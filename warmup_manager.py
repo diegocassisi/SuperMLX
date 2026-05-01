@@ -1,0 +1,641 @@
+"""
+warmup_manager.py — Dynamic Prefix Capture (DPC) for SuperMLX
+══════════════════════════════════════════════════════════════════════════════
+
+Manages KV cache warmup lifecycle with zero manual seed files.
+
+Architecture inspired by SGLang (RadixAttention) and vLLM (Automatic Prefix
+Caching), adapted for MLX's flat ArraysCache/KVCache memory model.
+
+Flow:
+  1. Boot:    Load prefix hash from disk (instant, <1ms)
+  2. Request: Detect boundary → hash prefix → compare with disk
+              Match  → load .safetensors → instant warm cache
+              Miss   → cold start → auto-capture → save to disk
+  3. Restart: Back to step 1 (self-healing if SOUL/tools changed)
+
+Files managed:
+  - logs/warmup_cache.safetensors  — KV state of the static prefix
+  - logs/warmup_cache.hash         — MD5 of the prefix token array
+
+Replaces: warmup_seed.txt, .seed_hash, FEATURE_WARMUP_AUTO_UPDATE
+"""
+
+import copy
+import hashlib
+import math
+import struct
+import threading
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import mlx.core as mx
+from mlx_lm.models.cache import (
+    make_prompt_cache,
+    can_trim_prompt_cache,
+    trim_prompt_cache,
+)
+
+# ── Boundary markers for different model families ────────────────────────────
+# The first user message marker separates the static prefix (system + tools)
+# from the variable content (user messages, RAG, conversation history).
+_USER_MARKERS = [
+    "<|im_start|>user",        # Qwen3/ChatML
+    "<|start_header_id|>user", # Llama 3
+    "<|user|>",                # Gemma/generic
+    "<start_of_turn>user",     # Gemma 2
+]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# HASHING
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def compute_prefix_hash(tokens: List[int]) -> str:
+    """
+    Compute MD5 hash of a token array.
+
+    Deterministic, format-invariant: the same sequence of token IDs always
+    produces the same hash, regardless of how the text was rendered or what
+    chat template was used. This is the cryptographic anchor of DPC.
+    """
+    token_bytes = struct.pack(f"<{len(tokens)}i", *tokens)
+    return hashlib.md5(token_bytes).hexdigest()
+
+
+def load_prefix_hash(cache_dir: Path) -> Optional[str]:
+    """Load prefix hash from disk. Returns None if not found."""
+    hash_path = cache_dir / "warmup_cache.hash"
+    if hash_path.exists():
+        try:
+            return hash_path.read_text().strip()
+        except Exception:
+            return None
+    return None
+
+
+def save_prefix_hash(prefix_hash: str, cache_dir: Path) -> None:
+    """Save prefix hash to disk."""
+    hash_path = cache_dir / "warmup_cache.hash"
+    hash_path.parent.mkdir(parents=True, exist_ok=True)
+    hash_path.write_text(prefix_hash)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# BOUNDARY DETECTION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def detect_boundary(prompt_text: str, tokens: List[int], tokenizer) -> int:
+    """
+    Find the boundary between static prefix (system + tools) and variable
+    content (user messages) in token space.
+
+    Strategy:
+      1. Find the character position of the first user marker in the rendered
+         prompt string (reliable, model-family agnostic).
+      2. Tokenize only the static prefix substring to get the exact token
+         boundary index.
+
+    Returns the token index where the first user message begins.
+    If no user marker is found, returns len(tokens) (entire prompt is static).
+
+    NOTE: We operate on the rendered string first and then re-tokenize the
+    prefix substring, instead of searching for marker tokens directly in the
+    token array. This avoids BPE context-sensitivity issues where tokenizing
+    a marker string in isolation produces different token IDs than when it
+    appears in a larger context.
+    """
+    # Find character position of first user marker
+    cut_pos = len(prompt_text)
+    for marker in _USER_MARKERS:
+        pos = prompt_text.find(marker)
+        if pos > 0:
+            cut_pos = min(cut_pos, pos)
+            break
+
+    if cut_pos >= len(prompt_text):
+        # No user marker found — entire prompt is static (unusual but valid)
+        return len(tokens)
+
+    # Tokenize just the static prefix to get exact token boundary
+    static_text = prompt_text[:cut_pos]
+
+    # Use same logic as _tokenize_prompt: skip BOS if already present
+    add_special_tokens = (
+        getattr(tokenizer, "bos_token", None) is None
+        or not static_text.startswith(tokenizer.bos_token or "")
+    )
+    static_tokens = tokenizer.encode(static_text, add_special_tokens=add_special_tokens)
+    boundary = len(static_tokens)
+
+    # Safety: clamp to total token count
+    return min(boundary, len(tokens))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CACHE PERSISTENCE (save/load KV state to/from disk)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def save_cache(
+    tokens: List[int],
+    prompt_cache: Any,
+    path: Path,
+    prefix_hash: Optional[str] = None,
+    log_fn=None,
+) -> bool:
+    """
+    Serialize KV cache to disk using MLX safetensors.
+
+    Saves token sequence + per-layer K/V arrays + offsets.
+    If prefix_hash is provided, also saves warmup_cache.hash.
+    Best-effort: never crashes the server on failure.
+
+    Args:
+        tokens: Token IDs corresponding to the cached KV state.
+        prompt_cache: List of cache layer objects (KVCache/ArraysCache).
+        path: Destination path for the .safetensors file.
+        prefix_hash: MD5 hash of the prefix tokens (saved alongside).
+        log_fn: Optional logging callback fn(emoji, message).
+    """
+    _log = log_fn or (lambda *a: None)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        arrays: Dict[str, Any] = {}
+        arrays["tokens"] = mx.array(tokens, dtype=mx.int32)
+        arrays["n_layers"] = mx.array([len(prompt_cache)], dtype=mx.int32)
+        saved_layers = 0
+        for i, layer in enumerate(prompt_cache):
+            if not hasattr(layer, "keys") or layer.keys is None:
+                continue
+            offset = int(getattr(layer, "offset", 0))
+            if offset == 0:
+                continue
+            # Handle list-wrapping: some MLX cache layers store keys/values
+            # as [mx.array] (single-element list) instead of bare mx.array.
+            k_arr = layer.keys[0] if isinstance(layer.keys, list) else layer.keys
+            v_arr = layer.values[0] if isinstance(layer.values, list) else layer.values
+            # Only save the valid token slice (skip pre-allocated zeros)
+            arrays[f"k{i}"] = k_arr[..., :offset, :]
+            arrays[f"v{i}"] = v_arr[..., :offset, :]
+            arrays[f"o{i}"] = mx.array([offset], dtype=mx.int32)
+            saved_layers += 1
+        # Force evaluation before writing to disk
+        live = [v for v in arrays.values() if hasattr(v, "shape")]
+        if live:
+            mx.eval(*live)
+        mx.save_safetensors(str(path), arrays)
+
+        # Save prefix hash alongside the cache
+        if prefix_hash:
+            save_prefix_hash(prefix_hash, path.parent)
+
+        _log(
+            "💾",
+            f"DPC: cache saved → {path.name} | layers={saved_layers} | tokens={len(tokens)}",
+        )
+        return True
+    except Exception as e:
+        _log("⚠️", f"DPC: cache save FAILED ({type(e).__name__}: {e})")
+        return False
+
+
+def load_cache(
+    path: Path,
+    model: Any,
+    max_kv_size: int,
+    is_vlm: bool = False,
+    log_fn=None,
+) -> Tuple[Optional[List[int]], Optional[Any]]:
+    """
+    Deserialize KV cache from disk.
+
+    Reconstructs KVCache layer objects with saved K/V arrays and offsets.
+    Returns (tokens, prompt_cache) or (None, None) on any failure.
+
+    Args:
+        path: Path to the .safetensors file.
+        model: The loaded MLX model (needed for make_prompt_cache).
+        max_kv_size: Maximum KV cache size setting.
+        is_vlm: Whether the model is a Vision-Language Model.
+        log_fn: Optional logging callback fn(emoji, message).
+    """
+    _log = log_fn or (lambda *a: None)
+    if not path.exists():
+        return None, None
+    try:
+        arrays = mx.load(str(path))
+        tokens = arrays["tokens"].tolist()
+        if not tokens:
+            _log("⚠️", "DPC: disk cache has empty token list — ignoring")
+            return None, None
+
+        cache_model = (
+            model.language_model
+            if is_vlm and hasattr(model, "language_model")
+            else model
+        )
+        prompt_cache = make_prompt_cache(cache_model, max_kv_size=max_kv_size)
+
+        restored_layers = 0
+        for i, layer in enumerate(prompt_cache):
+            k_key = f"k{i}"
+            if k_key not in arrays:
+                continue
+            offset = int(arrays[f"o{i}"].tolist()[0])
+            if offset == 0:
+                continue
+
+            saved_k = arrays[k_key]   # shape [B, n_heads, offset, head_dim]
+            saved_v = arrays[f"v{i}"]
+
+            # Pad to KVCache step boundary (default step=256) to match internal layout
+            step = int(getattr(layer, "step", 256))
+            capacity = math.ceil(offset / step) * step
+            current_len = saved_k.shape[2]
+            if capacity > current_len:
+                pad_len = capacity - current_len
+                zeros_k = mx.zeros(
+                    (*saved_k.shape[:2], pad_len, saved_k.shape[3]), dtype=saved_k.dtype
+                )
+                zeros_v = mx.zeros(
+                    (*saved_v.shape[:2], pad_len, saved_v.shape[3]), dtype=saved_v.dtype
+                )
+                layer.keys = mx.concatenate([saved_k, zeros_k], axis=2)
+                layer.values = mx.concatenate([saved_v, zeros_v], axis=2)
+            else:
+                layer.keys = saved_k
+                layer.values = saved_v
+            layer.offset = offset
+            restored_layers += 1
+
+        # Force GPU evaluation of all reconstructed tensors
+        live = [
+            l.keys for l in prompt_cache
+            if hasattr(l, "keys") and l.keys is not None
+        ]
+        if live:
+            mx.eval(*live)
+
+        _log(
+            "💾",
+            f"DPC: disk cache loaded | layers={restored_layers} | tokens={len(tokens)}",
+        )
+        # Guard: if not ALL layers were restored (hybrid model: ArraysCache + KVCache),
+        # the cache is inconsistent and will cause broadcast shape errors.
+        total_layers = len(prompt_cache)
+        if restored_layers < total_layers:
+            _log(
+                "⚠️",
+                f"DPC: partial cache ({restored_layers}/{total_layers} layers) — "
+                f"discarding to avoid shape mismatch. Will cold-start.",
+            )
+            return None, None
+        return tokens, prompt_cache
+    except Exception as e:
+        _log(
+            "⚠️",
+            f"DPC: disk load FAILED ({type(e).__name__}: {e}) — will cold-start",
+        )
+        return None, None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# FROZEN CACHE (immutable snapshot for pollution recovery)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def create_frozen_snapshot(
+    prompt_cache: Any,
+    tokens: List[int],
+    log_fn=None,
+) -> Tuple[Optional[Any], Optional[List[int]]]:
+    """
+    Create an immutable deep copy of the prompt cache for pollution recovery.
+
+    When the sliding window gets contaminated with response tokens, this frozen
+    snapshot allows restoring a clean prefix cache in ~3s instead of doing a
+    full re-prefill (~70s).
+
+    Args:
+        prompt_cache: Live prompt cache (list of layer objects).
+        tokens: Token IDs corresponding to the cached state.
+        log_fn: Optional logging callback fn(emoji, message).
+
+    Returns:
+        (frozen_cache, frozen_tokens) or (None, None) on failure.
+    """
+    _log = log_fn or (lambda *a: None)
+    try:
+        from mlx_lm.models.cache import ArraysCache as _AC
+
+        if isinstance(prompt_cache, list) and len(prompt_cache) > 0:
+            frozen = []
+            for layer in prompt_cache:
+                if isinstance(layer, _AC):
+                    new_layer = _AC(len(layer.cache))
+                    new_layer.cache = [
+                        mx.array(c) if c is not None else None
+                        for c in layer.cache
+                    ]
+                    frozen.append(new_layer)
+                else:
+                    frozen.append(copy.deepcopy(layer))
+            frozen_tokens = list(tokens)
+            _log(
+                "🧊",
+                f"DPC: frozen cache created | {len(frozen)} layers | "
+                f"{len(frozen_tokens)} tokens",
+            )
+            return frozen, frozen_tokens
+    except Exception as e:
+        _log("⚠️", f"DPC: freeze failed ({e}) — pollution recovery disabled")
+    return None, None
+
+
+def restore_frozen_snapshot(
+    frozen_cache: Any,
+    log_fn=None,
+) -> Optional[Any]:
+    """
+    Restore a clean prompt cache from a frozen snapshot.
+
+    Creates new copies of all layer objects so the frozen snapshot remains
+    immutable for future restores.
+
+    Args:
+        frozen_cache: Previously frozen cache (from create_frozen_snapshot).
+        log_fn: Optional logging callback fn(emoji, message).
+
+    Returns:
+        A fresh deep copy of the frozen cache, or None on failure.
+    """
+    _log = log_fn or (lambda *a: None)
+    if frozen_cache is None:
+        return None
+    try:
+        from mlx_lm.models.cache import ArraysCache as _AC
+
+        restored = []
+        for layer in frozen_cache:
+            if isinstance(layer, _AC):
+                new_layer = _AC(len(layer.cache))
+                new_layer.cache = [
+                    mx.array(c) if c is not None else None
+                    for c in layer.cache
+                ]
+                restored.append(new_layer)
+            else:
+                restored.append(copy.deepcopy(layer))
+        _log("🧊", f"DPC: frozen cache restored | {len(restored)} layers")
+        return restored
+    except Exception as e:
+        _log("⚠️", f"DPC: frozen restore failed ({e})")
+        return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# AUTO-SAVE: trim response tokens and persist prefix-only cache
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def trim_and_save_prefix(
+    cache_key: List[int],
+    prompt_cache: Any,
+    generated_tokens: List[int],
+    persist_path: Path,
+    prefix_hash: Optional[str] = None,
+    log_fn=None,
+) -> Tuple[Optional[Any], Optional[List[int]]]:
+    """
+    Trim response tokens from cache, save prefix-only state to disk,
+    and return a frozen snapshot of the trimmed cache.
+
+    This handles the complexity of hybrid caches (ArraysCache + KVCache)
+    where only KVCache layers are trimmable.
+
+    Args:
+        cache_key: Full token sequence (prompt + generated).
+        prompt_cache: Live prompt cache after generation.
+        generated_tokens: Tokens generated in this turn.
+        persist_path: Path for the .safetensors file.
+        prefix_hash: MD5 hash of the prefix tokens.
+        log_fn: Optional logging callback fn(emoji, message).
+
+    Returns:
+        (frozen_cache, frozen_tokens) for pollution recovery, or (None, None).
+    """
+    _log = log_fn or (lambda *a: None)
+
+    # Strip response tokens from the key
+    prompt_only_key = (
+        cache_key[:-len(generated_tokens)]
+        if generated_tokens
+        else list(cache_key)
+    )
+
+    _log(
+        "💾",
+        f"DPC auto-save: capturing prefix cache → {persist_path.name} | "
+        f"tokens={len(prompt_only_key)} (stripped {len(generated_tokens)} response tok)",
+    )
+
+    save_cache_copy = None
+
+    if generated_tokens and can_trim_prompt_cache(prompt_cache):
+        # Standard path: all layers trimmable (pure KVCache model)
+        try:
+            save_cache_copy = copy.deepcopy(prompt_cache)
+            pre_trim = _kv_offset(save_cache_copy)
+            trim_prompt_cache(save_cache_copy, len(generated_tokens))
+            post_trim = _kv_offset(save_cache_copy)
+
+            if post_trim is not None and pre_trim is not None and post_trim >= pre_trim:
+                _log("⚠️", f"DPC auto-save ABORTED: trim did not reduce offset ({pre_trim} → {post_trim})")
+                save_cache_copy = None
+        except Exception as e:
+            _log("⚠️", f"DPC auto-save ABORTED: deepcopy/trim failed ({e})")
+            save_cache_copy = None
+
+    elif not generated_tokens:
+        # No response tokens to strip — safe to save as-is
+        save_cache_copy = prompt_cache
+
+    else:
+        # Hybrid cache (e.g., Qwen3.5: ArraysCache + KVCache):
+        # can_trim_prompt_cache() requires ALL layers trimmable, but
+        # ArraysCache (linear attention) is never trimmable.
+        # Fix: deepcopy + trim only the trimmable layers (KVCache).
+        any_trimmable = any(
+            hasattr(layer, "is_trimmable") and layer.is_trimmable()
+            for layer in prompt_cache
+        )
+        if any_trimmable:
+            try:
+                save_cache_copy = copy.deepcopy(prompt_cache)
+                pre_trim = None
+                for layer in save_cache_copy:
+                    if hasattr(layer, "is_trimmable") and layer.is_trimmable() and hasattr(layer, "offset"):
+                        pre_trim = int(layer.offset)
+                        break
+
+                n_trimmed = 0
+                for layer in save_cache_copy:
+                    if hasattr(layer, "is_trimmable") and layer.is_trimmable() and hasattr(layer, "trim"):
+                        layer.trim(len(generated_tokens))
+                        n_trimmed += 1
+
+                post_trim = None
+                for layer in save_cache_copy:
+                    if hasattr(layer, "is_trimmable") and layer.is_trimmable() and hasattr(layer, "offset"):
+                        post_trim = int(layer.offset)
+                        break
+
+                if post_trim is not None and pre_trim is not None and post_trim >= pre_trim:
+                    _log("⚠️", f"DPC auto-save ABORTED: per-layer trim did not reduce offset ({pre_trim} → {post_trim})")
+                    save_cache_copy = None
+                else:
+                    _log("💾", f"DPC auto-save: per-layer trim OK | trimmed={n_trimmed}/{len(save_cache_copy)} layers | offset {pre_trim} → {post_trim}")
+            except Exception as e:
+                _log("⚠️", f"DPC auto-save ABORTED: per-layer trim failed ({e})")
+                save_cache_copy = None
+        else:
+            _log("⚠️", f"DPC auto-save SKIPPED: no trimmable layers ({type(prompt_cache[0]).__name__ if prompt_cache else 'empty'})")
+
+    # Persist and create frozen snapshot
+    frozen_cache = None
+    frozen_tokens = None
+
+    if save_cache_copy is not None:
+        # Save to disk in background thread
+        threading.Thread(
+            target=save_cache,
+            args=(prompt_only_key, save_cache_copy, persist_path),
+            kwargs={"prefix_hash": prefix_hash, "log_fn": log_fn},
+            daemon=True,
+            name="dpc-cache-save",
+        ).start()
+
+        # Create frozen snapshot from the trimmed copy
+        frozen_cache = save_cache_copy
+        frozen_tokens = list(prompt_only_key)
+        _log("🧊", f"DPC: frozen cache updated | {len(save_cache_copy)} layers | {len(prompt_only_key)} tokens")
+
+    return frozen_cache, frozen_tokens
+
+
+def _kv_offset(cache: Any) -> Optional[int]:
+    """Return the current KV offset from the first layer that has one."""
+    if cache is None:
+        return None
+    for layer in cache:
+        off = getattr(layer, "offset", None)
+        if off is not None:
+            return int(off)
+    return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# STARTUP: Background boot sequence (load hash + pre-load cache)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class DPCState:
+    """
+    Shared state for the Dynamic Prefix Capture lifecycle.
+
+    Thread-safe via the warmup_done event and explicit locking where needed.
+    Created once at boot, referenced by the request handler.
+    """
+    def __init__(self):
+        self.prefix_hash: Optional[str] = None       # MD5 from disk (loaded at boot)
+        self.frozen_cache: Optional[Any] = None       # Immutable snapshot for pollution recovery
+        self.frozen_tokens: Optional[List[int]] = None  # Tokens for the frozen cache
+        self.disk_cache_saved: bool = False            # True after first MAIN save to disk
+        self.embedded_cache_saved: bool = False        # True after first EMBEDDED save to disk
+        self.warmup_done = threading.Event()           # Set when boot sequence completes
+        self.first_capture_done: bool = False          # True after DPC auto-capture on first request
+
+
+def run_startup(
+    state: DPCState,
+    cache_persist_path: Optional[str],
+    embedded_cache_persist_path: Optional[str],
+    model: Any,
+    max_kv_size: int,
+    is_vlm: bool,
+    prompt_cache_main,      # LRUPromptCache for MAIN
+    prompt_cache_compact,   # LRUPromptCache for COMPACT
+    prompt_cache_lock,      # threading.Lock for cache access
+    model_path: str,
+    log_fn=None,
+) -> None:
+    """
+    Background startup sequence for DPC.
+
+    1. Load prefix hash from disk (instant)
+    2. Load EMBEDDED cache from disk → PROMPT_CACHE_COMPACT
+    3. Load MAIN cache from disk (tentative — validated on first request)
+    4. Signal warmup_done
+
+    Does NOT do any prefill. The first real request handles cold start
+    if the hash doesn't match.
+    """
+    _log = log_fn or (lambda *a: None)
+
+    persist_path = Path(cache_persist_path) if cache_persist_path else None
+    embedded_persist_path = (
+        Path(embedded_cache_persist_path) if embedded_cache_persist_path else None
+    )
+
+    try:
+        # ── 1. Load prefix hash ─────────────────────────────────────────────
+        if persist_path:
+            state.prefix_hash = load_prefix_hash(persist_path.parent)
+            if state.prefix_hash:
+                _log("🔑", f"DPC: prefix hash loaded from disk | {state.prefix_hash[:12]}…")
+            else:
+                _log("ℹ️", "DPC: no prefix hash on disk — first request will cold-start")
+
+        # ── 2. Load EMBEDDED cache (PROMPT_CACHE_COMPACT) ────────────────────
+        if embedded_persist_path and embedded_persist_path.exists():
+            emb_tokens, emb_cache = load_cache(
+                embedded_persist_path, model, max_kv_size, is_vlm, log_fn=_log,
+            )
+            if emb_tokens and emb_cache and len(emb_tokens) > 1000:
+                with prompt_cache_lock:
+                    prompt_cache_compact.insert_cache(
+                        model_path, emb_tokens, emb_cache, pinned=False
+                    )
+                _log(
+                    "🔥",
+                    f"DPC: EMBEDDED cache loaded (disk) | {len(emb_tokens)} tokens → COMPACT slot",
+                )
+            else:
+                _log("⚠️", "DPC: EMBEDDED disk cache invalid or empty — COMPACT slot empty")
+
+        # ── 3. Load MAIN cache from disk (tentative) ─────────────────────────
+        # We load it into PROMPT_CACHE now. On the first real request, we'll
+        # validate the prefix hash. If it doesn't match, we evict and cold-start.
+        if persist_path and persist_path.exists():
+            disk_tokens, disk_cache = load_cache(
+                persist_path, model, max_kv_size, is_vlm, log_fn=_log,
+            )
+            if disk_tokens and disk_cache and len(disk_tokens) > 5000:
+                with prompt_cache_lock:
+                    prompt_cache_main.insert_cache(
+                        model_path, disk_tokens, disk_cache, pinned=False
+                    )
+                # Create frozen snapshot from disk cache
+                state.frozen_cache, state.frozen_tokens = create_frozen_snapshot(
+                    disk_cache, disk_tokens, log_fn=_log,
+                )
+                _log(
+                    "🔥",
+                    f"DPC: MAIN cache loaded (disk) | {len(disk_tokens)} tokens | "
+                    f"hash={'✓' if state.prefix_hash else '?'} | LRU (evictable)",
+                )
+            else:
+                _log("⚠️", "DPC: disk cache invalid or empty — first request will cold-start")
+
+    except Exception as e:
+        _log("❌", f"DPC: startup FAILED ({type(e).__name__}: {e}) — server still functional")
+    finally:
+        state.warmup_done.set()

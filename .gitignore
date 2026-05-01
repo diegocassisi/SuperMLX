@@ -1,0 +1,25 @@
+# === ENTORNO ===
+venv/
+__pycache__/
+*.pyc
+.DS_Store
+
+# === CONFIGURACIÓN LOCAL (secretos, paths locales) ===
+.env
+
+# === RUNTIME (generado por el servidor) ===
+logs/
+rag_data/
+
+# === MODELOS Y PESOS (demasiado grandes para git) ===
+models/
+*.safetensors
+*.gguf
+*.bin
+
+# === ARCHIVOS HISTÓRICOS ===
+Archive/
+
+# === IDE ===
+.vscode/
+.idea/
