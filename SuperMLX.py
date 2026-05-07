@@ -605,42 +605,21 @@ from tool_parsing import (
     _reasoning_level_to_enable_thinking, _extract_enable_thinking,
     _normalize_assistant_text, _coerce_arg_value, _extract_openai_tool_calls,
 )
-INBOUND_META_MESSAGE_ID_PATTERN = re.compile(r'("message_id"\s*:\s*")[^"]+(")')
-# NOTE: INBOUND_TRUSTED_CONTEXT_BLOCK_PATTERN, CACHE_STABLE_INBOUND_CONTEXT_BLOCK, and
-# INBOUND_CONTEXT_TO_PROJECT_BOUNDARY_PATTERN were removed (Phase 7 Fix 2, 2026-03-14).
-# The Inbound Context block is now handled structurally by _canonicalize_inbound_context_block()
-# using plain string anchors with no DOTALL regex.  Do NOT re-add a DOTALL regex here —
-# see Phase 5 in PLAN.md for why that approach caused a 17k-char lobotomy bug.
-# OpenClaw sub-agent completion event: "Stats: runtime 1m52s • tokens 0 (in 0 / out 0)"
-# The runtime duration is volatile (changes with each execution).  The UUIDs in
-# session_key and session_id are frozen per injection (stable across turns), so only
-# the runtime field needs to be normalised.  Single-line, structurally bounded — safe.
-SUBAGENT_STATS_PATTERN = re.compile(r"(Stats: runtime\s+)[^\n•]+", re.IGNORECASE)
-# Cache normalization: scrub volatile request-specific text so retries hit cache.
-CACHE_TIME_PATTERN = re.compile(r"Current time is[^\n]+\.", re.IGNORECASE)
-# OpenClaw user message injects "Current time: Tuesday, April..." (colon variant, not covered above)
-CACHE_TIME_COLON_PATTERN = re.compile(
-    r"Current time:\s*[^\n]+", re.IGNORECASE
-)
-CACHE_CCH_PATTERN = re.compile(r"cch=[a-zA-Z0-9]+;?", re.IGNORECASE)
-CACHE_BILLING_HEADER_PATTERN = re.compile(
-    r"-anthropic-billing-header:\s*[a-zA-Z0-9\-]+", re.IGNORECASE
-)
-# Claude Code injects variable <system-reminder> text (e.g. "gentle reminder" vs "improve or augment");
-# normalize so stream=true vs stream=false retries hit cache.
-CACHE_SYSTEM_REMINDER_PATTERN = re.compile(
-    r"<system-reminder>.*?</system-reminder>", re.DOTALL | re.IGNORECASE
-)
-# OpenClaw injects <available_skills>...</available_skills> dynamically based on installed skills.
-# ANY skill install/update changes this block and breaks cache at token ~691.
-# Replace the entire block with a stable sentinel so the cache key is invariant to skill changes.
-CACHE_SKILLS_BLOCK_PATTERN = re.compile(
-    r"<available_skills>.*?</available_skills>", re.DOTALL | re.IGNORECASE
-)
-# OpenClaw injects a ## Runtime line with volatile fields (model, channel, thinking level, node version).
-# This line changes per request and breaks the stable prefix after the skills block.
-CACHE_RUNTIME_LINE_PATTERN = re.compile(
-    r"^Runtime:.*$", re.MULTILINE | re.IGNORECASE
+# ── Message pipeline (extracted to message_pipeline.py) ──────────────────────
+from message_pipeline import (
+    INBOUND_META_MESSAGE_ID_PATTERN, SUBAGENT_STATS_PATTERN,
+    CACHE_TIME_PATTERN, CACHE_TIME_COLON_PATTERN, CACHE_CCH_PATTERN,
+    CACHE_BILLING_HEADER_PATTERN, CACHE_SYSTEM_REMINDER_PATTERN,
+    CACHE_SKILLS_BLOCK_PATTERN, CACHE_RUNTIME_LINE_PATTERN,
+    SessionContext,
+    _get_healing_hash, _heal_messages, _extract_tool_call_signature,
+    _break_tool_call_loop, _inject_loop_stop,
+    _count_roles, _summarize_tool_results, _estimate_token_count,
+    _is_slug_gen_request, _is_rag_bypass_request, _detect_compact_runner,
+    _flatten_content, _prepare_messages_for_template,
+    _scrub_cache_key, _canonicalize_inbound_context_block,
+    _canonicalize_messages, _extract_session_context,
+    _COMPACT_RUNNER_SIGNALS, _RAG_BYPASS_SIGNALS_USER, _RAG_BYPASS_SIGNALS_SYSTEM,
 )
 
 
@@ -651,259 +630,7 @@ HEALING_STORE_LOCK = threading.Lock()
 MAX_HEALING_STORE = 2000  # Generous size to survive deep multi-agent sessions
 
 
-def _get_healing_hash(
-    text: str, tool_calls: Optional[List[Dict[str, Any]]] = None
-) -> Optional[str]:
-    """
-    Creates a robust SHA-256 hash of the assistant's output.
-    If the text is empty but has tool calls, we hash the canonicalized tool calls.
-    """
-    base = (text or "").strip()
-    if tool_calls:
-        try:
-            # Sort keys to ensure deterministic hashing of tool calls
-            base += json.dumps(tool_calls, sort_keys=True)
-        except Exception:
-            pass
 
-    if not base:
-        return None
-
-    return hashlib.sha256(base.encode("utf-8")).hexdigest()
-
-
-def _heal_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Intercepts incoming messages. If a stripped assistant message matches
-    a hash in our store, we swap it back to the full version (with <think>).
-    """
-    healed = []
-    for msg in messages:
-        m = dict(msg)
-        if (m.get("role") or "").strip().lower() == "assistant":
-            content = m.get("content", "")
-            tool_calls = m.get("tool_calls")
-
-            # Handle standard text content
-            if isinstance(content, str):
-                h = _get_healing_hash(content, tool_calls)
-                if h:
-                    with HEALING_STORE_LOCK:
-                        if h in HEALING_STORE:
-                            m["content"] = HEALING_STORE[h]
-                            # CRITICAL: Prevent the Jinja template from double-rendering
-                            # the tool calls, since the raw text already contains them.
-                            m.pop("tool_calls", None)
-                            HEALING_STORE.move_to_end(h, last=True)
-
-            # Handle VLM list content (e.g., [{"type": "text", "text": "..."}])
-            elif isinstance(content, list):
-                new_content = []
-                healed_any = False
-                for part in content:
-                    if isinstance(part, dict) and part.get("type") == "text":
-                        text_part = part.get("text") or part.get("content") or ""
-                        h = _get_healing_hash(text_part, tool_calls)
-                        if h:
-                            with HEALING_STORE_LOCK:
-                                if h in HEALING_STORE:
-                                    new_content.append(
-                                        {**part, "text": HEALING_STORE[h]}
-                                    )
-                                    healed_any = True
-                                    HEALING_STORE.move_to_end(h, last=True)
-                                    continue
-                    new_content.append(part)
-                m["content"] = new_content
-                if healed_any:
-                    # CRITICAL: Prevent double-rendering for VLM multi-part messages too
-                    m.pop("tool_calls", None)
-
-        healed.append(m)
-    return healed
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# TOOL CALL LOOP BREAKER
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _extract_tool_call_signature(asst_msg: Dict[str, Any]) -> Optional[Tuple[str, str]]:
-    """Extract (tool_name, args_json) from an assistant message with tool_calls."""
-    tc_list = asst_msg.get("tool_calls") or []
-    if not tc_list or not isinstance(tc_list[0], dict):
-        return None
-    func = tc_list[0].get("function", {})
-    name = func.get("name", "")
-    args = func.get("arguments", "")
-    if isinstance(args, dict):
-        args = json.dumps(args, sort_keys=True)
-    return (name, args) if name else None
-
-
-def _break_tool_call_loop(
-    messages: List[Dict[str, Any]], request_id: str = ""
-) -> Tuple[List[Dict[str, Any]], bool]:
-    """
-    Detect and break infinite tool-call retry loops.
-
-    Three detection modes:
-    1. ERROR LOOP: Same tool fails N consecutive times (original behavior).
-    2. DUPLICATE LOOP: Same tool + same args called 2+ times (even if "successful").
-    3. SPAM LOOP: Same tool called 5+ times consecutively regardless of args/results.
-
-    Returns (messages, loop_was_broken).
-    """
-    if not FEATURE_TOOL_LOOP_BREAKER or len(messages) < 4:
-        return messages, False
-
-    # ── MODE 2 & 3: Scan for duplicate calls and same-tool spam ──────────
-    # Walk backward collecting consecutive (assistant→tool) pairs regardless of error status.
-    SPAM_THRESHOLD = 5  # same tool N times in a row = spam
-    DUPLICATE_THRESHOLD = 2  # exact same call (name+args) N times = duplicate
-
-    consecutive_calls: List[Dict[str, Any]] = []  # [{tool_name, tool_args, tool_idx}]
-    i = len(messages) - 1
-
-    while i >= 1:
-        tool_msg = messages[i]
-        asst_msg = messages[i - 1]
-
-        if (tool_msg.get("role") or "").lower() != "tool":
-            break
-        if (asst_msg.get("role") or "").lower() != "assistant":
-            break
-
-        sig = _extract_tool_call_signature(asst_msg)
-        if not sig:
-            break
-
-        consecutive_calls.append({
-            "tool_name": sig[0], "tool_args": sig[1], "tool_idx": i
-        })
-        i -= 2
-
-    if consecutive_calls:
-        # Check DUPLICATE: exact same (name, args) repeated
-        seen_sigs: Dict[str, int] = {}
-        for c in consecutive_calls:
-            key = f"{c['tool_name']}::{c['tool_args']}"
-            seen_sigs[key] = seen_sigs.get(key, 0) + 1
-
-        for sig_key, count in seen_sigs.items():
-            if count >= DUPLICATE_THRESHOLD:
-                dup_name = sig_key.split("::")[0]
-                return _inject_loop_stop(
-                    messages, consecutive_calls[0]["tool_idx"],
-                    dup_name, count, "DUPLICATE", request_id,
-                    f"You already called '{dup_name}' with the EXACT same arguments "
-                    f"{count} times and got the same results each time. "
-                    f"The information you need is NOT available via this tool. "
-                    f"DO NOT call '{dup_name}' again. "
-                    f"Respond with a text message using your own knowledge instead."
-                )
-
-        # Check SPAM: same tool name called too many times (different args OK)
-        if len(consecutive_calls) >= SPAM_THRESHOLD:
-            first_name = consecutive_calls[0]["tool_name"]
-            same_name_count = sum(1 for c in consecutive_calls if c["tool_name"] == first_name)
-            if same_name_count >= SPAM_THRESHOLD:
-                return _inject_loop_stop(
-                    messages, consecutive_calls[0]["tool_idx"],
-                    first_name, same_name_count, "SPAM", request_id,
-                    f"You have called '{first_name}' {same_name_count} consecutive times "
-                    f"without making progress. STOP searching. "
-                    f"DO NOT call '{first_name}' again. "
-                    f"Respond with a text message using the information you already have, "
-                    f"or explain that you couldn't find what you needed."
-                )
-
-    # ── MODE 1: Original error-based loop detection ──────────────────────
-    failures: List[Dict[str, Any]] = []
-    i = len(messages) - 1
-
-    while i >= 1:
-        tool_msg = messages[i]
-        asst_msg = messages[i - 1]
-
-        if (tool_msg.get("role") or "").lower() != "tool":
-            break
-        if (asst_msg.get("role") or "").lower() != "assistant":
-            break
-
-        content = str(tool_msg.get("content", ""))
-        is_error = (
-            '"status": "error"' in content
-            or '"status":"error"' in content
-            or '"error":' in content[:200]
-        )
-        if not is_error:
-            break
-
-        tc_list = asst_msg.get("tool_calls") or []
-        if not tc_list:
-            break
-
-        tool_name = (
-            tc_list[0].get("function", {}).get("name", "unknown")
-            if isinstance(tc_list[0], dict)
-            else "unknown"
-        )
-        failures.append({"tool_name": tool_name, "tool_idx": i})
-        i -= 2
-
-    if len(failures) < TOOL_LOOP_MAX_RETRIES:
-        return messages, False
-
-    name_counts: Dict[str, int] = {}
-    for f in failures:
-        name_counts[f["tool_name"]] = name_counts.get(f["tool_name"], 0) + 1
-    most_common_name = max(name_counts, key=name_counts.get)  # type: ignore[arg-type]
-    most_common_count = name_counts[most_common_name]
-
-    if most_common_count < TOOL_LOOP_MAX_RETRIES:
-        return messages, False
-
-    return _inject_loop_stop(
-        messages, failures[0]["tool_idx"],
-        most_common_name, most_common_count, "ERROR", request_id,
-        f"The tool '{most_common_name}' has failed "
-        f"{most_common_count} consecutive times with errors. "
-        f"DO NOT retry this tool. DO NOT call '{most_common_name}' again. "
-        f"Instead, respond with a text message to the user explaining "
-        f"that '{most_common_name}' is currently unavailable and what the error was."
-    )
-
-
-def _inject_loop_stop(
-    messages: List[Dict[str, Any]], tool_idx: int,
-    tool_name: str, count: int, mode: str, request_id: str,
-    instruction: str,
-) -> Tuple[List[Dict[str, Any]], bool]:
-    """Inject a stop instruction into the last tool result to break the loop."""
-    messages = list(messages)
-    messages[tool_idx] = dict(messages[tool_idx])
-    original_content = str(messages[tool_idx].get("content", ""))
-    messages[tool_idx]["content"] = original_content + f"\n\n⚠️ SYSTEM LOOP BREAKER: {instruction}"
-
-    if FEATURE_FULL_LOGGING:
-        _pipeline_log(
-            "LOOP_BREAK", request_id,
-            f"ACTIVATED ({mode}) | tool='{tool_name}' | "
-            f"consecutive_calls={count} | "
-            f"injected stop instruction at msg[{tool_idx}]",
-        )
-
-    return messages, True
-
-
-# ---------------------------------------
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# PIPELINE LOGGING — Full observability for every pipeline stage.
-# Every component logs: when activated, what received, what did, what returned,
-# how long it took.  "Si no se loguea, no existe."
-# ══════════════════════════════════════════════════════════════════════════════
 
 _PIPELINE_LOG_DIR = SETTINGS.log_root / "requests"
 
@@ -961,189 +688,6 @@ def _write_request_log(request_id: str, stage: str, data: Any) -> None:
             json.dump(data, f, ensure_ascii=False, indent=2, default=str)
     except Exception:
         pass  # Best-effort — never crash the pipeline for a log
-
-
-def _count_roles(messages: List[Dict[str, Any]]) -> Dict[str, int]:
-    """Count messages by role for inbound logging."""
-    counts: Dict[str, int] = {}
-    for m in messages:
-        role = (m.get("role") or "unknown").strip().lower()
-        counts[role] = counts.get(role, 0) + 1
-    return counts
-
-
-def _summarize_tool_results(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Extract tool result messages for logging (role=tool only)."""
-    results = []
-    for m in messages:
-        if (m.get("role") or "").strip().lower() == "tool":
-            content = m.get("content", "")
-            content_len = len(content) if isinstance(content, str) else len(str(content))
-            results.append({
-                "tool_call_id": m.get("tool_call_id", "?"),
-                "name": m.get("name", "?"),
-                "content_len": content_len,
-            })
-    return results
-
-
-def _estimate_token_count(messages: List[Dict[str, Any]]) -> int:
-    """Rough token estimate: ~4 chars per token. Used for logging only, never for logic."""
-    total_chars = 0
-    for m in messages:
-        content = m.get("content", "")
-        if isinstance(content, str):
-            total_chars += len(content)
-        elif isinstance(content, list):
-            for part in content:
-                if isinstance(part, dict):
-                    total_chars += len(part.get("text", "") or part.get("content", "") or "")
-    return total_chars // 4
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# KRIPPER DUAL-SLOT — Compact runner detector
-# ══════════════════════════════════════════════════════════════════════════════
-
-# Keywords injected by OpenClaw's buildEmbeddedSystemPrompt() during compaction.
-# Source: dist/pi-embedded-BYdcxQ5A.js — compactEmbeddedPiSessionDirect()
-_COMPACT_RUNNER_SIGNALS: List[str] = [
-    "compact",
-    "compaction",
-    "summarize",
-    "summary of",
-    "context window",
-    "conversation history",
-    "prior conversation",
-    "previous conversation",
-    "Produce a compact, factual summary",  # Real OpenClaw source signal (pi-embedded.js)
-]
-
-def _is_slug_gen_request(messages: List[Dict[str, Any]]) -> bool:
-    """Detects the specific OpenClaw slug-generation request."""
-    if not messages: return False
-    # Check last user message for slug generation instructions
-    last_msg = str(messages[-1].get("content") or "")
-    return "filename slug" in last_msg.lower() and "short 1-2 word" in last_msg.lower()
-
-
-# ── RAG BYPASS SIGNALS ────────────────────────────────────────────────────
-# Requests matching these patterns are lightweight/internal OpenClaw operations
-# that should NOT be enriched with RAG context. RAG injection on these inflates
-# a ~500 token request to 50K+, causing 170s prefill on a 9B model.
-_RAG_BYPASS_SIGNALS_USER = [
-    "write any lasting notes to memory",
-    "store durable memories now",
-    "session nearing compaction",
-    "reply with no_reply if nothing to store",
-    "<text_to_summarize>",
-]
-_RAG_BYPASS_SIGNALS_SYSTEM = [
-    "session nearing compaction",
-    "store durable memories now",
-]
-
-def _is_rag_bypass_request(messages: List[Dict[str, Any]]) -> bool:
-    """
-    Detects requests that should bypass RAG enrichment:
-    - OpenClaw memory flush turns (pre-compaction save)
-    - Pure summarization requests (no domain knowledge needed)
-    - Internal maintenance operations
-
-    These are lightweight requests where injecting RAG context is
-    counterproductive: it inflates tokens and wastes prefill time.
-    """
-    if not messages:
-        return False
-
-    # Check last user message for flush/summarization signals
-    for msg in reversed(messages):
-        role = (msg.get("role") or "").lower()
-        content = msg.get("content", "")
-        if not isinstance(content, str):
-            continue
-        content_lower = content.lower()
-
-        if role == "user":
-            if any(sig in content_lower for sig in _RAG_BYPASS_SIGNALS_USER):
-                return True
-            break  # only check the last user message
-
-    # Check system prompt for flush signals
-    for msg in messages:
-        if (msg.get("role") or "").lower() == "system":
-            content = msg.get("content", "")
-            if isinstance(content, str):
-                content_lower = content.lower()
-                if any(sig in content_lower for sig in _RAG_BYPASS_SIGNALS_SYSTEM):
-                    return True
-
-    return False
-
-
-def _detect_compact_runner(
-    messages: List[Dict[str, Any]],
-    tools: Any,
-) -> bool:
-    """
-    Detects if the incoming request is from OpenClaw's compact runner
-    (compactEmbeddedPiSessionDirect), not from the MAIN agent.
-
-    The compact runner:
-      - Sends 0 tools (never uses function calling)
-      - Injects a system prompt with compaction-specific language
-      - Sends the full session history as messages (can be long)
-
-    The old heuristic (len(tools) <= 2) was wrong: compact sends 0 tools,
-    and MAIN in conversational mode may also send 0 tools.
-
-    Decision: Guard 1 (no tools) is necessary but not sufficient.
-    Guard 2 (system prompt keywords) is the decisive signal.
-    Guard 3 (long history, no tools) catches edge cases without system prompt.
-    """
-    # Guard 1: compact never uses tools. If tools present → definitely MAIN.
-    has_tools = tools is not None and len(tools) > 0
-    if has_tools:
-        return False
-
-    # Guard 2: system prompt contains compaction keywords (primary signal).
-    for msg in messages:
-        if (msg.get("role") or "").lower() == "system":
-            content = msg.get("content", "")
-            if isinstance(content, str):
-                content_lower = content.lower()
-                if any(sig in content_lower for sig in _COMPACT_RUNNER_SIGNALS):
-                    return True
-            elif isinstance(content, list):
-                for part in content:
-                    if isinstance(part, dict):
-                        text = (part.get("text") or part.get("content") or "").lower()
-                        if any(sig in text for sig in _COMPACT_RUNNER_SIGNALS):
-                            return True
-
-    # Guard 3: very long history with no tools — likely compact.
-    # Conservative threshold: MAIN conversational rarely exceeds 8K tokens without tools.
-    # Guard 3b: If system prompt contains MAIN-agent indicators, do NOT flag as compact.
-    # This prevents false positives when MAIN runs in conversational mode (no tools, long history).
-    _MAIN_AGENT_INDICATORS = ["<tools>", "function", "you are", "tool_choice", "<environment"]
-    est_tokens = _estimate_token_count(messages)
-    if est_tokens > 8000:
-        for msg in messages:
-            if (msg.get("role") or "").lower() == "system":
-                content = msg.get("content", "")
-                if isinstance(content, str):
-                    content_lower = content.lower()
-                    if any(ind in content_lower for ind in _MAIN_AGENT_INDICATORS):
-                        return False  # Looks like MAIN, not compact
-                elif isinstance(content, list):
-                    for part in content:
-                        if isinstance(part, dict):
-                            text = (part.get("text") or part.get("content") or "").lower()
-                            if any(ind in text for ind in _MAIN_AGENT_INDICATORS):
-                                return False
-        return True
-
-    return False
 
 
 # ── CASCADE: Forward to Frontier API ─────────────────────────────────────────
@@ -1686,12 +1230,6 @@ PROMPT_CACHE_COMPACT = LRUPromptCache(
 
 
 @dataclass(frozen=True)
-class SessionContext:
-    session_id: str
-    parent_session_id: Optional[str]
-    branch_id: Optional[str]
-    source: str
-
 
 class SessionIndex:
     @dataclass
@@ -2186,80 +1724,6 @@ def _cache_log_session_id(
     if session_raw:
         return hashlib.sha1(session_raw.encode("utf-8")).hexdigest()[:16]
     return _cache_session_id(cache_session_tokens)
-
-
-def _flatten_content(content):
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        text_content = ""
-        for part in content:
-            if isinstance(part, dict) and part.get("type") == "text":
-                text_content += part.get("text", "")
-            elif isinstance(part, str):
-                text_content += part
-        return text_content
-    return content
-
-
-def _prepare_messages_for_template(messages):
-    normalized = []
-    for msg in messages:
-        m = dict(msg)
-        m["content"] = _flatten_content(m.get("content", ""))
-
-        # OpenAI tool_calls use function.arguments as a JSON string.
-        # GLM's template expects arguments to be a mapping so it can iterate items().
-        if m.get("role") == "assistant" and isinstance(m.get("tool_calls"), list):
-            fixed_tool_calls = []
-            for tc in m["tool_calls"]:
-                tc_copy = dict(tc)
-                fn = tc_copy.get("function")
-                if isinstance(fn, dict):
-                    fn_copy = dict(fn)
-                    fn_name = str(fn_copy.get("name", "")).strip().lower()
-                    args = fn_copy.get("arguments")
-                    if isinstance(args, str):
-                        try:
-                            fn_copy["arguments"] = json.loads(args)
-                        except Exception:
-                            fn_copy["arguments"] = {"raw": args}
-                    if (
-                        SETTINGS.normalize_write_tool_content_for_prompt
-                        and fn_name == "write"
-                        and isinstance(fn_copy.get("arguments"), dict)
-                        and "content" in fn_copy["arguments"]
-                    ):
-                        # Keep write semantics (path + write intent) while stabilizing
-                        # prompt tokens by replacing huge inline content with a digest tag.
-                        raw_content = fn_copy["arguments"]["content"]
-                        if isinstance(raw_content, str):
-                            raw_bytes = raw_content.encode("utf-8")
-                            digest = hashlib.sha1(raw_bytes).hexdigest()[:16]
-                            placeholder = (
-                                f"__WRITE_CONTENT_OMITTED__sha1={digest};"
-                                f"bytes={len(raw_bytes)};chars={len(raw_content)};"
-                                f"lines={raw_content.count(chr(10)) + 1}__"
-                            )
-                        else:
-                            serialized = json.dumps(
-                                raw_content, ensure_ascii=False, sort_keys=True
-                            )
-                            raw_bytes = serialized.encode("utf-8")
-                            digest = hashlib.sha1(raw_bytes).hexdigest()[:16]
-                            placeholder = (
-                                f"__WRITE_CONTENT_OMITTED_NONSTRING__sha1={digest};"
-                                f"bytes={len(raw_bytes)}__"
-                            )
-                        args_copy = dict(fn_copy["arguments"])
-                        args_copy["content"] = placeholder
-                        fn_copy["arguments"] = args_copy
-                    tc_copy["function"] = fn_copy
-                fixed_tool_calls.append(tc_copy)
-            m["tool_calls"] = fixed_tool_calls
-
-        normalized.append(m)
-    return normalized
 
 
 def _messages_have_images(messages: List[Dict[str, Any]]) -> bool:
@@ -2761,325 +2225,10 @@ def _kv_cache_offset(cache: Any) -> Optional[int]:
     return None
 
 
-def _assert_cache_key_safety(
-    original_prompt: str,
-    cache_key_prompt: str,
-    context: str = "",
-) -> bool:
-    """
-    Safety invariant check for the dual-pipeline architecture.
-    Asserts that the cache key is not dramatically shorter than the original prompt,
-    which would indicate over-matching normalization silently deleting content.
-
-    Only called when CACHE_NORM_SAFETY_CHECK=true (off by default — no latency impact).
-
-    Returns True if invariant holds.  On violation: logs an error and returns False.
-    The caller must fall back to using original_prompt as the cache key.
-    """
-    if not isinstance(original_prompt, str) or not isinstance(cache_key_prompt, str):
-        return True
-    orig_len = len(original_prompt)
-    if orig_len == 0:
-        return True
-    key_len = len(cache_key_prompt)
-    ratio = key_len / orig_len
-    if ratio < 0.90:
-        _terminal_status(
-            "❌",
-            f"[CACHE-SAFETY] cache_key is {ratio:.1%} of original prompt "
-            f"({key_len} vs {orig_len} chars) — normalization over-matched. "
-            f"Falling back to original prompt as cache key. context={context}",
-        )
-        return False
-    return True
-
-
-def _scrub_cache_key(prompt: str) -> str:
-    """
-    Post-render scrub of the CACHE KEY ONLY — never called on the model input.
-
-    KRIPPER FIX-13: Length-Preserving Scrubbing.
-    Instead of short sentinels, we mask volatile text with '0's of identical length
-    to keep character/token offsets stable. This prevents 'rest_tokens inflation'.
-    """
-    if not isinstance(prompt, str):
-        return prompt
-    if not SETTINGS.cache_canonicalize_tool_context:
-        return prompt
-
-    def _mask(match):
-        """Helper to replace match with a string of same length (0-padding)."""
-        return "0" * len(match.group(0))
-
-    # Scrub timestamp and Claude Code telemetry.
-    normalized = CACHE_TIME_PATTERN.sub(_mask, prompt)
-    normalized = CACHE_TIME_COLON_PATTERN.sub(_mask, normalized)
-    normalized = CACHE_CCH_PATTERN.sub(_mask, normalized)
-    normalized = CACHE_BILLING_HEADER_PATTERN.sub(_mask, normalized)
-    normalized = CACHE_SYSTEM_REMINDER_PATTERN.sub(_mask, normalized)
-    normalized = CACHE_SKILLS_BLOCK_PATTERN.sub(_mask, normalized)
-    normalized = CACHE_RUNTIME_LINE_PATTERN.sub(_mask, normalized)
-    return normalized
-
-
-# _normalize_prompt_for_cache alias removed (Phase 7 Fix 4, 2026-03-14).
 # No call sites remain after Phase 6 cleanup.  Use _scrub_cache_key() directly.
 
 
-# --- DUAL-PIPELINE: message-struct level canonicalization ---
-# Structural anchors for the OpenClaw "Inbound Context (trusted metadata)" block.
-# These constants are intentionally plain strings — no regex — so there is no
-# risk of accidental over-matching on user content.
-_INBOUND_CONTEXT_HEADER = (
-    "## Group Chat Context\n## Inbound Context (trusted metadata)\n"
-)
-_INBOUND_CONTEXT_FENCE_OPEN = "```json"
-_INBOUND_CONTEXT_FENCE_CLOSE = "```"
-# Stable sentinel that replaces the ENTIRE Group Chat Context / Inbound Context
-# block (header + description lines + JSON fence) in the canonical cache key.
-# Using a single sentinel for the whole block — instead of replacing only the
-# JSON payload — ensures canonical form is IDENTICAL whether or not OpenClaw
-# included the block in a given turn.  OpenClaw sometimes omits the block
-# (confirmed in Phase 8 session logs: 44059 chars in T2, 43478 chars in T7),
-# which caused the entire KV cache to diverge at the omission point and produced
-# a 50.4% cache hit instead of the expected ~98%.
-_INBOUND_CONTEXT_STABLE_SECTION = "__STABLE_INBOUND_CONTEXT_SECTION__"
-# Anchor used for the "block absent" injection path.
-_PROJECT_CONTEXT_ANCHOR = "\n# Project Context"
 
-
-def _canonicalize_inbound_context_block(content: str) -> str:
-    """
-    Canonicalize the OpenClaw "Group Chat Context / Inbound Context" section.
-
-    Two cases are handled so the canonical form is IDENTICAL regardless of whether
-    OpenClaw included the block in a given turn (Phase 8 finding: the block is
-    sometimes present, sometimes absent, causing a 50.4% VLM cache hit instead of
-    the expected ~98% when the block is omitted in one turn but was present in the
-    turn whose KV state is cached).
-
-    Case A — block IS present:
-        Replace the ENTIRE block (from the '## Group Chat Context' line through
-        the closing ``` fence) with _INBOUND_CONTEXT_STABLE_SECTION.
-        Canonical: '...<before>\\n__STABLE_INBOUND_CONTEXT_SECTION__\\n# Project Context...'
-
-    Case B — block is ABSENT but '\\n# Project Context' anchor exists:
-        Insert _INBOUND_CONTEXT_STABLE_SECTION immediately before the anchor.
-        Canonical: same as Case A.
-
-    If neither condition is met, the content is returned unchanged (safe no-op).
-
-    Safety guarantees:
-    - Pure string operations, no regex, no DOTALL.
-    - Only touches the bounded region between the header and closing ```.
-    - Stops scanning after 10 description lines (cannot cross section boundaries).
-    - Idempotent: already-stable content is returned unchanged in one fast check.
-    """
-    # Fast idempotency check.
-    if _INBOUND_CONTEXT_STABLE_SECTION in content:
-        return content
-
-    header_pos = content.find(_INBOUND_CONTEXT_HEADER)
-
-    if header_pos != -1:
-        # --- Case A: block present ---
-        # Find the start of the '## Group Chat Context' line.
-        # header_pos already points there since _INBOUND_CONTEXT_HEADER begins with it.
-        # Walk forward (up to 10 lines) to find the opening ```json fence.
-        search_start = header_pos + len(_INBOUND_CONTEXT_HEADER)
-        fence_open_pos = -1
-        cursor = search_start
-        for _ in range(10):
-            line_end = content.find("\n", cursor)
-            if line_end == -1:
-                break
-            line = content[cursor:line_end]
-            if line.startswith(_INBOUND_CONTEXT_FENCE_OPEN):
-                fence_open_pos = cursor
-                break
-            # Stop if a new section header is encountered — prevents over-scanning.
-            if line.startswith("## ") or line.startswith("# "):
-                break
-            cursor = line_end + 1
-
-        if fence_open_pos == -1:
-            # JSON fence not found within 10 lines — leave unchanged (safe).
-            return content
-
-        # Find the closing ``` fence on its own line.
-        fence_line_end = content.find("\n", fence_open_pos)
-        if fence_line_end == -1:
-            return content
-        json_body_start = fence_line_end + 1
-        fence_close_pos = content.find(
-            "\n" + _INBOUND_CONTEXT_FENCE_CLOSE, json_body_start
-        )
-        if fence_close_pos == -1:
-            return content
-        # fence_close_pos + 1 = first ` of the closing fence.
-        # We advance past the full closing fence line (```\n) to get the remainder.
-        fence_end = fence_close_pos + 1 + len(_INBOUND_CONTEXT_FENCE_CLOSE)
-        # Skip the trailing newline if present.
-        if fence_end < len(content) and content[fence_end] == "\n":
-            fence_end += 1
-
-        # Determine prefix boundary: keep the content immediately before the block.
-        # header_pos may be preceded by a newline we want to preserve.
-        block_start = header_pos
-
-        return (
-            content[:block_start]
-            + _INBOUND_CONTEXT_STABLE_SECTION
-            + "\n"
-            + content[fence_end:]
-        )
-
-    else:
-        # --- Case B: block absent but # Project Context anchor present ---
-        # OpenClaw sometimes omits the Inbound Context section entirely.
-        # Insert the stable sentinel at the same relative position so the cache key
-        # matches turns where the block was present (Case A canonical form).
-        anchor_pos = content.find(_PROJECT_CONTEXT_ANCHOR)
-        if anchor_pos == -1:
-            return content  # No recognisable anchor — safe no-op.
-        # Insert stable sentinel on its own line immediately before the anchor.
-        # _PROJECT_CONTEXT_ANCHOR starts with '\n', so after anchor_pos we have
-        # '\n# Project Context'. We insert before that newline.
-        return (
-            content[:anchor_pos]
-            + "\n"
-            + _INBOUND_CONTEXT_STABLE_SECTION
-            + content[anchor_pos:]
-        )
-
-
-def _canonicalize_messages(
-    messages: List[Dict[str, Any]],
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """
-    Pre-render canonicalization: returns (original_messages, canonical_messages).
-
-    - original_messages  : deep copy of the input, never modified.
-      This is what the model always receives (fed to apply_chat_template for generation).
-    - canonical_messages : deep copy with volatile-but-semantically-neutral fields
-      replaced by stable tokens.  Used ONLY for cache key computation.
-
-    Volatile fields normalised in the canonical copy (message-struct level only):
-    1. "message_id" values inside JSON content strings → __STABLE_MSG_ID__
-       (handles OpenClaw / Claude Code per-request IDs that change every turn)
-    2. OpenClaw "Inbound Context (trusted metadata)" JSON block → __STABLE_INBOUND_META__
-       (handled structurally via string anchors, no DOTALL regex)
-
-    No other mutations.  In particular, tool results and <think> blocks are
-    preserved verbatim — the model sees them intact.
-    """
-    if not SETTINGS.cache_canonicalize_tool_context:
-        # Canonicalization disabled: both pipelines see the same content.
-        original = copy.deepcopy(messages)
-        return original, copy.deepcopy(original)
-
-    original: List[Dict[str, Any]] = copy.deepcopy(messages)
-    canonical: List[Dict[str, Any]] = copy.deepcopy(messages)
-
-    for msg in canonical:
-        content = msg.get("content", "")
-        if isinstance(content, str):
-            # 1. Stable message IDs.
-            content = INBOUND_META_MESSAGE_ID_PATTERN.sub(
-                r"\1__STABLE_MSG_ID__\2", content
-            )
-            # 2. Inbound Context block (system message — present or absent).
-            content = _canonicalize_inbound_context_block(content)
-            # 3. Sub-agent completion stats (volatile runtime duration in user messages).
-            content = SUBAGENT_STATS_PATTERN.sub(r"\1__STABLE_RUNTIME__", content)
-            msg["content"] = content
-        elif isinstance(content, list):
-            new_parts = []
-            for part in content:
-                if isinstance(part, dict) and part.get("type") == "text":
-                    text = part.get("text", "")
-                    text = INBOUND_META_MESSAGE_ID_PATTERN.sub(
-                        r"\1__STABLE_MSG_ID__\2", text
-                    )
-                    text = _canonicalize_inbound_context_block(text)
-                    text = SUBAGENT_STATS_PATTERN.sub(r"\1__STABLE_RUNTIME__", text)
-                    new_parts.append({**part, "text": text})
-                else:
-                    new_parts.append(part)
-            msg["content"] = new_parts
-
-    return original, canonical
-
-
-def _extract_session_context(
-    body: Dict[str, Any], prompt_tokens: List[int]
-) -> SessionContext:
-    def _read_any_id(
-        container: Optional[Dict[str, Any]], keys: List[str]
-    ) -> Optional[str]:
-        if not isinstance(container, dict):
-            return None
-        for key in keys:
-            value = container.get(key)
-            if value is None:
-                continue
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-            if isinstance(value, (int, float)):
-                return str(value)
-        return None
-
-    metadata = body.get("metadata")
-    extra_body = body.get("extra_body")
-
-    id_keys = [
-        "session_id",
-        "conversation_id",
-        "thread_id",
-        "chat_id",
-        "conversation",
-        "session",
-    ]
-    parent_keys = [
-        "parent_session_id",
-        "parent_id",
-        "source_session_id",
-        "origin_session_id",
-    ]
-    branch_keys = ["branch_id", "branch", "subsession_id", "subagent_id"]
-
-    session_id = (
-        _read_any_id(body, id_keys)
-        or _read_any_id(metadata, id_keys)
-        or _read_any_id(extra_body, id_keys)
-    )
-    parent_session_id = (
-        _read_any_id(body, parent_keys)
-        or _read_any_id(metadata, parent_keys)
-        or _read_any_id(extra_body, parent_keys)
-    )
-    branch_id = (
-        _read_any_id(body, branch_keys)
-        or _read_any_id(metadata, branch_keys)
-        or _read_any_id(extra_body, branch_keys)
-    )
-
-    source = "request"
-    if not session_id:
-        raw = ",".join(str(tok) for tok in prompt_tokens[:128])
-        digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
-        session_id = f"implicit-{digest}"
-        source = "derived_from_prompt_prefix"
-
-    if parent_session_id == session_id:
-        parent_session_id = None
-
-    return SessionContext(
-        session_id=session_id,
-        parent_session_id=parent_session_id,
-        branch_id=branch_id,
-        source=source,
-    )
 
 
 def _build_sampler(body):
@@ -3899,7 +3048,7 @@ class SidecarHandler(BaseHTTPRequestHandler):
             if system_parts:
                 messages = [{"role": "system", "content": "\n\n".join(system_parts)}] + non_system
 
-            prepared = _prepare_messages_for_template(messages)
+            prepared = _prepare_messages_for_template(messages, SETTINGS.normalize_write_tool_content_for_prompt)
 
             # Resolve enable_thinking: support both top-level (legacy) and
             # chat_template_kwargs (Qwen3.5 official API)
@@ -4378,7 +3527,7 @@ class APIHandler(BaseHTTPRequestHandler):
         if is_vlm:
             raw_messages = body.get("messages", [])
             # --- APPLY STATELESS HEALING ---
-            healed_messages = _heal_messages(raw_messages)
+            healed_messages = _heal_messages(raw_messages, HEALING_STORE, HEALING_STORE_LOCK)
 
             messages = _prepare_messages_for_vlm(healed_messages, tools=tools)
             images = _extract_images_from_messages(body.get("messages", []))
@@ -4416,7 +3565,7 @@ class APIHandler(BaseHTTPRequestHandler):
             prompt_tokens = model_tokens  # safe fallback
             if SETTINGS.cache_canonicalize_tool_context:
                 try:
-                    _, canonical_msgs_vlm = _canonicalize_messages(healed_messages)
+                    _, canonical_msgs_vlm = _canonicalize_messages(healed_messages, SETTINGS.cache_canonicalize_tool_context)
                     canon_prepared = _prepare_messages_for_vlm(
                         canonical_msgs_vlm, tools=tools
                     )
@@ -4442,7 +3591,7 @@ class APIHandler(BaseHTTPRequestHandler):
                             tools=tools,
                             enable_thinking=enable_thinking,
                         )
-                        _canon_fmt = _scrub_cache_key(str(_canon_fmt))
+                        _canon_fmt = _scrub_cache_key(str(_canon_fmt), SETTINGS.cache_canonicalize_tool_context)
                         _canon_ids = _vlm_tok.encode(_canon_fmt)
                         if isinstance(_canon_ids, list) and _canon_ids:
                             prompt_tokens = _canon_ids
@@ -4602,7 +3751,7 @@ class APIHandler(BaseHTTPRequestHandler):
 
             # --- APPLY STATELESS HEALING ---
             _heal_t0 = time.time()
-            healed_messages = _heal_messages(raw_messages)
+            healed_messages = _heal_messages(raw_messages, HEALING_STORE, HEALING_STORE_LOCK)
             _heal_ms = (time.time() - _heal_t0) * 1000
             _pipeline_timings["heal"] = _heal_ms
 
@@ -4623,7 +3772,10 @@ class APIHandler(BaseHTTPRequestHandler):
             # The stop instruction must reach the model (via original_messages) and
             # must also be reflected in the cache key (via canonical_messages).
             healed_messages, _loop_broken = _break_tool_call_loop(
-                healed_messages, request_id
+                healed_messages, request_id,
+                enabled=FEATURE_TOOL_LOOP_BREAKER,
+                max_retries=TOOL_LOOP_MAX_RETRIES,
+                log_fn=_pipeline_log if FEATURE_FULL_LOGGING else None,
             )
 
             # --- DUAL PIPELINE: split model input from cache key at message-struct level ---
@@ -4657,8 +3809,8 @@ class APIHandler(BaseHTTPRequestHandler):
             original_messages = _hoist_system_messages(original_messages)
             canonical_messages = _hoist_system_messages(canonical_messages)
 
-            messages = _prepare_messages_for_template(original_messages)
-            cache_messages = _prepare_messages_for_template(canonical_messages)
+            messages = _prepare_messages_for_template(original_messages, SETTINGS.normalize_write_tool_content_for_prompt)
+            cache_messages = _prepare_messages_for_template(canonical_messages, SETTINGS.normalize_write_tool_content_for_prompt)
 
             if hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template:
                 prompt = tokenizer.apply_chat_template(
@@ -4683,7 +3835,7 @@ class APIHandler(BaseHTTPRequestHandler):
 
             # Post-render scrub: atomic, line-scoped patterns only (cch=, billing header,
             # timestamps, system-reminder). Never applied to the model input.
-            cache_prompt = _scrub_cache_key(cache_prompt_raw)
+            cache_prompt = _scrub_cache_key(cache_prompt_raw, SETTINGS.cache_canonicalize_tool_context)
             # Safety invariant: cache key must not be dramatically shorter than the original.
             if SETTINGS.cache_norm_safety_check:
                 if not _assert_cache_key_safety(
@@ -5027,12 +4179,12 @@ class APIHandler(BaseHTTPRequestHandler):
                     _pipeline_timings["emergency_compress"] = time.time()
 
                     # Re-heal, re-canonicalize, re-tokenize
-                    healed_messages = _heal_messages(raw_messages)
-                    original_messages, canonical_messages = _canonicalize_messages(healed_messages)
+                    healed_messages = _heal_messages(raw_messages, HEALING_STORE, HEALING_STORE_LOCK)
+                    original_messages, canonical_messages = _canonicalize_messages(healed_messages, SETTINGS.cache_canonicalize_tool_context)
                     original_messages = _hoist_system_messages(original_messages)
                     canonical_messages = _hoist_system_messages(canonical_messages)
-                    messages = _prepare_messages_for_template(original_messages)
-                    cache_messages = _prepare_messages_for_template(canonical_messages)
+                    messages = _prepare_messages_for_template(original_messages, SETTINGS.normalize_write_tool_content_for_prompt)
+                    cache_messages = _prepare_messages_for_template(canonical_messages, SETTINGS.normalize_write_tool_content_for_prompt)
 
                     if hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template:
                         prompt = tokenizer.apply_chat_template(
@@ -5047,7 +4199,7 @@ class APIHandler(BaseHTTPRequestHandler):
                         prompt = messages[-1]["content"] if messages else ""
                         cache_prompt_raw = cache_messages[-1]["content"] if cache_messages else ""
 
-                    cache_prompt = _scrub_cache_key(cache_prompt_raw)
+                    cache_prompt = _scrub_cache_key(cache_prompt_raw, SETTINGS.cache_canonicalize_tool_context)
                     prompt_tokens = _tokenize_prompt(cache_prompt)
                     model_tokens = _tokenize_prompt(prompt)
 
