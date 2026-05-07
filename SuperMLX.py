@@ -1229,7 +1229,7 @@ PROMPT_CACHE_COMPACT = LRUPromptCache(
 )
 
 
-@dataclass(frozen=True)
+
 
 class SessionIndex:
     @dataclass
