@@ -1,0 +1,27 @@
+# SuperMLX — Requirements
+# Tested on Python 3.11-3.13, macOS (Apple Silicon only)
+#
+# CORE (required)
+mlx>=0.31.2
+mlx-lm>=0.31.3
+python-dotenv>=1.2.1
+safetensors>=0.6.2
+torch>=2.9.1          # CPU only — used to quarantine MPS from MLX (see SuperMLX.py)
+transformers>=5.7.0
+tokenizers>=0.22.1
+numpy>=2.3.3
+huggingface-hub>=1.9.0
+litellm>=1.83.2        # OpenAI-compatible reverse proxy
+
+# OPTIONAL — VLM support (vision models)
+# mlx-vlm>=0.3.11
+
+# OPTIONAL — Pipeline Monitor dashboard (streamlit run pipeline_monitor.py)
+# streamlit>=1.45.0
+# plotly>=6.1.0
+# psutil>=7.0.0
+
+# OPTIONAL — RAG enrichment + prompt compression (FEATURE_RAG_ENRICHMENT=true)
+# lancedb>=0.26.1
+# sentence-transformers>=5.2.0
+# llmlingua>=0.2.2

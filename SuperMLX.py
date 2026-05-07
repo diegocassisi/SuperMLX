@@ -1,204 +1,140 @@
+# SPDX-License-Identifier: MIT
 """
-SuperMLX1.3.85a.py — MLX Inference Server (Kripper Architecture + Dynamic Prefix Capture)
-PEQUEÑAS MEJORAS
+SuperMLX — Production-Grade MLX Inference Server for Agentic AI
 
-Last fix: /path/to/knowledge/wiki/MLXServer/warmup-cache-resilience.md
-══════════════════════════════════════════════════════════════════════════════
+OpenAI-compatible inference server on Apple Silicon (MLX). Serves agentic AI
+requests with persistent KV cache, multi-agent isolation, and OOM protection,
+maximizing cache hits to minimize TTFT.
 
-Servidor OpenAI-compatible sobre Apple Silicon (M4 Pro 24GB).
-Diseñado para OpenClaw con soporte multi-agente, Dual-Slot KV cache, detección
-automática de compact runner, y protección OOM reactiva via Metal memory guard.
+This file is the single source of inference logic.
+warmup_manager.py handles DPC. rag_enricher.py handles RAG/Compressor.
+═══════════════════════════════════════════════════════════════════════════════
 
-─── MULTI-MODEL COMPATIBILITY ────────────────────────────────────────────────
+─── MULTI-MODEL SUPPORT ──────────────────────────────────────────────────────
 
-  Soporte de familias de modelos (MODEL_FAMILY env var o auto-detect):
+  Family     Models                   Tool Call Format          Thinking       Status
+  ────────   ──────────────────────   ─────────────────────    ────────────   ──────
+  qwen3      Qwen 3 / 3.5            <tool_call><function=>   <think>        ✅ Production
+  hermes     Hermes 3 (NousResearch)  <tool_call> + JSON       <think>        ✅ Supported
+  glm4       GLM-4 / 4.5 / 4.7       <tool_call> + JSON       <think>        ✅ Supported
+  gemma4     Gemma 4 (Google)         <|tool_call|> + JSON     <|think|>      ✅ Supported
+  deepseek   DeepSeek V3 / R1         JSON (via template)      <think>        ✅ Supported
+  generic    Phi-4, other ChatML      <tool_call> + JSON       <think>        ⚠️  Fallback
 
-  Familia      Modelos                  Tool Call Format         Thinking         Status
-  ─────────    ─────────────────────    ────────────────────     ─────────────    ──────
-  qwen3        Qwen 3/3.5               <tool_call><function=>  <think>          ✅ Producción
-  hermes       Hermes 3 (NousResearch)  <tool_call> + JSON       <think>          ✅ Soportado
-  glm4         GLM-4/4.5/4.7 (Zhipu)   <tool_call> + JSON       <think>          ✅ Soportado
-  gemma4       Gemma 4 (Google)         <|tool_call|> + JSON     <|think|>        ✅ Soportado
-  deepseek     DeepSeek V3/R1           JSON (via template)      <think>          ✅ Soportado
-  generic      Phi-4, otros ChatML      <tool_call> + JSON       <think>          ⚠️ Fallback
-
-  INPUT:  Manejado por tokenizer.apply_chat_template() — model-agnostic.
-  OUTPUT: Parsed por _extract_openai_tool_calls() con fallback chain.
-
-  Switches:
-    MODEL_PATH=mlx-community/...       Modelo a cargar (HuggingFace o local)
-    MODEL_FAMILY=qwen3|hermes|glm4|gemma4|deepseek|generic
-                                        Auto-detectado desde MODEL_PATH si no se especifica.
+  Tokenization: tokenizer.apply_chat_template() — model-agnostic.
+  Extraction:   _extract_openai_tool_calls() with multi-family fallback chain.
 
 ─── QUICK START ──────────────────────────────────────────────────────────────
 
-  Mínimo (producción):
+  Minimal:
+    python SuperMLX.py
 
-    FORCE_TEXT_MODE=true python SuperMLX1.3.82.py
-
-  Full features (TurboQuant + DPC warmup + persistencia):
-
-    FORCE_TEXT_MODE=true USE_OPTIQ=true \
-      CACHE_PERSIST_PATH=logs/warmup_cache.safetensors \
-      EMBEDDED_CACHE_PERSIST_PATH=logs/embedded_cache.safetensors \
-      python SuperMLX1.3.83.py
-
-
-
-
+  Production (DPC + cache persistence):
+    FORCE_TEXT_MODE=true \\
+      CACHE_PERSIST_PATH=logs/warmup_cache.safetensors \\
+      EMBEDDED_CACHE_PERSIST_PATH=logs/embedded_cache.safetensors \\
+      python SuperMLX.py
 
   Endpoints:
-    Proxy (OpenClaw):  http://0.0.0.0:4000/v1/chat/completions
-    MLX directo:       http://0.0.0.0:8080/v1/chat/completions
-    Sidecar (externo): http://0.0.0.0:8081/v1/chat/completions
+    LiteLLM Proxy:  http://0.0.0.0:4000/v1/chat/completions  (point your framework here)
+    MLX Direct:     http://0.0.0.0:8080/v1/chat/completions
+    Sidecar:        http://0.0.0.0:8081/v1/chat/completions  (scripts, sensors)
 
-─── FEATURES ─────────────────────────────────────────────────────────────────
+─── ACTIVE FEATURES ──────────────────────────────────────────────────────────
 
-  ✅ ACTIVAS POR DEFECTO:
-    • Dual-Slot KV Cache       PROMPT_CACHE (MAIN) + PROMPT_CACHE_COMPACT (compact)
-    • Compact Runner Detector  Guard 1 (tools) + Guard 2 (keywords) + Guard 3b (anti-MAIN)
-    • Memory Guard             Pre-prefill Metal RAM check (80% threshold, auto-evict)
-    • Session-aware routing    SESSION_INDEX con prefix matching + block index
-    • Cache persistence        Warmup + embedded cache persist a disco
-    • Proxy reverse            nginx-lite que routea OpenClaw → MLX
-    • Hybrid Cache Support     Qwen3.5 Gated DeltaNet (ArraysCache + KVCache) persistence
+  ✅ On by default:
+    • Dual-Slot KV Cache        Isolated MAIN + COMPACT LRU stores per agent type
+    • Dynamic Prefix Capture    Auto-capture, hash validation, disk persistence (warmup_manager.py)
+    • Post-Reaper Cache Reload  Automatic disk reload after idle eviction (v1.4.0)
+    • Cache Canonicalization     Volatile fields masked → 97%+ cache hit rate
+    • Compact Runner Detector   Multi-signal routing: tools + keywords + anti-MAIN guard
+    • Memory Guard              Pre-prefill Metal RAM check with auto-eviction
+    • Tool Loop Breaker         Breaks infinite tool-call retry cycles (3 detection modes)
+    • Emergency Compression     LLMLingua-2 last-resort OOM defense
+    • Session-Aware Routing     Per-session prefix tracking with block-hash index
     • Min-Suffix Pollution Wash Re-prefill ≥256 tokens on cache hit with response pollution
-    • Per-Layer Trim (auto-save) Deepcopy + trim KVCache only for hybrid cache disk saves
-    • Frozen Cache Snapshot     Auto-save updates frozen cache with prompt-only coverage
+    • Per-Layer Trim            Selective KVCache trim for hybrid architecture disk saves
+    • Frozen Cache Snapshot     Prompt-only snapshot for post-generation cache recovery
+    • LiteLLM Reverse Proxy     OpenAI-compatible routing layer
 
-  🔧 OPCIONALES (env vars):
-    • TurboQuant OptiQ         USE_OPTIQ=true         (KV 4.5GB→1GB, 4.5x compresión)
-    • TurboQuant Hybrid        (auto si turboquant-mlx instalado y USE_OPTIQ=false)
-    • RAG Enrichment           FEATURE_RAG_ENRICHMENT=true + RAG_WORKSPACE_ROOT=/path
-    • Prompt Compressor        FEATURE_COMPRESSOR=true
-    • Text-only mode           FORCE_TEXT_MODE=true    (skip VLM, faster load)
-    • Cascade Routing          FEATURE_CASCADE=true     (forward a frontier API si RAG confidence baja)
+  🔧 Optional (env vars):
+    • RAG Enrichment            FEATURE_RAG_ENRICHMENT=true  (LanceDB + embeddings)
+    • Prompt Compressor         FEATURE_COMPRESSOR=true      (LLMLingua-2 + reranker)
+    • Vision Model Support      Auto-detected from config    (mlx-vlm)
+    • Cascade Routing           FEATURE_CASCADE=true         (frontier API fallback)
+    • Native KV Quantization    KV_BITS=4                    (4-bit / 8-bit per session)
 
-  ❌ DESACTIVADAS:
-    • TurboQuant Legacy        FEATURE_TURBOQUANT=False (incompatible Qwen3.5 DecoderLayer)
-    • Continuous Batching      No implementado (model_lock serializa requests)
+  ❌ Not implemented:
+    • Continuous Batching       model_lock serializes requests (single-request pipeline)
 
-─── CASCADE ROUTING ──────────────────────────────────────────────────────────
-
-  Cuando RAG confidence es baja (no hay knowledge local para la query), el
-  request se redirige a un frontier model (Gemini, etc.) en vez de generar
-  localmente. Esto cubre los rubros donde el modelo local no tiene training.
-
-  Flujo:
-    Request → RAG search → best_score > CASCADE_THRESHOLD
-      → Forward a CASCADE_API_URL con el API key
-      → Response del frontier se proxea de vuelta al cliente
-      → El modelo local nunca se toca (0 GPU, 0 latencia local)
-
-  Señales que activan cascade:
-    1. RAG confidence baja: best L2 score > CASCADE_RAG_THRESHOLD (default 2.0)
-    2. Señal explícita: header X-Force-Cascade: true en el request
-    3. Latencia: model_lock contention > CASCADE_LATENCY_THRESHOLD_MS (futuro)
-
-  Señales que BLOQUEAN cascade:
-    1. Compact runner (embedded agent) — siempre local
-    2. RAG bypass requests (flush, summarize) — siempre local
-    3. Header X-No-Cascade: true — el caller fuerza local
-    4. Feature flag desactivado (default)
-
-  Env vars:
-    FEATURE_CASCADE              (false)    Master switch
-    CASCADE_API_URL              ("")       URL del endpoint frontier (OpenAI-compatible)
-                                             Ej: https://generativelanguage.googleapis.com/v1beta/openai/chat/completions
-    CASCADE_API_KEY              ("")       API key del frontier model
-    CASCADE_MODEL                ("")       Nombre del modelo frontier (ej: gemini-2.0-flash)
-    CASCADE_RAG_THRESHOLD        (2.0)      L2 distance mínima para triggear cascade
-    CASCADE_TIMEOUT_S            (60)       Timeout del request al frontier
-
-─── ENV VARS ─────────────────────────────────────────────────────────────────
+─── CONFIGURATION ────────────────────────────────────────────────────────────
 
   Core:
-    FORCE_TEXT_MODE                  (true)     Cargar como text-only, no VLM
-    MLX_HOST                        (0.0.0.0)  Host del servidor MLX
-    MLX_PORT                        (8080)     Puerto del servidor MLX
-    PROXY_PORT                      (4000)     Puerto del proxy (OpenClaw apunta acá)
-    SIDECAR_PORT                    (8081)     Puerto del sidecar (0=disabled)
+    MODEL_PATH                      (mlx-community/Qwen3.5-9B-4bit)  HuggingFace ID or local path
+    MODEL_FAMILY                    (auto)      qwen3 | hermes | glm4 | gemma4 | deepseek | generic
+    FORCE_TEXT_MODE                 (false)     Skip VLM detection for text-only models
+    MLX_PORT                        (8080)      MLX engine port
+    PROXY_PORT                      (4000)      LiteLLM proxy port
+    SIDECAR_PORT                    (8081)      Sidecar port (0 = disabled)
 
   KV Cache:
-    MAX_KV_SIZE                     (196608)   Tamaño máximo del KV cache por sesión
-    PROMPT_CACHE_MAX_ENTRIES_GLOBAL (2)        Entries máximas en LRU MAIN (2=safe 24GB)
-    KV_BITS                         (None)     Quantización nativa del KV (4/8/None)
+    MAX_KV_SIZE                     (196608)    Max tokens per session
+    PROMPT_CACHE_MAX_ENTRIES_GLOBAL (2)         Max LRU entries (2 = safe for 24GB)
+    PROMPT_CACHE_TTL_SECONDS        (1800)      Entry TTL before reaper prunes
+    CACHE_REAPER_INTERVAL_SECONDS   (60)        Reaper check frequency
+    KV_BITS                         (None)      Native quantization (4 / 8 / None)
 
-  TurboQuant:
-    USE_OPTIQ                       (false)    Activar OptiQ TurboQuant (preferido)
-    TURBOQUANT_BITS                 (4)        Bits de compresión TQ (3-4)
+  Persistence (DPC):
+    CACHE_PERSIST_PATH              ("")        Disk path for MAIN cache
+    EMBEDDED_CACHE_PERSIST_PATH     ("")        Disk path for COMPACT cache
 
-  Memory Guard:
-    MEMORY_GUARD_THRESHOLD_GB       (auto)     Umbral Metal RAM (default: 80% de RAM física)
-                                               Set 0 para desactivar
+  Memory:
+    MEMORY_GUARD_THRESHOLD_GB       (auto)      total_ram - 8GB (0 = disabled)
 
-  RAG / Compressor:
-    FEATURE_RAG_ENRICHMENT          (false)    Activar RAG codebase enrichment
-    RAG_WORKSPACE_ROOT              ("")       Path al workspace para indexar
-    FEATURE_COMPRESSOR              (false)    Activar prompt compression
-
-  Warmup / Persistencia (Dynamic Prefix Capture):
-    CACHE_PERSIST_PATH              ("")       Path para persistir cache MAIN
-    EMBEDDED_CACHE_PERSIST_PATH     ("")       Path para persistir cache COMPACT
-    (WARMUP_PROMPT_FILE removed — DPC auto-captures from first real request)
-
-  Sidecar:
-    SIDECAR_PORT                    (8081)     Puerto (0=disabled)
-    SIDECAR_MAX_TOKENS              (2048)     Max tokens por response
-    SIDECAR_ENABLE_RAG              (true)     Enriquecer con RAG
+  See .env.example for the full reference with all supported variables.
 
 ─── MEMORY BUDGET (24GB M4 Pro) ──────────────────────────────────────────────
 
-  Sin TurboQuant (USE_OPTIQ=false):
-    Modelo Qwen3.5-9B-4bit:   ~5.0 GB
+    Model Qwen3.5-9B-4bit:    ~5.0 GB
     2 MAIN KV entries:        ~9.0 GB  (2 × 4.5GB)
     1 COMPACT KV entry:       ~4.5 GB
     Scratch prefill:          ~5.0 GB
     ──────────────────────────────────
-    Total pico:               ~23.5 GB → safe con Memory Guard a 19.2GB
-    Agentes simultáneos:      1-2 con cache caliente
+    Peak total:               ~23.5 GB → safe with Memory Guard at 19.2GB
+    Concurrent agents:        1–2 with warm cache
 
-  Con TurboQuant (USE_OPTIQ=true):
-    Modelo Qwen3.5-9B-4bit:   ~5.0 GB
-    4 MAIN KV entries:        ~4.0 GB  (4 × 1.0GB comprimido)
-    1 COMPACT KV entry:       ~1.0 GB
-    Scratch prefill:          ~5.0 GB
-    ──────────────────────────────────
-    Total pico:               ~15.0 GB → amplio margen
-    Agentes simultáneos:      4-5 con cache caliente
-    (Ajustar PROMPT_CACHE_MAX_ENTRIES_GLOBAL=4 para aprovechar)
+─── ARCHITECTURE ─────────────────────────────────────────────────────────────
 
-─── ARQUITECTURA ─────────────────────────────────────────────────────────────
-
-  OpenClaw MAIN agent ──→ Proxy :4000 ──→ MLX :8080 (APIHandler + Kripper)
-                                           │
-                          _detect_compact_runner()
-                           │              │
-                     MAIN path       COMPACT path
-                           │              │
-                    PROMPT_CACHE    PROMPT_CACHE_COMPACT
-                     (LRU max=2)      (LRU max=1)
-                           │              │
-                    ┌──────┴──────┐       │
-                    │Memory Guard │       │
-                    │(Metal RAM)  │       │
-                    └──────┬──────┘       │
-                           ↓              ↓
-                        stream_generate(model, prompt_cache=...)
-                                           ▲
-  Trading sensors ──→ Sidecar :8081 ───────┘
-  Scripts externos    (ephemeral cache, optional RAG, same model_lock)
-
-  Bug crítico OpenClaw resuelto: compaction.model debe tener el provider
-  como prefijo (ej: "oc-qwen/openai/model-id"). El campo compaction.provider
-  es ignorado por OpenClaw. Ver OPENCLAW_POINTERS_VALIDATION.md.
+  OpenClaw / Claude Code ──→ LiteLLM Proxy :4000 ──→ MLX Engine :8080
+                                                        │
+                                _detect_compact_runner()
+                                 │              │
+                           MAIN path       COMPACT path
+                                 │              │
+                          PROMPT_CACHE    PROMPT_CACHE_COMPACT
+                           (LRU max=2)      (LRU max=1)
+                                 │              │
+                          ┌──────┴──────┐       │
+                          │Memory Guard │       │
+                          │(Metal RAM)  │       │
+                          └──────┬──────┘       │
+                                 ↓              ↓
+                              stream_generate(model, prompt_cache=...)
+                                                 ▲
+  External tools ──→ Sidecar :8081 ──────────────┘
+                     (ephemeral cache, optional RAG, same model_lock)
 """
+import os
+# HuggingFace download progress bars: shown by default (useful for first-time model downloads).
+# Set HF_SHOW_DOWNLOAD_PROGRESS=false in .env to suppress on cached setups.
+if os.getenv("HF_SHOW_DOWNLOAD_PROGRESS", "true").lower() in ("0", "false", "no", "off"):
+    os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+
 import json
 import time
 import subprocess
 import atexit
 import copy
-import os
 import threading
 import tempfile
 import re
@@ -266,6 +202,8 @@ DOTENV_PATH = SCRIPT_DIR / ".env"
 _vlm_diagnostics = threading.local()
 if DOTENV_PATH.exists():
     load_dotenv(dotenv_path=DOTENV_PATH, override=True)
+
+__version__ = "1.4.0"
 
 
 def _env_str(name: str, default: str) -> str:
@@ -387,7 +325,6 @@ class Settings:
     log_root: Path
     proxy_startup_wait_seconds: float
     proxy_model_id: str
-    warmup_prompt_file: str
     cache_persist_path: str
     embedded_cache_persist_path: str  # Kripper slot para EMBEDDED agents (compaction/memory)
     memory_guard_threshold_gb: float  # Metal RAM threshold (GB) for pre-prefill eviction (0=disabled)
@@ -428,8 +365,7 @@ def _infer_model_family(model_path: str) -> str:
 
 
 def _build_settings() -> Settings:
-    _use_optiq = _env_str("USE_OPTIQ", "false").lower() in ("1", "true", "yes")
-    _default_model = "mlx-community/Qwen3.5-9B-4bit"  # OptiQ pesos producen garbage — solo usar TQ para KV cache
+    _default_model = "mlx-community/Qwen3.5-9B-4bit"
     model_path = _env_str("MODEL_PATH", _default_model)
     model_family = _normalize_model_family(
         _env_str("MODEL_FAMILY", _infer_model_family(model_path))
@@ -495,7 +431,6 @@ def _build_settings() -> Settings:
         log_root=Path(_env_str("LOG_ROOT", str(SCRIPT_DIR / "logs"))),
         proxy_startup_wait_seconds=_env_float("PROXY_STARTUP_WAIT_SECONDS", 2.0),
         proxy_model_id=proxy_model_id,
-        warmup_prompt_file=_env_str("WARMUP_PROMPT_FILE", ""),
         cache_persist_path=_env_str("CACHE_PERSIST_PATH", ""),
         embedded_cache_persist_path=_env_str("EMBEDDED_CACHE_PERSIST_PATH", ""),
         # Memory guard: evict cache entries if Metal RAM exceeds this threshold (GB).
@@ -524,14 +459,6 @@ SETTINGS = _build_settings()
 # Cambiar True/False y reiniciar el servidor. Sin env vars por ahora — rapidez.
 # ══════════════════════════════════════════════════════════════════════════════
 
-# KV cache compression via TurboQuant (4.57x). Requiere turboquant_lite.py + turboquant_mlx.
-# DISABLED: incompatible with Qwen3.5 (DecoderLayer has no self_attn attribute)
-FEATURE_TURBOQUANT         = False
-
-# OptiQ TurboQuant KV cache (from mlx-optiq). Per-layer, only self_attn.
-# Activates only when USE_OPTIQ=true. Takes priority over FEATURE_TURBOQUANT.
-FEATURE_OPTIQ_TURBOQUANT   = _env_str("USE_OPTIQ", "false").lower() in ("1", "true", "yes")
-
 # Prompt compression: historial largo → LanceDB → solo contexto relevante.
 # Requiere rag_enricher.py + lancedb + sentence-transformers.
 # Env: FEATURE_COMPRESSOR=true | COMPRESSION_THRESHOLD=6000 | COMPRESSION_GUARD=6
@@ -548,7 +475,7 @@ FEATURE_EMERGENCY_COMPRESS    = _env_str("EMERGENCY_CONTENT_COMPRESS", "true").l
 FEATURE_RAG_ENRICHMENT        = _env_str("FEATURE_RAG_ENRICHMENT", "false").lower() in ("1", "true", "yes")
 FEATURE_RAG_WORKSPACE_ROOT    = _env_str("RAG_WORKSPACE_ROOT", "")
 
-# Headers HTTP de diagnóstico (X-Pipeline-Compression-Ms, X-Pipeline-TQ-Active, etc.)
+# Headers HTTP de diagnóstico (X-Pipeline-Compression-Ms, X-Pipeline-RAG-Ms, etc.)
 FEATURE_DIAGNOSTIC_HEADERS = True
 
 # Logging exhaustivo de todas las etapas del pipeline.
@@ -564,11 +491,6 @@ FEATURE_LOG_CACHE          = True   # Hit/miss/shorter, stable prefix, evictions
 FEATURE_LOG_HEALING        = True   # Healing store operations (hits, store size)
 FEATURE_LOG_GENERATION     = True   # tps, timing, token breakdown por etapa
 FEATURE_LOG_RESP           = True   # Response normalization, tool extraction, think stripping
-FEATURE_LOG_TQ_DETAIL      = _env_bool("LOG_TQ_DETAIL", True)  # TurboQuant internals: bits, compression, memoria
-
-# TurboQuant: config
-FEATURE_TQ_BITS            = 4      # Bits de quantización (1/2/3/4). 4 = mejor calidad.
-FEATURE_TQ_SEED            = 42     # Seed para rotation determinista
 
 # Compressor: config (env-var driven above, these are runtime defaults for rag_enricher)
 FEATURE_COMPRESSION_THRESHOLD = _env_int("COMPRESSION_THRESHOLD", 6000)
@@ -693,14 +615,6 @@ def _compress_with_cache(
 FEATURE_RAG_TOP_K             = 5      # chunks a recuperar de LanceDB
 FEATURE_RAG_RELEVANCE_THRESHOLD = 1.6  # Qwen3-Embed asimétrico (docs sin prefijo). Probado 0.8: filtra demasiado
 
-# Tool Filter: strip non-essential tools to save ~8K tokens in prompt
-FEATURE_TOOL_FILTER           = False  # Was True — stripped web_search etc, causing tool-call rabbit holes
-FEATURE_TOOL_ALLOWLIST        = {
-    "read", "edit", "write", "exec", "process",
-    "memory_search", "memory_get", "message",
-}  # Only these tools are sent to the model. Others are stripped.
-_CANONICAL_TOOLS = None  # Will be set on first request with tools
-
 # Tool Call Loop Breaker: detect and break infinite tool-call retry loops.
 # When the model retries the same failed tool N consecutive times, inject a
 # stop instruction into the last tool_result so the model gives up and responds
@@ -711,24 +625,6 @@ TOOL_LOOP_MAX_RETRIES         = _env_int("TOOL_LOOP_MAX_RETRIES", 3)
 # Dynamic Prefix Capture (DPC): replaces warmup_seed.txt with auto-capture + hash validation.
 # Managed by warmup_manager.py. No manual seed files needed.
 import warmup_manager as _wm
-
-# Prompt optimization pipeline (CPU-only, no Metal)
-# DISABLED 2026-04-30: Both modules run but have zero functional effect.
-# tool_cache_injector: only tracks hashes, DPC already handles caching.
-# prompt_reorderer: output discarded (line 5255 reads fresh from body).
-# Re-enable when connected to pipeline properly.
-# try:
-#     import tool_cache_injector as _tci
-#     _tci_available = True
-# except ImportError:
-#     _tci_available = False
-# try:
-#     import prompt_reorderer as _pr
-#     _pr_available = True
-# except ImportError:
-#     _pr_available = False
-_tci_available = False
-_pr_available = False
 
 # ── CASCADE ROUTING ──────────────────────────────────────────────────────────
 # Forward a frontier API cuando RAG confidence es baja (no hay knowledge local).
@@ -821,19 +717,40 @@ def _resolve_model_path_and_config():
         try:
             from huggingface_hub import snapshot_download
 
-            path = Path(
-                snapshot_download(
-                    repo_id=path_str,
-                    allow_patterns=[
-                        "*.json",
-                        "*.safetensors",
-                        "*.model",
-                        "*.tiktoken",
-                        "*.py",
-                        "*.jinja",
-                    ],
+            # Offline-first: use cached snapshot, fallback to network
+            _was_offline = os.environ.get("HF_HUB_OFFLINE")
+            os.environ.setdefault("HF_HUB_OFFLINE", "1")
+            try:
+                path = Path(
+                    snapshot_download(
+                        repo_id=path_str,
+                        allow_patterns=[
+                            "*.json",
+                            "*.safetensors",
+                            "*.model",
+                            "*.tiktoken",
+                            "*.py",
+                            "*.jinja",
+                        ],
+                    )
                 )
-            )
+            except Exception:
+                # Not cached yet — retry with network
+                if _was_offline is None:
+                    os.environ.pop("HF_HUB_OFFLINE", None)
+                path = Path(
+                    snapshot_download(
+                        repo_id=path_str,
+                        allow_patterns=[
+                            "*.json",
+                            "*.safetensors",
+                            "*.model",
+                            "*.tiktoken",
+                            "*.py",
+                            "*.jinja",
+                        ],
+                    )
+                )
             config_path = path / "config.json"
             if config_path.exists():
                 with open(config_path, encoding="utf-8") as f:
@@ -1587,64 +1504,16 @@ def _cascade_forward_request(body: Dict[str, Any], request_id: str,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# COMPONENT INITIALIZATION — TurboQuant, RAG, Compressor
+# COMPONENT INITIALIZATION — RAG, Compressor
 # Deferred to after model load (see post-model-load section below).
 # These globals track runtime availability after dependency checks.
 # ══════════════════════════════════════════════════════════════════════════════
-
-_tq_available = False
-_tq_cache_class = None        # Will be set to TQCacheLite if available
-_tq_apply_patch = None        # Will be set to apply_patch function
-
-_optiq_tq_available = False
-_optiq_tq_cache_class = None  # Will be set to TurboQuantKVCache from optiq
-
-# KRIPPER FASE 2 — turboquant_mlx hybrid (second priority, after OptiQ)
-# Activated via TURBOQUANT_HYBRID=true. Uses servidorWEB.py pattern:
-# TurboQuantKVCache on softmax layers, native cache on GatedDeltaNet (is_linear=True).
-_tq_hybrid_available = False
-_tq_hybrid_cache_class = None  # turboquant_mlx.TurboQuantKVCache
 
 _compressor_available = False
 _compressor_module = None     # Will be set to rag_enricher module
 
 _rag_available = False
 _rag_module = None            # Will be set to rag_enricher module (same module)
-
-def _build_hybrid_cache(cache_model, bits: int = 4, seed: int = 42):
-    """
-    KRIPPER FASE 2 — Hybrid TurboQuant cache (ported from servidorWEB.py).
-
-    Applies TurboQuantKVCache (turboquant_mlx) to softmax attention layers only.
-    Leaves GatedDeltaNet / linear attention layers with native cache.
-    This avoids the Qwen3.5 crash: 'DecoderLayer has no self_attn attribute'.
-
-    Compression: 4.5GB per slot → ~1GB (4.57x ratio at 4 bits).
-    Requires: pip install turboquant-mlx
-    """
-    if not _tq_hybrid_available or _tq_hybrid_cache_class is None:
-        return None
-    try:
-        native_cache = cache_model.make_cache()
-        hybrid_cache = []
-        n_tq = 0
-        for i, layer in enumerate(cache_model.layers):
-            is_linear = getattr(layer, "is_linear", False)
-            if is_linear:
-                hybrid_cache.append(native_cache[i])  # GatedDeltaNet: native
-            else:
-                hybrid_cache.append(_tq_hybrid_cache_class(bits=bits, seed=seed))
-                n_tq += 1
-        _terminal_status(
-            "⚡",
-            f"TurboQuant Hybrid: cache built | "
-            f"{n_tq} layers TQ (softmax) + {len(cache_model.layers) - n_tq} native (linear) | "
-            f"bits={bits} | est. footprint: ~{n_tq * 0.035:.1f}GB"
-        )
-        return hybrid_cache
-    except Exception as e:
-        _terminal_status("⚠️", f"TurboQuant Hybrid: _build_hybrid_cache failed ({e}) — falling back to standard cache")
-        return None
 
 def _terminal_status(icon: str, message: str, indent: int = 0) -> None:
     with console_lock:
@@ -2027,7 +1896,6 @@ class LRUPromptCache:
         # Longer cache: request is a strict prefix of cached
         # Trimming is delegated to Fix-31 v3 (Model Space Math)
         return entry.prompt_cache, [], best_cached_tokens, "longer", len(tokens_tup)
-        return None, tokens, tokens, "miss", 0
 
     def insert_cache(self, model, tokens, prompt_cache, pinned: bool = False):
         self.prune_expired()
@@ -4076,10 +3944,21 @@ if _config and _is_vlm_config(_config) and not SETTINGS.force_text_mode:
         )
 else:
     if SETTINGS.force_text_mode and _config and _is_vlm_config(_config):
-        _terminal_status("⚠️", "FORCE_TEXT_MODE=true → VLM config detected but loading as TEXT-ONLY (faster, enables TurboQuant)")
-    model, tokenizer = load(
-        SETTINGS.model_path, tokenizer_config={"trust_remote_code": True}
-    )
+        _terminal_status("⚠️", "FORCE_TEXT_MODE=true → VLM config detected but loading as TEXT-ONLY (faster)")
+    # Force offline mode: model already cached in ~/.cache/huggingface/
+    # Prevents "Fetching N files" network check on every boot.
+    # If model isn't cached yet, we catch the error and retry online.
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    try:
+        model, tokenizer = load(
+            SETTINGS.model_path, tokenizer_config={"trust_remote_code": True}
+        )
+    except Exception as _offline_err:
+        _terminal_status("⚠️", f"Offline load failed ({_offline_err}) — retrying with network...")
+        os.environ.pop("HF_HUB_OFFLINE", None)
+        model, tokenizer = load(
+            SETTINGS.model_path, tokenizer_config={"trust_remote_code": True}
+        )
     _terminal_status("✅", "Model loaded (mlx-lm).")
     _terminal_status("⚡", "Torch acceleration: N/A (text-only model).")
 _terminal_status(
@@ -4093,100 +3972,14 @@ _terminal_status(
     ),
 )
 _kv_desc = f"bits={SETTINGS.kv_bits}" if SETTINGS.kv_bits is not None else "OFF"
-if SETTINGS.kv_bits is not None and SETTINGS.kv_quant_scheme == "turboquant":
-    _kv_desc += f" scheme=turboquant start={SETTINGS.quantized_kv_start}"
-elif SETTINGS.kv_bits is not None:
-    _kv_desc += f" scheme=uniform group_size={SETTINGS.kv_group_size}"
-_terminal_status("🗜️", f"KV Cache Quantization: {_kv_desc}")
+if SETTINGS.kv_bits is not None:
+    _kv_desc += f" scheme={SETTINGS.kv_quant_scheme} group_size={SETTINGS.kv_group_size}"
+_terminal_status("🗜️", f"KV Cache Quantization (native mlx-lm): {_kv_desc}")
 
 # ══════════════════════════════════════════════════════════════════════════════
-# POST-MODEL-LOAD: Initialize optional components (TurboQuant, RAG, Compressor)
 # Each component checks its FEATURE flag, then tries to import dependencies.
 # Failures are logged but never crash startup — graceful degradation.
 # ══════════════════════════════════════════════════════════════════════════════
-
-# --- OptiQ TurboQuant (preferred) ---
-if FEATURE_OPTIQ_TURBOQUANT:
-    try:
-        from optiq.core.turbo_kv_cache import TurboQuantKVCache as _OptiqTQCache
-        from optiq.core.turbo_kv_cache import patch_attention as _optiq_patch_attention
-        _optiq_tq_cache_class = _OptiqTQCache
-        _optiq_tq_available = True
-
-        # CRITICAL: Install the rotated-space attention monkey-patch.
-        # Without this, SDPA receives centroid-space KV without the required
-        # pre/post rotations → garbage output.
-        _optiq_patch_attention()
-
-        # FIX: OptiQ only patches qwen3_next, but our model uses qwen3.
-        # Patch qwen3 explicitly so the rotated-space SDPA is used.
-        try:
-            import mlx_lm.models.qwen3 as _qwen3_module
-            from optiq.core.turbo_kv_cache import _turbo_scaled_dot_product_attention
-            if hasattr(_qwen3_module, "scaled_dot_product_attention"):
-                _qwen3_module.scaled_dot_product_attention = _turbo_scaled_dot_product_attention
-                _terminal_status("⚡", "OptiQ: patched qwen3.scaled_dot_product_attention ✓")
-        except ImportError:
-            pass
-
-        # Count self_attn layers (only those get TurboQuant)
-        cache_model = model.language_model if is_vlm and hasattr(model, "language_model") else model
-        _self_attn_count = sum(1 for layer in cache_model.layers if hasattr(layer, "self_attn"))
-        _linear_attn_count = len(cache_model.layers) - _self_attn_count
-        _terminal_status(
-            "⚡",
-            f"OptiQ TurboQuant: ACTIVATED | bits={FEATURE_TQ_BITS} | "
-            f"self_attn={_self_attn_count} layers (TQ) | linear_attn={_linear_attn_count} layers (standard) | "
-            f"model=OptiQ mixed-precision"
-        )
-    except ImportError as e:
-        _terminal_status("⚠️", f"OptiQ TurboQuant: UNAVAILABLE (import failed: {e}) — falling back to TQCacheLite")
-    except Exception as e:
-        _terminal_status("❌", f"OptiQ TurboQuant: FAILED ({e}) — falling back to TQCacheLite")
-
-# --- TurboQuant Hybrid / turboquant_mlx (second priority, after OptiQ) ---
-# Env: TURBOQUANT_HYBRID=true  |  pip install turboquant-mlx
-_FEATURE_TQ_HYBRID = _env_str("TURBOQUANT_HYBRID", "false").lower() in ("1", "true", "yes")
-if not _optiq_tq_available and not is_vlm and _FEATURE_TQ_HYBRID:
-    try:
-        from turboquant_mlx import TurboQuantKVCache as _TQMlxCache
-        _tq_hybrid_cache_class = _TQMlxCache
-        _tq_hybrid_available = True
-        _terminal_status(
-            "⚡",
-            f"TurboQuant Hybrid: READY (turboquant_mlx) | bits={FEATURE_TQ_BITS} | "
-            f"strategy=hybrid (softmax=TQ, linear=native) | awaiting first MISS to build cache"
-        )
-    except ImportError as e:
-        _terminal_status("⚠️", f"TurboQuant Hybrid: UNAVAILABLE ({e}) — falling back to TQCacheLite")
-    except Exception as e:
-        _terminal_status("❌", f"TurboQuant Hybrid: FAILED ({e}) — falling back to TQCacheLite")
-elif not _optiq_tq_available and _FEATURE_TQ_HYBRID and is_vlm:
-    _terminal_status("⚠️", "TurboQuant Hybrid: SKIPPED (VLM model — hybrid cache not compatible with VLM)")
-
-# --- TurboQuant legacy (fallback) ---
-if not _optiq_tq_available and FEATURE_TURBOQUANT:
-    if is_vlm:
-        _terminal_status("⚠️", "TurboQuant: SKIPPED (VLM model — TQ patch requires Qwen3 Attention, not compatible with VLM)")
-    else:
-        try:
-            from turboquant_lite import TQCacheLite, apply_patch as _tq_patch_fn
-            _tq_cache_class = TQCacheLite
-            _tq_apply_patch = _tq_patch_fn
-            patched_layers = _tq_apply_patch(model)
-            _tq_available = True
-            _terminal_status(
-                "⚡",
-                f"TurboQuant: ACTIVATED | bits={FEATURE_TQ_BITS} | seed={FEATURE_TQ_SEED} | "
-                f"patched_layers={patched_layers} | compression=4.57x | fused_decode=enabled"
-            )
-        except ImportError as e:
-            _terminal_status("⚠️", f"TurboQuant: UNAVAILABLE (import failed: {e}) — using mlx_lm kv_bits as fallback")
-        except Exception as e:
-            _terminal_status("❌", f"TurboQuant: FAILED to initialize ({e}) — using mlx_lm kv_bits as fallback")
-elif not _optiq_tq_available:
-    _terminal_status("ℹ️", "TurboQuant: DISABLED (FEATURE_TURBOQUANT=False)")
-
 # --- RAG Enricher ---
 if FEATURE_RAG_ENRICHMENT:
     try:
@@ -4275,12 +4068,6 @@ if not FEATURE_COMPRESSOR and FEATURE_EMERGENCY_COMPRESS and _compressor_module 
 
 # --- Feature flags summary ---
 _active_features = []
-if _optiq_tq_available:
-    _active_features.append("OptiQ_TurboQuant")
-elif _tq_hybrid_available:
-    _active_features.append("TQ_Hybrid")
-elif _tq_available:
-    _active_features.append("TurboQuant")
 if _compressor_available:
     _active_features.append("Compressor")
 if _rag_available:
@@ -4312,6 +4099,12 @@ _terminal_status(
 # DPC shared state — replaces _WARMUP_SEED_HASH, _WARMUP_CACHE_FROZEN, etc.
 _DPC = _wm.DPCState()
 _WARMUP_DONE = _DPC.warmup_done  # Alias for backward compat (warmup gate, sidecar wait)
+
+# Post-reaper reload signal: set by reaper when it prunes entries,
+# cleared by request handler after launching reload thread.
+# Separate from _WARMUP_DONE to avoid impacting sidecar or DPCState.
+_CACHE_REAPED = threading.Event()
+_CACHE_RELOAD_LOCK = threading.Lock()  # prevents double-reload on concurrent requests
 
 
 # Pattern for startup detection (robust: case-insensitive, survives OpenClaw text changes)
@@ -4387,7 +4180,7 @@ else:
 # Metal, but Metal's allocator keeps GPU memory mapped until macOS forces
 # eviction at ~98% pressure. Setting mx.metal.set_cache_limit(0) tells Metal
 # to NOT hoard freed buffers, releasing them to the OS immediately.
-_CACHE_REAPER_INTERVAL_SECONDS = 60
+_CACHE_REAPER_INTERVAL_SECONDS = _env_int("CACHE_REAPER_INTERVAL_SECONDS", 60)
 
 # Tell Metal to release freed GPU buffers above the model footprint.
 # set_cache_limit(0) is too aggressive (causes alloc/dealloc thrashing during generation).
@@ -4447,6 +4240,10 @@ def _cache_reaper_loop():
                     f"active={_get_active()/1e9:.2f}GB | "
                     f"cache={_get_cache()/1e9:.2f}GB",
                 )
+                # Signal next request to reload cache from disk (post-reaper warm-up).
+                if SETTINGS.cache_persist_path:
+                    _CACHE_REAPED.set()
+                    _terminal_status("🧹", "CACHE REAPER: signaled _CACHE_REAPED → next request will reload from disk")
         except Exception:
             pass  # Never crash the reaper
 
@@ -4974,6 +4771,24 @@ class APIHandler(BaseHTTPRequestHandler):
                         f"cache_ready={_WARMUP_DONE.is_set()}",
                         flush=True,
                     )
+
+        # ── POST-REAPER RELOAD GATE ─────────────────────────────────────────
+        # If the cache reaper pruned entries while idle, reload from disk on the
+        # first incoming request. Uses double-check locking to prevent concurrent
+        # requests from launching multiple reload threads simultaneously.
+        if _CACHE_REAPED.is_set() and SETTINGS.cache_persist_path:
+            with _CACHE_RELOAD_LOCK:
+                if _CACHE_REAPED.is_set():  # double-check inside lock
+                    _CACHE_REAPED.clear()
+                    _terminal_status("🔥", "DPC: post-reaper reload triggered | reloading from disk...")
+                    _reload_done = threading.Event()
+                    def _do_reload(_done=_reload_done):
+                        _run_startup_warmup()
+                        _done.set()
+                    threading.Thread(target=_do_reload, daemon=True, name="dpc-post-reaper").start()
+                    _reload_done.wait(timeout=120)
+        # ── END POST-REAPER RELOAD GATE ─────────────────────────────────────
+
         # ── END DPC GATE ────────────────────────────────────────────────────
 
         _wg_elapsed = 0.0 # Placeholder if gate didn't run
@@ -5003,23 +4818,6 @@ class APIHandler(BaseHTTPRequestHandler):
             self.wfile.write(json.dumps(resp).encode("utf-8"))
             return
         tools = body.get("tools")
-        # --- TOOL FILTER: strip non-essential tools to reduce prompt tokens ---
-        if tools and FEATURE_TOOL_FILTER and FEATURE_TOOL_ALLOWLIST:
-            _orig_count = len(tools)
-            tools = [
-                t for t in tools
-                if (t.get("function", {}).get("name", "") in FEATURE_TOOL_ALLOWLIST)
-            ]
-            _stripped = _orig_count - len(tools)
-            if _stripped > 0 and FEATURE_FULL_LOGGING:
-                _pipeline_log("TOOLS", request_id,
-                    f"FILTER: {_orig_count} → {len(tools)} tools (stripped {_stripped}, saves ~{_stripped * 400} tokens)")
-
-        # --- TOOL HASH TRACKER: DISABLED 2026-04-30 ---
-        # DPC already handles tool caching. This block only tracked hashes
-        # with ~2ms CPU + log noise per request. Zero functional effect.
-        # Re-enable by uncommenting imports at line 713.
-        _tci_meta = {}
 
         # KRIPPER DUAL-SLOT: Detect OpenClaw's compact runner.
         # The compact runner sends ZERO tools and a system prompt with compaction keywords.
@@ -5064,12 +4862,6 @@ class APIHandler(BaseHTTPRequestHandler):
                 f"tool_result_truncation={_tool_truncations} | limit={_MAX_TOOL_RESULT_CHARS} chars "
                 f"| TEMP measure until plan §11 (ephemeral workspace)")
 
-        # --- PROMPT REORDERER: DISABLED 2026-04-30 ---
-        # Output was discarded (line 5255 reads fresh from body).
-        # When enabled, caused personality regression (brevity overrides warmth).
-        # ~13ms CPU + log noise per request. Zero functional effect.
-        # Re-enable by uncommenting imports at line 713 AND changing line 5255.
-        _pr_meta = {}
 
         if FEATURE_FULL_LOGGING:
             _roles = _count_roles(raw_messages_inbound)
@@ -5764,36 +5556,12 @@ class APIHandler(BaseHTTPRequestHandler):
                     if is_vlm and hasattr(model, "language_model")
                     else model
                 )
-                if _optiq_tq_available and _optiq_tq_cache_class is not None:
-                    # OptiQ: TurboQuant only for self_attn layers, standard for linear_attn
-                    prompt_cache = make_prompt_cache(
-                        cache_model, max_kv_size=SETTINGS.max_kv_size
-                    )
-                    for i, layer in enumerate(cache_model.layers):
-                        if hasattr(layer, "self_attn"):
-                            prompt_cache[i] = _optiq_tq_cache_class(
-                                head_dim=layer.self_attn.head_dim,
-                                bits=FEATURE_TQ_BITS,
-                                seed=FEATURE_TQ_SEED + i,
-                            )
-                elif _tq_available and FEATURE_TURBOQUANT and _tq_cache_class is not None:
-                    prompt_cache = [_tq_cache_class() for _ in range(len(cache_model.layers))]
-                else:
-                    prompt_cache = make_prompt_cache(
-                        cache_model, max_kv_size=SETTINGS.max_kv_size
-                    )
+                prompt_cache = make_prompt_cache(
+                    cache_model, max_kv_size=SETTINGS.max_kv_size
+                )
                 # Full miss: model prefills all original tokens (never canonical).
                 rest_tokens = model_tokens
-            # --- OLD FIX-16/17 REMOVED (FIX-31 v3 supersedes) ---
-            # The original FIX-16/17 guard used matched_prefix_len (canonical space)
-            # as an index into model_tokens (model space). Since canonical tokens
-            # can outnumber model tokens (19849 vs 15848 due to '000...' padding),
-            # the guard "matched_prefix_len >= _m_len" ALWAYS fired, overriding
-            # FIX-31 v3's correctly computed rest_tokens with rest_tokens=1.
-            # FIX-31 v3 already handles all edge cases (_kv_off > _m_len,
-            # _kv_off == _m_len, empty rest_tokens, None) in model space.
-            # ---------------------------------
-            # ---------------------------------
+
 
             rest_count = len(rest_tokens) if rest_tokens is not None else _m_len
 
@@ -5905,21 +5673,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 _pipeline_log("CACHE", request_id,
                     f"RESULTADO: cache_hit={cache_match_type} | rest_tokens={rest_count} | source={cache_selection_source}")
             
-            _is_tq_active = False
-            if _optiq_tq_available:
-                _is_tq_active = True
-                if FEATURE_FULL_LOGGING and FEATURE_LOG_TQ_DETAIL:
-                    _pipeline_log("TQ", request_id,
-                        f"ACTIVADO | bits={FEATURE_TQ_BITS} | cache_type=OptiQ_TurboQuantKVCache")
-                    _pipeline_log("TQ", request_id,
-                        f"existing_offset={matched_prefix_len} | prefill_tokens={rest_count}")
-            elif prompt_cache and len(prompt_cache) > 0 and getattr(prompt_cache[0], '__class__', None).__name__ == "TQCacheLite":
-                _is_tq_active = True
-                if FEATURE_FULL_LOGGING and FEATURE_LOG_TQ_DETAIL:
-                    _pipeline_log("TQ", request_id, 
-                        f"ACTIVADO | bits={FEATURE_TQ_BITS} | cache_type=TQCacheLite")
-                    _pipeline_log("TQ", request_id,
-                        f"existing_offset={matched_prefix_len} | prefill_tokens={rest_count}")
+
             cache_session_id = _cache_log_session_id(session_ctx, cache_session_tokens)
             if SETTINGS.enable_request_logging:
                 try:
@@ -6027,7 +5781,6 @@ class APIHandler(BaseHTTPRequestHandler):
                     self.send_header("X-Pipeline-Compression-Ms", f"{_pipeline_timings.get('compress', 0):.1f}")
                     self.send_header("X-Pipeline-RAG-Ms", f"{_pipeline_timings.get('rag', 0):.1f}")
                     self.send_header("X-Pipeline-Heal-Ms", f"{_pipeline_timings.get('heal', 0):.1f}")
-                    self.send_header("X-Pipeline-TQ-Active", "true" if _is_tq_active else "false")
                 self.end_headers()
 
                 # --- PREFILL PROGRESS INDICATOR ---

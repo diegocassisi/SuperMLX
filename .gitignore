@@ -19,6 +19,7 @@ models/
 
 # === ARCHIVOS HISTÓRICOS ===
 Archive/
+Private-docs/
 
 # === IDE ===
 .vscode/

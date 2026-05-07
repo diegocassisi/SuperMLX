@@ -3,14 +3,11 @@ SuperMLX Pipeline Monitor — Real-time observability dashboard.
 
 Reads structured pipeline logs from SuperMLX and displays them in a
 Streamlit dashboard. No modifications to the server needed — reads logs
-and terminal output via file tailing.
+from the configured logs directory.
 
 Usage:
     pip install streamlit plotly psutil
-    streamlit run monitor.py -- --logs-dir /path/to/MLXTurboQuant/logs
-
-Origin: OOM crash analysis 2026-04-26
-Wiki: knowledge/wiki/MLXServer/challenges/out-of-memory-v83-fix (A8)
+    streamlit run pipeline_monitor.py -- --logs-dir ./logs
 """
 
 import json
@@ -632,7 +629,7 @@ for i, m in enumerate(metrics):
 # ── Footer ────────────────────────────────────────────────────────────────────
 
 st.markdown("---")
-st.caption(f"SuperMLX Pipeline Monitor v1.0 | Logs: `{LOGS_DIR}` | {datetime.now().strftime('%H:%M:%S')}")
+st.caption(f"SuperMLX Pipeline Monitor v1.4 | Logs: `{LOGS_DIR}` | {datetime.now().strftime('%H:%M:%S')}")
 
 if auto_refresh:
     time.sleep(10)
