@@ -471,11 +471,51 @@ if sys_mem:
 
 st.markdown("---")
 
+# ── Benchmark Summary ─────────────────────────────────────────────────────────
+
+st.markdown("## 📊 Session Benchmark")
+
+# Calculate aggregate metrics
+_total_prefill = sum(m.get("prefill_s", 0) for m in metrics)
+_cache_hits = [m for m in metrics if m.get("cache_match_type") not in ("miss", "?")]
+_cache_misses = [m for m in metrics if m.get("cache_match_type") in ("miss", "?")]
+_avg_miss_prefill = (
+    sum(m.get("prefill_s", 0) for m in _cache_misses) / max(len(_cache_misses), 1)
+)
+# Estimated time WITHOUT cache: every turn would cost the cold-start prefill
+_estimated_no_cache = _avg_miss_prefill * len(metrics) if _cache_misses else _total_prefill
+_time_saved = max(0, _estimated_no_cache - _total_prefill)
+
+bcol1, bcol2, bcol3, bcol4 = st.columns(4)
+with bcol1:
+    st.metric("🧊 Cold Starts", f"{len(_cache_misses)}")
+    st.caption(f"Avg cold prefill: {_avg_miss_prefill:.1f}s")
+with bcol2:
+    st.metric("🔥 Cache Hits", f"{len(_cache_hits)}")
+    _avg_hit_prefill = (
+        sum(m.get("prefill_s", 0) for m in _cache_hits) / max(len(_cache_hits), 1)
+    )
+    st.caption(f"Avg warm prefill: {_avg_hit_prefill:.1f}s")
+with bcol3:
+    st.metric("⏱️ Total Prefill", f"{_total_prefill:.1f}s")
+    st.caption(f"Without cache: ~{_estimated_no_cache:.0f}s")
+with bcol4:
+    st.metric("💰 Time Saved", f"{_time_saved:.0f}s")
+    _speedup = _estimated_no_cache / max(_total_prefill, 0.1)
+    st.caption(f"Speedup: {_speedup:.1f}×")
+
+st.markdown("---")
+
 # ── Request Timeline ──────────────────────────────────────────────────────────
 
 st.markdown("## 📋 Request Timeline")
+st.caption("Most recent request first.")
 
-for i, m in enumerate(metrics):
+# Reverse: newest request at the top
+metrics_display = list(reversed(metrics))
+entries_reversed = True  # Flag for matching entries by full request_id
+
+for i, m in enumerate(metrics_display):
     req_id = m.get("request_id", "?")[:8]
     prompt_tok = m.get("prompt_tokens", 0)
     rest_tok = m.get("rest_tokens", 0)
@@ -629,7 +669,7 @@ for i, m in enumerate(metrics):
 # ── Footer ────────────────────────────────────────────────────────────────────
 
 st.markdown("---")
-st.caption(f"SuperMLX Pipeline Monitor v1.4 | Logs: `{LOGS_DIR}` | {datetime.now().strftime('%H:%M:%S')}")
+st.caption(f"SuperMLX Pipeline Monitor v1.4.2 | Logs: `{LOGS_DIR}` | {datetime.now().strftime('%H:%M:%S')}")
 
 if auto_refresh:
     time.sleep(10)
