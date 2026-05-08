@@ -167,6 +167,31 @@ For 12GB machines, use `PROMPT_CACHE_MAX_ENTRIES_GLOBAL=1` and `MEMORY_GUARD_THR
 | `emergency_compressor.py` | Last-resort content compression for OOM prevention |
 | `pipeline_monitor.py` | Streamlit real-time observability dashboard |
 
+### Why `SuperMLX.py` is large
+
+A typical web server can split cleanly into independent modules. An MLX inference
+server cannot — because **GPU memory is a shared physical resource** that doesn't
+modularize.
+
+The KV cache, model weights, and tokenizer live in Metal GPU buffers managed by
+`mx`. Every component that touches generation — the HTTP handler, cache lookup,
+memory guard, prefill, decode, post-generation cache update — needs direct access
+to the same `mx` runtime, the same `model` singleton, and the same `prompt_cache_lock`
+mutex. This creates a "gravity well" where core logic is pulled toward the center.
+
+**What we extracted** (~1,400 lines across 4 modules): everything that is *pure* —
+config parsing, regex patterns, message canonicalization, healing, loop detection,
+debug diagnostics. These functions take inputs and return outputs with no GPU state.
+
+**What stays in `SuperMLX.py`** (~4,900 lines): everything coupled to GPU state —
+`LRUPromptCache` (calls `mx.clear_cache()`), the generation loop, the HTTP handler,
+the cache reaper thread, and the memory guard. Extracting these would require either
+circular imports or passing 10+ parameters through every call, trading real complexity
+for cosmetic file splitting.
+
+This is not a limitation to fix — it's an architectural reality of GPU-bound servers.
+Other MLX/llama.cpp servers with comparable features have similar structure.
+
 ### Pipeline Monitor
 
 Real-time dashboard that reads SuperMLX's structured logs — no server modifications needed.
