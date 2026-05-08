@@ -24,7 +24,12 @@ Versioning follows [Semantic Versioning](https://semver.org/).
     session context extraction, cache key safety check.
 - All extracted functions are pure (input → output). Global stores (`HEALING_STORE`,
   `_terminal_status`) are passed as parameters to maintain module independence.
-- `SuperMLX.py` reduced from ~5800 to ~5015 lines (~13% reduction).
+- `SuperMLX.py` reduced from ~5800 to ~4987 lines (~14% reduction).
+- **Deduplication:** Extracted 3 shared helpers replacing 6 copy-pasted blocks
+  between streaming and non-streaming paths:
+  - `_start_prefill_progress()` — replaces 2× ~30-line inline closures.
+  - `_update_healing_store()` — replaces 2× ~8-line inline blocks.
+  - `_post_generation_cache_update()` — replaces 2× ~40-line cache insertion blocks.
 
 ### Removed
 - `_ANSI_RED` — defined but never referenced (only `_ANSI_YELLOW` was used).
