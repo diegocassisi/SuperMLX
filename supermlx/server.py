@@ -146,7 +146,7 @@ import signal
 import math
 from datetime import datetime
 try:
-    from emergency_compressor import emergency_compress_if_needed, should_signal_overflow
+    from .emergency_compressor import emergency_compress_if_needed, should_signal_overflow
     _emergency_compressor_available = True
 except ImportError:
     _emergency_compressor_available = False
@@ -195,7 +195,7 @@ except ImportError:
     vlm_load_image = None
     get_chat_template = None
 
-SCRIPT_DIR = Path(__file__).resolve().parent
+SCRIPT_DIR = Path(__file__).resolve().parent.parent  # repo root (one level above supermlx/)
 DOTENV_PATH = SCRIPT_DIR / ".env"
 
 
@@ -206,7 +206,7 @@ __version__ = "1.4.2"
 
 
 # ── Configuration (extracted to config.py) ────────────────────────────────────
-from config import (
+from .config import (
     Settings, build_settings,
     _env_str, _env_int, _env_float, _env_bool,
     _env_str_any, _env_int_any, _env_bool_any, _env_kv_bits,
@@ -385,7 +385,7 @@ TOOL_LOOP_MAX_RETRIES         = _env_int("TOOL_LOOP_MAX_RETRIES", 3)
 
 # Dynamic Prefix Capture (DPC): replaces warmup_seed.txt with auto-capture + hash validation.
 # Managed by warmup_manager.py. No manual seed files needed.
-import warmup_manager as _wm
+from . import warmup_manager as _wm
 
 # ── CASCADE ROUTING ──────────────────────────────────────────────────────────
 # Forward a frontier API cuando RAG confidence es baja (no hay knowledge local).
@@ -595,7 +595,7 @@ proxy_process = None
 proxy_config_path = None
 
 # ── Tool parsing (extracted to tool_parsing.py) ──────────────────────────────
-from tool_parsing import (
+from .tool_parsing import (
     TOOL_CALL_PATTERN, GEMMA4_TOOL_CALL_PATTERN, ARG_PAIR_PATTERN,
     QWEN_FUNCTION_PATTERN, QWEN_PARAMETER_PATTERN,
     THINK_TAG_STRIP_PATTERN, GEMMA4_THINK_STRIP_PATTERN,
@@ -605,7 +605,7 @@ from tool_parsing import (
     _normalize_assistant_text, _coerce_arg_value, _extract_openai_tool_calls,
 )
 # ── Message pipeline (extracted to message_pipeline.py) ──────────────────────
-from message_pipeline import (
+from .message_pipeline import (
     INBOUND_META_MESSAGE_ID_PATTERN, SUBAGENT_STATS_PATTERN,
     CACHE_TIME_PATTERN, CACHE_TIME_COLON_PATTERN, CACHE_CCH_PATTERN,
     CACHE_BILLING_HEADER_PATTERN, CACHE_SYSTEM_REMINDER_PATTERN,
@@ -621,7 +621,7 @@ from message_pipeline import (
     _assert_cache_key_safety, _hoist_system_messages,
     _COMPACT_RUNNER_SIGNALS, _RAG_BYPASS_SIGNALS_USER, _RAG_BYPASS_SIGNALS_SYSTEM,
 )
-from debug_tools import _debug_token_divergence
+from .debug_tools import _debug_token_divergence
 
 
 
@@ -2667,7 +2667,7 @@ _terminal_status("🗜️", f"KV Cache Quantization (native mlx-lm): {_kv_desc}"
 # --- RAG Enricher ---
 if FEATURE_RAG_ENRICHMENT:
     try:
-        import rag_enricher as _rag_mod
+        from . import rag_enricher as _rag_mod
         _rag_mod.RELEVANCE_THRESHOLD = FEATURE_RAG_RELEVANCE_THRESHOLD
         _rag_module = _rag_mod
         _rag_available = True
@@ -2702,7 +2702,7 @@ if FEATURE_COMPRESSOR:
         if _rag_module is not None:
             _compressor_module = _rag_module
         else:
-            import rag_enricher as _comp_mod
+            from . import rag_enricher as _comp_mod
             _compressor_module = _comp_mod
         _compressor_available = True
         _terminal_status(
@@ -2735,7 +2735,7 @@ if not FEATURE_COMPRESSOR and FEATURE_EMERGENCY_COMPRESS and _compressor_module 
         if _rag_module is not None:
             _compressor_module = _rag_module
         else:
-            import rag_enricher as _comp_mod
+            from . import rag_enricher as _comp_mod
             _compressor_module = _comp_mod
         try:
             _terminal_status("🗜️", "Emergency Compressor: precargando LLMLingua (CPU)...")

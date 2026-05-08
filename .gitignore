@@ -24,3 +24,8 @@ Private-docs/
 # === IDE ===
 .vscode/
 .idea/
+
+# === BUILD / PIP ===
+*.egg-info/
+dist/
+build/

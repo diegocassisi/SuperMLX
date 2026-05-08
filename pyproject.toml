@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "supermlx"
+version = "1.4.2"
+description = "Agentic-optimized MLX inference server for Apple Silicon"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.11"
+authors = [
+    {name = "Diego Cassisi"},
+]
+keywords = ["mlx", "apple-silicon", "inference", "agentic", "llm", "kv-cache"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    "mlx>=0.31.2",
+    "mlx-lm>=0.31.3",
+    "python-dotenv>=1.2.1",
+    "safetensors>=0.6.2",
+    "torch>=2.9.1",
+    "transformers>=5.7.0",
+    "tokenizers>=0.22.1",
+    "numpy>=2.3.3",
+    "huggingface-hub>=1.9.0",
+    "litellm>=1.83.2",
+]
+
+[project.optional-dependencies]
+vlm = ["mlx-vlm>=0.3.11"]
+monitor = ["streamlit>=1.45.0", "plotly>=6.1.0", "psutil>=7.0.0"]
+rag = ["lancedb>=0.26.1", "sentence-transformers>=5.2.0", "llmlingua>=0.2.2"]
+
+[project.scripts]
+supermlx = "supermlx.server:run"
+
+[project.urls]
+Homepage = "https://github.com/dcassisi/SuperMLX"
+
+[tool.setuptools.packages.find]
+include = ["supermlx*"]
