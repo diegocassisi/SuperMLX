@@ -6,6 +6,36 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.4.1] — 2026-05-07
+
+### Fixed
+- **CRITICAL:** `_assert_cache_key_safety` was deleted during modularization but still
+  called at runtime — would crash with `NameError` if `CACHE_NORM_SAFETY_CHECK=true`.
+  Migrated to `message_pipeline.py` with parameterized `log_fn`.
+- Orphaned `@dataclass(frozen=True)` decorator leaked onto `SessionIndex` class after
+  `SessionContext` extraction, causing `FrozenInstanceError` on startup.
+
+### Changed
+- **Modularization Phase 3:** Extracted ~750 lines of core pipeline logic from the
+  monolithic `SuperMLX.py` into three independent modules:
+  - `config.py` — Environment helpers + `Settings` dataclass (pure, no side effects).
+  - `tool_parsing.py` — Regex patterns, `<think>` extraction, OpenAI tool-call parsing.
+  - `message_pipeline.py` — Canonicalization, healing, loop breaker, detection,
+    session context extraction, cache key safety check.
+- All extracted functions are pure (input → output). Global stores (`HEALING_STORE`,
+  `_terminal_status`) are passed as parameters to maintain module independence.
+- `SuperMLX.py` reduced from ~5800 to ~5015 lines (~13% reduction).
+
+### Removed
+- `_ANSI_RED` — defined but never referenced (only `_ANSI_YELLOW` was used).
+- `_vlm_diagnostics` — thread-local never written to, always returned `False`.
+- `_messages_have_images()` — 14-line function with zero call sites.
+- `_warmup_load_cache()` — backward-compat wrapper with zero callers post-modularization.
+- 17 consecutive blank lines (sed extraction residue).
+- Orphaned comment referencing deleted Phase 6 function.
+
+---
+
 ## [1.4.0] — 2026-05-07
 
 ### Added
