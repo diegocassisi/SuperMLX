@@ -222,6 +222,27 @@ Measured on Mac Mini M4 Pro (24GB), Qwen3.5-9B-4bit:
 | **Cache hit rate** | 0% | 97%+ |
 | **Prefill throughput** | 300-330 tok/s | N/A (cached) |
 
+## Roadmap — v2.0 (Future Rewrite)
+
+v1.x works and is stable. The items below are architectural improvements that would
+require rewriting the core server. They are **aspirational, not committed** — contributions
+are welcome.
+
+| Feature | Description |
+|---------|-------------|
+| **Pipeline Architecture** | Replace the monolithic `do_POST` with a staged pipeline: `Adapter IN → Pipeline(canon → RAG → compress → cache → gen) → Adapter OUT`. Each stage receives a `RequestContext` dataclass — zero globals, testable per stage. |
+| **Multi-API Adapters** | Pluggable input/output adapters for OpenAI, Anthropic, and future API formats. The pipeline stays the same; only the request parsing and response formatting change. |
+| **Continuous Batching** | Process multiple concurrent requests on the GPU by interleaving token generation across users. Enables true parallel sidecar + main generation. Requires `mlx-lm.BatchGenerator` integration. |
+| **Paged KV Cache** | Block-based KV cache with Copy-on-Write and prefix sharing (trie or hash-indexed), replacing the current per-session LRU slots. Better memory utilization for multi-session workloads. |
+| **Structured Output** | JSON Schema-constrained generation via grammar-based sampling (e.g. `lm-format-enforcer`). Guarantees valid tool-call JSON without retry loops. |
+| **Multi-Model Serving** | LRU model eviction + pinning + per-model TTL. Load multiple models in unified memory, swap on demand. |
+| **Context Scaling** | Report scaled token counts so agentic frameworks (Claude Code, OpenClaw) trigger auto-compact at the right timing. |
+
+> These ideas draw inspiration from [omlx](https://github.com/jundot/omlx),
+> [vllm-mlx](https://github.com/waybarrios/vllm-mlx), and
+> [mlx-openai-server](https://github.com/cubist38/mlx-openai-server) —
+> excellent projects solving complementary problems on Apple Silicon.
+
 ---
 
 ## Acknowledgments
