@@ -185,18 +185,14 @@ Mac Mini M4 Pro (24GB), Qwen3.5-9B-4bit:
 
 ---
 
-## Memory Budget
+## Memory Requirements
 
-```
-Model Qwen3.5-9B-4bit:   ~5.0 GB
-2 MAIN KV entries:        ~9.0 GB  (2 × 4.5GB)
-1 COMPACT KV entry:       ~4.5 GB
-Scratch prefill:          ~5.0 GB
-──────────────────────────────────
-Total peak:               ~23.5 GB → safe with Memory Guard at 19.2GB
-```
+| RAM | Model | Cache Slots | Config Needed |
+|:---:|-------|:-----------:|---------------|
+| **16 GB** | Qwen3.5-9B-4bit | 1 MAIN | `PROMPT_CACHE_MAX_ENTRIES_GLOBAL=1`, `MEMORY_GUARD_THRESHOLD_GB=10.5` |
+| **24 GB** | Qwen3.5-9B-4bit | 2 MAIN + 1 COMPACT | Works out of the box |
 
-For 16GB machines: `PROMPT_CACHE_MAX_ENTRIES_GLOBAL=1` and `MEMORY_GUARD_THRESHOLD_GB=10.5`.
+Memory Guard auto-evicts cache entries before Metal runs out. Set `MEMORY_GUARD_THRESHOLD_GB` for your machine and it handles the rest.
 
 ---
 
