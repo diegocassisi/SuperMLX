@@ -1933,6 +1933,120 @@ def _vlm_sync_before_generation(pixel_values: Any, mask: Any) -> None:
 
 
 
+# ── Shared helpers: deduplicate streaming / non-streaming do_POST paths ───────
+
+def _start_prefill_progress(
+    request_id: str, rest_count: int, log_fn=None, rate: int = 300
+) -> Tuple[threading.Event, Optional[threading.Thread]]:
+    """Launch a background prefill progress logger. Returns (done_event, thread|None)."""
+    done = threading.Event()
+    if rest_count <= 1000:
+        return done, None
+    _log = log_fn or _terminal_status
+
+    def _progress():
+        start = time.time()
+        est_total = rest_count / rate if rate > 0 else 60
+        _log(
+            "⏳",
+            f"Request {request_id} PREFILL starting | 0% | ETA ~{est_total:.0f}s | "
+            f"tokens={rest_count}",
+            indent=1,
+        )
+        while not done.is_set():
+            done.wait(5.0)
+            if done.is_set():
+                break
+            elapsed = time.time() - start
+            pct = min(99, (elapsed / est_total) * 100) if est_total > 0 else 0
+            eta = max(0, est_total - elapsed)
+            _log(
+                "🔄",
+                f"Request {request_id} PREFILL | {pct:.0f}% | "
+                f"{elapsed:.0f}s/{est_total:.0f}s | ~{eta:.0f}s remaining | "
+                f"tokens={rest_count}",
+                indent=1,
+            )
+
+    t = threading.Thread(target=_progress, daemon=True)
+    t.start()
+    return done, t
+
+
+def _update_healing_store(raw_text: str, message_text: str, tool_calls: Optional[List]) -> None:
+    """Store the raw (with <think>) response keyed by the stripped version's hash."""
+    if raw_text == message_text:
+        return
+    h = _get_healing_hash(message_text, tool_calls)
+    if not h:
+        return
+    with HEALING_STORE_LOCK:
+        HEALING_STORE[h] = raw_text
+        HEALING_STORE.move_to_end(h, last=True)
+        while len(HEALING_STORE) > MAX_HEALING_STORE:
+            HEALING_STORE.popitem(last=False)
+
+
+def _post_generation_cache_update(
+    *,
+    request_id: str,
+    messages: List[Dict[str, Any]],
+    prompt_tokens: List[int],
+    cache_key: List[int],
+    prompt_cache: Any,
+    generated_tokens: List[int],
+    tool_calls: Optional[List],
+    matched_prefix_len: int,
+    session_ctx: Any,
+    session_id_for_turn: str,
+    is_embedded_agent: bool,
+) -> None:
+    """
+    Shared post-generation logic: insert cache entries (MAIN or COMPACT),
+    detect startup warmup candidate, update session turn store.
+    Must be called while holding prompt_cache_lock.
+    """
+    _cache_hit_ratio = matched_prefix_len / max(len(prompt_tokens), 1) if prompt_tokens else 1.0
+
+    if not is_embedded_agent:
+        # MAIN: detect real startup for disk cache auto-save
+        _last_msg_content = str(messages[-1].get("content", ""))
+        _is_real_startup = (
+            len(messages) == 2
+            and bool(_STARTUP_MSG_PATTERN.search(_last_msg_content))
+            and "filename slug" not in _last_msg_content.lower()
+        )
+        _insert_cache_entries(
+            model_name=SETTINGS.model_path,
+            session_ctx=session_ctx,
+            cache_key=cache_key,
+            prompt_cache=prompt_cache,
+            generated_tokens=generated_tokens,
+            tool_calls=tool_calls,
+            cache_hit_ratio=_cache_hit_ratio,
+            is_warmup_candidate=_is_real_startup,
+        )
+    else:
+        # COMPACT RUNNER: insert into isolated PROMPT_CACHE_COMPACT
+        _insert_cache_entries(
+            model_name=SETTINGS.model_path,
+            session_ctx=session_ctx,
+            cache_key=cache_key,
+            prompt_cache=prompt_cache,
+            generated_tokens=generated_tokens,
+            tool_calls=tool_calls,
+            cache_hit_ratio=_cache_hit_ratio,
+            prompt_cache_store_override=PROMPT_CACHE_COMPACT,
+        )
+        if FEATURE_FULL_LOGGING:
+            _pipeline_log("CACHE", request_id,
+                f"COMPACT_RUNNER: inserted into PROMPT_CACHE_COMPACT | "
+                f"MAIN cache slots preserved: {len(PROMPT_CACHE._entries)}")
+
+    # M5: Update session turn record for next-turn stable-prefix lookup
+    if session_id_for_turn:
+        _update_session_turn_store(session_id_for_turn, messages, prompt_tokens)
+
 
 def _tokenize_prompt(prompt):
     if isinstance(prompt, str):
@@ -4339,39 +4453,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     self.send_header("X-Pipeline-Heal-Ms", f"{_pipeline_timings.get('heal', 0):.1f}")
                 self.end_headers()
 
-                # --- PREFILL PROGRESS INDICATOR ---
-                _prefill_done = threading.Event()
-                _prefill_rate = 300  # estimated tok/s from logs
-                def _prefill_progress():
-                    _start = time.time()
-                    _est_total = rest_count / _prefill_rate if _prefill_rate > 0 else 60
-                    # Log inmediato al arrancar — elimina el gap silencioso post-FLUSH
-                    _terminal_status(
-                        "⏳",
-                        f"Request {request_id} PREFILL starting | 0% | ETA ~{_est_total:.0f}s | "
-                        f"tokens={rest_count}",
-                        indent=1,
-                    )
-
-                    while not _prefill_done.is_set():
-                        _prefill_done.wait(5.0)
-                        if _prefill_done.is_set():
-                            break
-                        _elapsed = time.time() - _start
-                        _pct = min(99, (_elapsed / _est_total) * 100) if _est_total > 0 else 0
-                        _eta = max(0, _est_total - _elapsed)
-                        _terminal_status(
-                            "🔄",
-                            f"Request {request_id} PREFILL | {_pct:.0f}% | "
-                            f"{_elapsed:.0f}s/{_est_total:.0f}s | ~{_eta:.0f}s remaining | "
-                            f"tokens={rest_count}",
-                            indent=1,
-                        )
-                if rest_count > 1000:
-                    _prefill_thread = threading.Thread(target=_prefill_progress, daemon=True)
-                    _prefill_thread.start()
-                else:
-                    _prefill_thread = None
+                _prefill_done, _prefill_thread = _start_prefill_progress(request_id, rest_count)
 
                 generated_parts = []
                 progress_last_at = time.time()
@@ -4412,65 +4494,24 @@ class APIHandler(BaseHTTPRequestHandler):
                 if enable_thinking:
                     message_text = _strip_thinking_from_content(message_text)
 
-                    # --- NEW HEALING STORE LOGIC ---
-                    if raw_response_text != message_text:
-                        h = _get_healing_hash(message_text, tool_calls)
-                        if h:
-                            with HEALING_STORE_LOCK:
-                                HEALING_STORE[h] = raw_response_text
-                                HEALING_STORE.move_to_end(h, last=True)
-                                while len(HEALING_STORE) > MAX_HEALING_STORE:
-                                    HEALING_STORE.popitem(last=False)
+                    _update_healing_store(raw_response_text, message_text, tool_calls)
 
                 finish_reason = "tool_calls" if tool_calls else "stop"
                 cache_key.extend(generated_tokens)
                 with prompt_cache_lock:
-                    _cache_hit_ratio = matched_prefix_len / max(len(prompt_tokens), 1) if prompt_tokens else 1.0
-                    if not _is_embedded_agent:
-                        # MAIN: insert into PROMPT_CACHE (HOT slot)
-                        # MAIN: insert into PROMPT_CACHE (HOT slot)
-                        # FIX PEND-03 (2026-04-07): Detección estricta de startup vs slug-gen.
-                        # Usa regex case-insensitive para sobrevivir cambios de texto en OpenClaw.
-                        _last_msg_content = str(messages[-1].get("content", ""))
-                        _is_real_startup = (
-                            len(messages) == 2
-                            and bool(_STARTUP_MSG_PATTERN.search(_last_msg_content))
-                            and "filename slug" not in _last_msg_content.lower()
-                        )
-                        _insert_cache_entries(
-                            model_name=SETTINGS.model_path,
-                            session_ctx=session_ctx,
-                            cache_key=cache_key,
-                            prompt_cache=prompt_cache,
-                            generated_tokens=generated_tokens,
-                            tool_calls=tool_calls,
-                            cache_hit_ratio=_cache_hit_ratio,
-                            is_warmup_candidate=_is_real_startup,
-                        )
-                    else:
-                        # COMPACT RUNNER: insert into PROMPT_CACHE_COMPACT (isolated slot).
-                        # This lets subsequent compact calls hit cache, and MAIN is NEVER touched.
-                        _insert_cache_entries(
-                            model_name=SETTINGS.model_path,
-                            session_ctx=session_ctx,
-                            cache_key=cache_key,
-                            prompt_cache=prompt_cache,
-                            generated_tokens=generated_tokens,
-                            tool_calls=tool_calls,
-                            cache_hit_ratio=_cache_hit_ratio,
-                            prompt_cache_store_override=PROMPT_CACHE_COMPACT,
-                        )
-                        if FEATURE_FULL_LOGGING:
-                            _pipeline_log("CACHE", request_id,
-                                f"COMPACT_RUNNER: inserted into PROMPT_CACHE_COMPACT | "
-                                f"MAIN cache slots preserved: {len(PROMPT_CACHE._entries)}")
-                    # --- M5: Update session turn record for next-turn stable-prefix lookup ---
-                    if _session_id_for_turn:
-                        _update_session_turn_store(
-                            _session_id_for_turn,
-                            messages,
-                            prompt_tokens,
-                        )
+                    _post_generation_cache_update(
+                        request_id=request_id,
+                        messages=messages,
+                        prompt_tokens=prompt_tokens,
+                        cache_key=cache_key,
+                        prompt_cache=prompt_cache,
+                        generated_tokens=generated_tokens,
+                        tool_calls=tool_calls,
+                        matched_prefix_len=matched_prefix_len,
+                        session_ctx=session_ctx,
+                        session_id_for_turn=_session_id_for_turn,
+                        is_embedded_agent=_is_embedded_agent,
+                    )
 
                 response_id = f"chatcmpl-{int(time.time())}"
                 full_response = {
@@ -4608,36 +4649,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 )
                 _keepalive_thread.start()
 
-                # --- PREFILL PROGRESS INDICATOR (streaming) ---
-                _prefill_done_s = threading.Event()
-                _prefill_rate_s = 300
-                def _prefill_progress_s():
-                    _start = time.time()
-                    _est_total = rest_count / _prefill_rate_s if _prefill_rate_s > 0 else 60
-                    # Log inmediato al arrancar — elimina el gap silencioso post-FLUSH (streaming)
-                    _terminal_status(
-                        "⏳",
-                        f"Request {request_id} PREFILL starting | 0% | ETA ~{_est_total:.0f}s | "
-                        f"tokens={rest_count}",
-                        indent=1,
-                    )
-                    while not _prefill_done_s.is_set():
-                        _prefill_done_s.wait(5.0)
-                        if _prefill_done_s.is_set():
-                            break
-                        _elapsed = time.time() - _start
-                        _pct = min(99, (_elapsed / _est_total) * 100) if _est_total > 0 else 0
-                        _eta = max(0, _est_total - _elapsed)
-                        _terminal_status(
-                            "🔄",
-                            f"Request {request_id} PREFILL | {_pct:.0f}% | "
-                            f"{_elapsed:.0f}s/{_est_total:.0f}s | ~{_eta:.0f}s remaining | "
-                            f"tokens={rest_count}",
-                            indent=1,
-                        )
-                if rest_count > 1000:
-                    _prefill_thread_s = threading.Thread(target=_prefill_progress_s, daemon=True)
-                    _prefill_thread_s.start()
+                _prefill_done_s, _ = _start_prefill_progress(request_id, rest_count)
 
                 raw_parts = []
 
@@ -4687,63 +4699,23 @@ class APIHandler(BaseHTTPRequestHandler):
                 if enable_thinking:
                     message_text = _strip_thinking_from_content(message_text)
 
-                    # --- NEW HEALING STORE LOGIC ---
-                    if raw_full_text != message_text:
-                        h = _get_healing_hash(message_text, tool_calls)
-                        if h:
-                            with HEALING_STORE_LOCK:
-                                HEALING_STORE[h] = raw_full_text
-                                HEALING_STORE.move_to_end(h, last=True)
-                                while len(HEALING_STORE) > MAX_HEALING_STORE:
-                                    HEALING_STORE.popitem(last=False)
+                    _update_healing_store(raw_full_text, message_text, tool_calls)
 
                 cache_key.extend(generated_tokens)
                 with prompt_cache_lock:
-                    _cache_hit_ratio = matched_prefix_len / max(len(prompt_tokens), 1) if prompt_tokens else 1.0
-                    if not _is_embedded_agent:
-                        # FIX B2: is_warmup_candidate must be passed in streaming path too.
-                        _last_msg_content_s = str(messages[-1].get("content", ""))
-                        _is_real_startup_s = (
-                            len(messages) == 2
-                            and bool(_STARTUP_MSG_PATTERN.search(_last_msg_content_s))
-                            and "filename slug" not in _last_msg_content_s.lower()
-                        )
-                        _insert_cache_entries(
-                            model_name=SETTINGS.model_path,
-                            session_ctx=session_ctx,
-                            cache_key=cache_key,
-                            prompt_cache=prompt_cache,
-                            generated_tokens=generated_tokens,
-                            tool_calls=tool_calls,
-                            cache_hit_ratio=_cache_hit_ratio,
-                            is_warmup_candidate=_is_real_startup_s,
-                        )
-                    else:
-                        # COMPACT RUNNER: insert into PROMPT_CACHE_COMPACT (isolated slot).
-                        # This lets subsequent compact calls hit cache, and MAIN is NEVER touched.
-                        # (Aligned with non-streaming path — audit fix B2)
-                        _cache_hit_ratio = matched_prefix_len / max(len(prompt_tokens), 1) if prompt_tokens else 1.0
-                        _insert_cache_entries(
-                            model_name=SETTINGS.model_path,
-                            session_ctx=session_ctx,
-                            cache_key=cache_key,
-                            prompt_cache=prompt_cache,
-                            generated_tokens=generated_tokens,
-                            tool_calls=tool_calls,
-                            cache_hit_ratio=_cache_hit_ratio,
-                            prompt_cache_store_override=PROMPT_CACHE_COMPACT,
-                        )
-                        if FEATURE_FULL_LOGGING:
-                            _pipeline_log("CACHE", request_id,
-                                f"COMPACT_RUNNER: inserted into PROMPT_CACHE_COMPACT (streaming) | "
-                                f"MAIN cache slots preserved: {len(PROMPT_CACHE._entries)}")
-                    # --- M5: Update session turn record for next-turn stable-prefix lookup ---
-                    if _session_id_for_turn:
-                        _update_session_turn_store(
-                            _session_id_for_turn,
-                            messages,
-                            prompt_tokens,
-                        )
+                    _post_generation_cache_update(
+                        request_id=request_id,
+                        messages=messages,
+                        prompt_tokens=prompt_tokens,
+                        cache_key=cache_key,
+                        prompt_cache=prompt_cache,
+                        generated_tokens=generated_tokens,
+                        tool_calls=tool_calls,
+                        matched_prefix_len=matched_prefix_len,
+                        session_ctx=session_ctx,
+                        session_id_for_turn=_session_id_for_turn,
+                        is_embedded_agent=_is_embedded_agent,
+                    )
 
                 if message_text:
                     chunk = {
