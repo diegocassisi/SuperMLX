@@ -19,7 +19,7 @@ Frontier APIs prefill 30,000-token prompts in milliseconds. Agentic frameworks w
 SuperMLX's approach: reuse the KV cache aggressively. When a 13,000-token prompt grows by 200 tokens on the next turn, only the 200 new tokens get prefilled — dropping time-to-first-token from 32s to under 3s. The hard part is making cache reuse survive the chaos that agentic frameworks create: sub-agent compaction, volatile metadata, idle eviction, and retry storms.
 
 | Problem | Other servers | SuperMLX |
-|---------|:------------:|:--------:|
+|---------|:------------:|:---------|
 | KV cache survives sub-agent compaction | ❌ | ✅ Dual-Slot |
 | Auto-persists & restores warm cache across restarts | ❌ | ✅ DPC |
 | Cache stable despite volatile metadata every turn | ❌ | ✅ Canonicalization |
