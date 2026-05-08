@@ -590,6 +590,27 @@ def _extract_session_context(
     )
 
 
+def _hoist_system_messages(msgs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Merge all system messages into one at position 0.
+
+    Required by Qwen3.5 strict rule: system messages MUST be at the beginning.
+    After compress/RAG/heal, system messages can be scattered — this fixes ordering.
+    """
+    system_parts: List[str] = []
+    non_system: List[Dict[str, Any]] = []
+    for m in msgs:
+        if m.get("role") == "system":
+            c = m.get("content", "")
+            if isinstance(c, str) and c.strip():
+                system_parts.append(c.strip())
+        else:
+            non_system.append(m)
+    if system_parts:
+        merged_system = {"role": "system", "content": "\n\n".join(system_parts)}
+        return [merged_system] + non_system
+    return non_system
+
+
 def _assert_cache_key_safety(
     original_prompt: str,
     cache_key_prompt: str,

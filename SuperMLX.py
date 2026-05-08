@@ -618,9 +618,10 @@ from message_pipeline import (
     _flatten_content, _prepare_messages_for_template,
     _scrub_cache_key, _canonicalize_inbound_context_block,
     _canonicalize_messages, _extract_session_context,
-    _assert_cache_key_safety,
+    _assert_cache_key_safety, _hoist_system_messages,
     _COMPACT_RUNNER_SIGNALS, _RAG_BYPASS_SIGNALS_USER, _RAG_BYPASS_SIGNALS_SYSTEM,
 )
+from debug_tools import _debug_token_divergence
 
 
 
@@ -797,66 +798,6 @@ def _terminal_status(icon: str, message: str, indent: int = 0) -> None:
         print(line, flush=True)
 
 
-def _debug_token_divergence(
-    tokenizer,
-    current_tokens: List[int],
-    stored_tokens: Tuple[int, ...],
-    context_window: int = 5,
-):
-    """Finds and prints exactly where two token sequences diverge for cache debugging."""
-    min_len = min(len(current_tokens), len(stored_tokens))
-    diverge_idx = -1
-
-    for i in range(min_len):
-        if current_tokens[i] != stored_tokens[i]:
-            diverge_idx = i
-            break
-
-    # Limit how much we print: last few token IDs and short decoded snippets only
-    max_tokens_show = 10
-    max_text_len = 200
-
-    start_idx = max(0, diverge_idx - context_window)
-    tokens_before = current_tokens[start_idx:diverge_idx]
-    if len(tokens_before) > max_tokens_show:
-        tokens_before = tokens_before[-max_tokens_show:]
-    end_idx_current = min(len(current_tokens), diverge_idx + context_window + 1)
-    end_idx_stored = min(len(stored_tokens), diverge_idx + context_window + 1)
-
-    print(f"\n" + "=" * 50)
-    print(f"🚨 CACHE DIVERGENCE DETECTED AT INDEX {diverge_idx} 🚨")
-    print(f"Token IDs before divergence (last {len(tokens_before)}): {tokens_before}")
-
-    try:
-        matching_text = tokenizer.decode(current_tokens[start_idx:diverge_idx])
-        if len(matching_text) > max_text_len:
-            matching_text = "..." + matching_text[-max_text_len:].strip()
-        print(f"Matching text leading up: {repr(matching_text)}")
-
-        curr_divergent_token = current_tokens[diverge_idx]
-        stor_divergent_token = stored_tokens[diverge_idx]
-        print(
-            f"\n❌ Current Request Token [{diverge_idx}]: ID {curr_divergent_token} -> {repr(tokenizer.decode([curr_divergent_token]))}"
-        )
-        print(
-            f"❌ Stored Cache Token  [{diverge_idx}]: ID {stor_divergent_token} -> {repr(tokenizer.decode([stor_divergent_token]))}"
-        )
-
-        curr_context_after = tokenizer.decode(
-            current_tokens[diverge_idx + 1 : end_idx_current]
-        )
-        stor_context_after = tokenizer.decode(
-            stored_tokens[diverge_idx + 1 : end_idx_stored]
-        )
-        if len(curr_context_after) > max_text_len:
-            curr_context_after = curr_context_after[:max_text_len] + "..."
-        if len(stor_context_after) > max_text_len:
-            stor_context_after = stor_context_after[:max_text_len] + "..."
-        print(f"\nCurrent context after: {repr(curr_context_after)}")
-        print(f"Stored context after:  {repr(stor_context_after)}")
-    except Exception as e:
-        print(f"Could not decode tokens: {e}")
-    print("=" * 50 + "\n")
 
 
 def _block_chain_hashes(
@@ -2048,6 +1989,78 @@ def _post_generation_cache_update(
         _update_session_turn_store(session_id_for_turn, messages, prompt_tokens)
 
 
+def _build_timing_dict(
+    first_token_at: Optional[float],
+    generation_started_at: Optional[float],
+    rest_count: int,
+    generated_tokens: List[int],
+) -> Dict[str, Any]:
+    """Build the prefill/decode timing dict used by request_logger and telemetry."""
+    timing: Dict[str, Any] = {}
+    if first_token_at is not None and generation_started_at is not None:
+        timing["prefill_seconds"] = first_token_at - generation_started_at
+        timing["decode_seconds"] = time.time() - first_token_at
+        timing["prefill_tps"] = (
+            rest_count / timing["prefill_seconds"]
+            if timing["prefill_seconds"] > 0 else None
+        )
+        timing["decode_tps"] = (
+            len(generated_tokens) / timing["decode_seconds"]
+            if timing["decode_seconds"] > 0 else None
+        )
+    return timing
+
+
+def _log_generation_telemetry(
+    request_id: str,
+    generation_started_at: float,
+    generated_tokens: List[int],
+    message_text: str,
+    tool_calls: Optional[List],
+    enable_thinking: bool,
+    finish_reason: str,
+    is_embedded_agent: bool,
+    timing: Dict[str, Any],
+) -> None:
+    """Shared post-generation pipeline logging (GEN + RESP + MSG_OUT)."""
+    if FEATURE_LOG_GENERATION:
+        _gen_ms = (time.time() - generation_started_at) * 1000
+        _pipeline_log("GEN", request_id,
+            f"finished: {len(generated_tokens)} tokens in {_gen_ms/1000:.2f}s "
+            f"({timing.get('decode_tps', 0):.1f} tok/s decode)")
+        _non_reas = len(_tokenize_prompt(message_text)) if message_text else 0
+        _reas = max(0, len(generated_tokens) - _non_reas)
+        _pipeline_log("GEN", request_id,
+            f"thinking_tokens={_reas} | output_tokens={_non_reas}")
+    else:
+        _non_reas = len(_tokenize_prompt(message_text)) if message_text else 0
+        _reas = max(0, len(generated_tokens) - _non_reas)
+
+    if FEATURE_LOG_RESP:
+        _pipeline_log("RESP", request_id,
+            f"raw_text={len(generated_tokens)} tokens | normalize_applied=true")
+        if tool_calls:
+            _pipeline_log("RESP", request_id,
+                f"tool_calls_extracted={len(tool_calls)} "
+                f"{[tc.get('function', {}).get('name') for tc in tool_calls]}")
+        if enable_thinking:
+            _pipeline_log("RESP", request_id,
+                f"think_block_stripped=true ({_reas} tokens hidden from client)")
+        _pipeline_log("RESP", request_id,
+            f"message_to_client={_non_reas} tokens | finish_reason={finish_reason}")
+        _agent_tag_out = "EMBEDDED" if is_embedded_agent else "MAIN"
+        if tool_calls:
+            for _tc in tool_calls:
+                _tc_name = _tc.get("function", {}).get("name", "?")
+                _tc_args = str(_tc.get("function", {}).get("arguments", ""))[:300].replace("\n", " ")
+                _pipeline_log("MSG_OUT", request_id,
+                    f"[{_agent_tag_out}] tool_call: {_tc_name}({_tc_args})")
+        elif message_text:
+            _out_preview = message_text[:300].replace("\n", " ")
+            _pipeline_log("MSG_OUT", request_id,
+                f"[{_agent_tag_out}] text: {_out_preview!r}")
+
+
 def _tokenize_prompt(prompt):
     if isinstance(prompt, str):
         add_special_tokens = tokenizer.bos_token is None or not prompt.startswith(
@@ -2870,8 +2883,7 @@ def _cache_reaper_loop():
     _get_cache = getattr(mx, 'get_cache_memory', None) or getattr(mx.metal, 'get_cache_memory', None)
     _get_peak = getattr(mx, 'get_peak_memory', None) or getattr(mx.metal, 'get_peak_memory', None)
 
-    def _mem_snapshot(label):
-        pass  # Telemetry disabled
+
 
     while True:
         time.sleep(_CACHE_REAPER_INTERVAL_SECONDS)
@@ -2881,9 +2893,7 @@ def _cache_reaper_loop():
                 before_main = len(PROMPT_CACHE._entries)
                 before_compact = len(PROMPT_CACHE_COMPACT._entries)
 
-                # [1/4] Before any pruning
-                if before_main > 0 or before_compact > 0:
-                    _mem_snapshot(f"1/4 before prune | entries_main={before_main} entries_compact={before_compact}")
+
 
                 # Prune with telemetry enabled
                 for k in [k for k, v in PROMPT_CACHE._entries.items() if PROMPT_CACHE._is_expired(v)]:
@@ -2894,13 +2904,9 @@ def _cache_reaper_loop():
                     pruned += 1
 
             if pruned > 0:
-                # [3/4] After gc.collect
                 import gc; gc.collect()
-                _mem_snapshot("3/4 after gc.collect")
 
-                # [4/4] After mx.clear_cache
                 mx.clear_cache()
-                _mem_snapshot("4/4 after mx.clear_cache")
 
                 _terminal_status(
                     "🧹",
@@ -3870,24 +3876,6 @@ class APIHandler(BaseHTTPRequestHandler):
             # --- Qwen3.5 STRICT RULE: system messages MUST be at the beginning ---
             # After compress/RAG/heal, system messages can be scattered.
             # Merge all system messages into one at position 0.
-            # NOTE: This merges RAG system messages too, which buries them in msg[0].
-            # See parking lot: RAG hoisting exception (audit 2026-04-26, 45/46 misplaced).
-            # Deferred until personality regression testing is available.
-            def _hoist_system_messages(msgs):
-                system_parts = []
-                non_system = []
-                for m in msgs:
-                    if m.get("role") == "system":
-                        c = m.get("content", "")
-                        if isinstance(c, str) and c.strip():
-                            system_parts.append(c.strip())
-                    else:
-                        non_system.append(m)
-                if system_parts:
-                    merged_system = {"role": "system", "content": "\n\n".join(system_parts)}
-                    return [merged_system] + non_system
-                return non_system
-
             original_messages = _hoist_system_messages(original_messages)
             canonical_messages = _hoist_system_messages(canonical_messages)
 
@@ -4535,23 +4523,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 if tool_calls:
                     full_response["choices"][0]["message"]["tool_calls"] = tool_calls
                 self.wfile.write(json.dumps(full_response).encode("utf-8"))
+                timing = _build_timing_dict(first_token_at, generation_started_at, rest_count, generated_tokens)
                 if request_logger:
-                    timing = {}
-                    if first_token_at is not None and generation_started_at is not None:
-                        timing["prefill_seconds"] = (
-                            first_token_at - generation_started_at
-                        )
-                        timing["decode_seconds"] = time.time() - first_token_at
-                        timing["prefill_tps"] = (
-                            rest_count / timing["prefill_seconds"]
-                            if timing["prefill_seconds"] > 0
-                            else None
-                        )
-                        timing["decode_tps"] = (
-                            len(generated_tokens) / timing["decode_seconds"]
-                            if timing["decode_seconds"] > 0
-                            else None
-                        )
                     request_logger.log(
                         "generation",
                         {
@@ -4567,38 +4540,11 @@ class APIHandler(BaseHTTPRequestHandler):
                     )
 
                 if FEATURE_FULL_LOGGING:
-                    if FEATURE_LOG_GENERATION:
-                        _gen_ms = (time.time() - generation_started_at) * 1000
-                        _pipeline_log("GEN", request_id,
-                            f"finished: {len(generated_tokens)} tokens in {_gen_ms/1000:.2f}s "
-                            f"({timing.get('decode_tps', 0):.1f} tok/s decode)")
-                        _non_reas = len(_tokenize_prompt(message_text)) if message_text else 0
-                        _reas = max(0, len(generated_tokens) - _non_reas)
-                        _pipeline_log("GEN", request_id,
-                            f"thinking_tokens={_reas} | output_tokens={_non_reas}")
-                    if FEATURE_LOG_RESP:
-                        _pipeline_log("RESP", request_id,
-                            f"raw_text={len(generated_tokens)} tokens | normalize_applied=true")
-                        if tool_calls:
-                            _pipeline_log("RESP", request_id,
-                                f"tool_calls_extracted={len(tool_calls)} {[tc.get('function', {}).get('name') for tc in tool_calls]}")
-                        if enable_thinking:
-                            _pipeline_log("RESP", request_id,
-                                f"think_block_stripped=true ({_reas} tokens hidden from client)")
-                        _pipeline_log("RESP", request_id,
-                            f"message_to_client={_non_reas} tokens | finish_reason={finish_reason}")
-                        # ── PIPELINE LOG: MSG_OUT (non-streaming) ─────────────────────────
-                        _agent_tag_out = "EMBEDDED" if _is_embedded_agent else "MAIN"
-                        if tool_calls:
-                            for _tc in tool_calls:
-                                _tc_name = _tc.get("function", {}).get("name", "?")
-                                _tc_args = str(_tc.get("function", {}).get("arguments", ""))[:300].replace("\n", " ")
-                                _pipeline_log("MSG_OUT", request_id,
-                                    f"[{_agent_tag_out}] tool_call: {_tc_name}({_tc_args})")
-                        elif message_text:
-                            _out_preview = message_text[:300].replace("\n", " ")
-                            _pipeline_log("MSG_OUT", request_id,
-                                f"[{_agent_tag_out}] text: {_out_preview!r}")
+                    _log_generation_telemetry(
+                        request_id, generation_started_at, generated_tokens,
+                        message_text, tool_calls, enable_thinking, finish_reason,
+                        _is_embedded_agent, timing,
+                    )
             else:
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
@@ -4787,23 +4733,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 except BrokenPipeError:
                     _pipeline_log("WIRE", request_id, "❌ BROKEN PIPE on final_chunk — client disconnected before receiving response")
                     raise
+                timing = _build_timing_dict(first_token_at, generation_started_at, rest_count, generated_tokens)
                 if request_logger:
-                    timing = {}
-                    if first_token_at is not None and generation_started_at is not None:
-                        timing["prefill_seconds"] = (
-                            first_token_at - generation_started_at
-                        )
-                        timing["decode_seconds"] = time.time() - first_token_at
-                        timing["prefill_tps"] = (
-                            rest_count / timing["prefill_seconds"]
-                            if timing["prefill_seconds"] > 0
-                            else None
-                        )
-                        timing["decode_tps"] = (
-                            len(generated_tokens) / timing["decode_seconds"]
-                            if timing["decode_seconds"] > 0
-                            else None
-                        )
                     request_logger.log(
                         "generation",
                         {
@@ -4819,38 +4750,11 @@ class APIHandler(BaseHTTPRequestHandler):
                     )
 
                 if FEATURE_FULL_LOGGING:
-                    if FEATURE_LOG_GENERATION:
-                        _gen_ms = (time.time() - generation_started_at) * 1000
-                        _pipeline_log("GEN", request_id,
-                            f"finished: {len(generated_tokens)} tokens in {_gen_ms/1000:.2f}s "
-                            f"({timing.get('decode_tps', 0):.1f} tok/s decode)")
-                        _non_reas = len(_tokenize_prompt(message_text)) if message_text else 0
-                        _reas = max(0, len(generated_tokens) - _non_reas)
-                        _pipeline_log("GEN", request_id,
-                            f"thinking_tokens={_reas} | output_tokens={_non_reas}")
-                    if FEATURE_LOG_RESP:
-                        _pipeline_log("RESP", request_id,
-                            f"raw_text={len(generated_tokens)} tokens | normalize_applied=true")
-                        if tool_calls:
-                            _pipeline_log("RESP", request_id,
-                                f"tool_calls_extracted={len(tool_calls)} {[tc.get('function', {}).get('name') for tc in tool_calls]}")
-                        if enable_thinking:
-                            _pipeline_log("RESP", request_id,
-                                f"think_block_stripped=true ({_reas} tokens hidden from client)")
-                        _pipeline_log("RESP", request_id,
-                            f"message_to_client={_non_reas} tokens | finish_reason={finish_reason}")
-                        # ── PIPELINE LOG: MSG_OUT (streaming) ────────────────────────────
-                        _agent_tag_out = "EMBEDDED" if _is_embedded_agent else "MAIN"
-                        if tool_calls:
-                            for _tc in tool_calls:
-                                _tc_name = _tc.get("function", {}).get("name", "?")
-                                _tc_args = str(_tc.get("function", {}).get("arguments", ""))[:300].replace("\n", " ")
-                                _pipeline_log("MSG_OUT", request_id,
-                                    f"[{_agent_tag_out}] tool_call: {_tc_name}({_tc_args})")
-                        elif message_text:
-                            _out_preview = message_text[:300].replace("\n", " ")
-                            _pipeline_log("MSG_OUT", request_id,
-                                f"[{_agent_tag_out}] text: {_out_preview!r}")
+                    _log_generation_telemetry(
+                        request_id, generation_started_at, generated_tokens,
+                        message_text, tool_calls, enable_thinking, finish_reason,
+                        _is_embedded_agent, timing,
+                    )
 
         except BrokenPipeError:
             _terminal_status(
