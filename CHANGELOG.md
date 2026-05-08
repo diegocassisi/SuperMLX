@@ -6,6 +6,12 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.4.2] — 2026-05-08
+
+_In progress._
+
+---
+
 ## [1.4.1] — 2026-05-07
 
 ### Fixed
