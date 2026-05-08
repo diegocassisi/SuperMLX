@@ -431,78 +431,223 @@ if not metrics:
     st.info("No requests found in this session log.")
     st.stop()
 
-# ── System Status ─────────────────────────────────────────────────────────────
+# ── Compute all dashboard values ─────────────────────────────────────────────
 
-col1, col2, col3, col4, col5 = st.columns(5)
+cache_hits_count = sum(1 for m in metrics if m.get("cache_match_type") not in ("miss", "?"))
+hit_pct = (cache_hits_count / len(metrics) * 100) if metrics else 0
+avg_rest = sum(m.get("rest_tokens", 0) for m in metrics) / max(len(metrics), 1)
+avg_prefill = sum(m.get("prefill_s", 0) for m in metrics) / max(len(metrics), 1)
+avg_decode_tps = sum(m.get("decode_tps", 0) for m in metrics) / max(len(metrics), 1)
 
-with col1:
-    st.metric("📨 Requests", len(metrics))
-with col2:
-    cache_hits = sum(1 for m in metrics if m.get("cache_match_type") not in ("miss", "?"))
-    hit_pct = (cache_hits / len(metrics) * 100) if metrics else 0
-    st.metric("🎯 Cache Hit %", f"{hit_pct:.0f}%")
-with col3:
-    avg_rest = sum(m.get("rest_tokens", 0) for m in metrics) / max(len(metrics), 1)
-    st.metric("📊 Avg Rest Tokens", f"{avg_rest:,.0f}")
-with col4:
-    avg_prefill = sum(m.get("prefill_s", 0) for m in metrics) / max(len(metrics), 1)
-    st.metric("⏱️ Avg Prefill", f"{avg_prefill:.1f}s")
-with col5:
-    avg_decode_tps = sum(m.get("decode_tps", 0) for m in metrics) / max(len(metrics), 1)
-    st.metric("⚡ Avg Decode", f"{avg_decode_tps:.1f} tok/s")
-
-# System memory
-sys_mem = _get_system_memory()
-if sys_mem:
-    st.markdown("---")
-    mcol1, mcol2, mcol3, mcol4 = st.columns(4)
-    with mcol1:
-        st.metric("💾 Total RAM", f"{sys_mem['total_gb']:.1f} GiB")
-    with mcol2:
-        st.metric("📈 Used", f"{sys_mem['used_gb']:.1f} GiB")
-    with mcol3:
-        st.metric("📉 Available", f"{sys_mem['available_gb']:.1f} GiB")
-    with mcol4:
-        metal_gb = _get_metal_memory_gb()
-        if metal_gb is not None:
-            st.metric("🖥️ Metal GPU", f"{metal_gb:.1f} GiB")
-        else:
-            st.metric("🖥️ Metal GPU", "N/A")
-
-st.markdown("---")
-
-# ── Benchmark Summary ─────────────────────────────────────────────────────────
-
-st.markdown("## 📊 Session Benchmark")
-
-# Calculate aggregate metrics
 _total_prefill = sum(m.get("prefill_s", 0) for m in metrics)
 _cache_hits = [m for m in metrics if m.get("cache_match_type") not in ("miss", "?")]
 _cache_misses = [m for m in metrics if m.get("cache_match_type") in ("miss", "?")]
 _avg_miss_prefill = (
     sum(m.get("prefill_s", 0) for m in _cache_misses) / max(len(_cache_misses), 1)
 )
-# Estimated time WITHOUT cache: every turn would cost the cold-start prefill
+_avg_hit_prefill = (
+    sum(m.get("prefill_s", 0) for m in _cache_hits) / max(len(_cache_hits), 1)
+)
 _estimated_no_cache = _avg_miss_prefill * len(metrics) if _cache_misses else _total_prefill
 _time_saved = max(0, _estimated_no_cache - _total_prefill)
+_speedup = _estimated_no_cache / max(_total_prefill, 0.1)
 
-bcol1, bcol2, bcol3, bcol4 = st.columns(4)
-with bcol1:
-    st.metric("🧊 Cold Starts", f"{len(_cache_misses)}")
-    st.caption(f"Avg cold prefill: {_avg_miss_prefill:.1f}s")
-with bcol2:
-    st.metric("🔥 Cache Hits", f"{len(_cache_hits)}")
-    _avg_hit_prefill = (
-        sum(m.get("prefill_s", 0) for m in _cache_hits) / max(len(_cache_hits), 1)
-    )
-    st.caption(f"Avg warm prefill: {_avg_hit_prefill:.1f}s")
-with bcol3:
-    st.metric("⏱️ Total Prefill", f"{_total_prefill:.1f}s")
-    st.caption(f"Without cache: ~{_estimated_no_cache:.0f}s")
-with bcol4:
-    st.metric("💰 Time Saved", f"{_time_saved:.0f}s")
-    _speedup = _estimated_no_cache / max(_total_prefill, 0.1)
-    st.caption(f"Speedup: {_speedup:.1f}×")
+sys_mem = _get_system_memory()
+metal_gb = _get_metal_memory_gb()
+_ram_used = f"{sys_mem['used_gb']:.1f}" if sys_mem else "—"
+_ram_total = f"{sys_mem['total_gb']:.1f}" if sys_mem else "—"
+_ram_pct = sys_mem['percent'] if sys_mem else 0
+_metal_str = f"{metal_gb:.1f}" if metal_gb is not None else "—"
+
+# Cache hit gauge color
+if hit_pct >= 85:
+    _gauge_color = "#22c55e"
+    _gauge_glow = "rgba(34,197,94,0.3)"
+elif hit_pct >= 50:
+    _gauge_color = "#eab308"
+    _gauge_glow = "rgba(234,179,8,0.3)"
+else:
+    _gauge_color = "#ef4444"
+    _gauge_glow = "rgba(239,68,68,0.3)"
+
+# ── Dashboard HTML ───────────────────────────────────────────────────────────
+
+st.markdown(f"""
+<style>
+    .dash-grid {{
+        display: grid;
+        grid-template-columns: 1fr 1fr 1fr;
+        gap: 16px;
+        margin: 16px 0 24px 0;
+    }}
+    .dash-hero {{
+        grid-column: 1 / -1;
+        display: grid;
+        grid-template-columns: 1fr 1fr 1fr;
+        gap: 16px;
+    }}
+    .card {{
+        background: rgba(255,255,255,0.04);
+        border: 1px solid rgba(255,255,255,0.08);
+        border-radius: 16px;
+        padding: 20px 24px;
+        backdrop-filter: blur(12px);
+        -webkit-backdrop-filter: blur(12px);
+    }}
+    .card-hero {{
+        background: linear-gradient(135deg, rgba(34,197,94,0.12) 0%, rgba(59,130,246,0.08) 100%);
+        border: 1px solid rgba(34,197,94,0.2);
+        border-radius: 20px;
+        padding: 28px 32px;
+        text-align: center;
+        backdrop-filter: blur(16px);
+        -webkit-backdrop-filter: blur(16px);
+    }}
+    .card-gauge {{
+        background: linear-gradient(135deg, rgba(255,255,255,0.06) 0%, rgba(255,255,255,0.02) 100%);
+        border: 1px solid rgba(255,255,255,0.1);
+        border-radius: 20px;
+        padding: 28px 32px;
+        text-align: center;
+        backdrop-filter: blur(16px);
+    }}
+    .card-label {{
+        font-family: 'Inter', -apple-system, sans-serif;
+        font-size: 0.7rem;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        color: rgba(255,255,255,0.45);
+        margin-bottom: 6px;
+    }}
+    .card-value {{
+        font-family: 'JetBrains Mono', 'SF Mono', monospace;
+        font-size: 1.6rem;
+        font-weight: 700;
+        color: #f0f0f8;
+        line-height: 1.2;
+    }}
+    .card-value-hero {{
+        font-family: 'JetBrains Mono', 'SF Mono', monospace;
+        font-size: 2.8rem;
+        font-weight: 700;
+        background: linear-gradient(135deg, #22c55e, #3b82f6);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        background-clip: text;
+        line-height: 1.1;
+    }}
+    .card-sub {{
+        font-family: 'Inter', -apple-system, sans-serif;
+        font-size: 0.75rem;
+        color: rgba(255,255,255,0.35);
+        margin-top: 4px;
+    }}
+    .gauge-ring {{
+        width: 100px;
+        height: 100px;
+        border-radius: 50%;
+        background: conic-gradient(
+            {_gauge_color} 0deg,
+            {_gauge_color} {hit_pct * 3.6}deg,
+            rgba(255,255,255,0.06) {hit_pct * 3.6}deg,
+            rgba(255,255,255,0.06) 360deg
+        );
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        margin: 0 auto 8px auto;
+        box-shadow: 0 0 24px {_gauge_glow};
+    }}
+    .gauge-inner {{
+        width: 76px;
+        height: 76px;
+        border-radius: 50%;
+        background: #13132e;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+    }}
+    .gauge-text {{
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 1.4rem;
+        font-weight: 700;
+        color: {_gauge_color};
+    }}
+    .dash-row {{
+        display: grid;
+        grid-template-columns: repeat(5, 1fr);
+        gap: 12px;
+        margin-top: 12px;
+    }}
+    .card-sm {{
+        background: rgba(255,255,255,0.03);
+        border: 1px solid rgba(255,255,255,0.06);
+        border-radius: 12px;
+        padding: 14px 16px;
+        backdrop-filter: blur(8px);
+    }}
+    .card-sm .card-value {{
+        font-size: 1.2rem;
+    }}
+</style>
+
+<div class="dash-hero">
+    <div class="card-gauge">
+        <div class="card-label">Cache Hit Rate</div>
+        <div class="gauge-ring">
+            <div class="gauge-inner">
+                <span class="gauge-text">{hit_pct:.0f}%</span>
+            </div>
+        </div>
+        <div class="card-sub">{cache_hits_count} hits / {len(_cache_misses)} misses</div>
+    </div>
+    <div class="card-hero">
+        <div class="card-label">Time Saved This Session</div>
+        <div class="card-value-hero">{_time_saved:.0f}s</div>
+        <div class="card-sub">
+            {_speedup:.1f}× speedup &nbsp;·&nbsp;
+            {_total_prefill:.0f}s actual vs ~{_estimated_no_cache:.0f}s without cache
+        </div>
+    </div>
+    <div class="card-gauge">
+        <div class="card-label">System Memory</div>
+        <div style="margin: 12px 0;">
+            <div class="card-value" style="font-size: 1.4rem;">{_ram_used} / {_ram_total} GiB</div>
+            <div class="card-sub" style="margin-top: 8px;">RAM {_ram_pct:.0f}% &nbsp;·&nbsp; Metal GPU {_metal_str} GiB</div>
+        </div>
+        <div style="background: rgba(255,255,255,0.06); border-radius: 4px; height: 6px; margin-top: 12px; overflow: hidden;">
+            <div style="background: {'#ef4444' if _ram_pct > 85 else '#eab308' if _ram_pct > 70 else '#22c55e'}; height: 100%; width: {_ram_pct}%; border-radius: 4px; transition: width 0.3s;"></div>
+        </div>
+    </div>
+</div>
+
+<div class="dash-row">
+    <div class="card-sm">
+        <div class="card-label">Requests</div>
+        <div class="card-value">{len(metrics)}</div>
+    </div>
+    <div class="card-sm">
+        <div class="card-label">Avg Prefill</div>
+        <div class="card-value">{avg_prefill:.1f}s</div>
+        <div class="card-sub">cold {_avg_miss_prefill:.1f}s · warm {_avg_hit_prefill:.1f}s</div>
+    </div>
+    <div class="card-sm">
+        <div class="card-label">Decode Speed</div>
+        <div class="card-value">{avg_decode_tps:.1f} <span style="font-size: 0.7rem; color: rgba(255,255,255,0.4);">tok/s</span></div>
+    </div>
+    <div class="card-sm">
+        <div class="card-label">Avg Rest Tokens</div>
+        <div class="card-value">{avg_rest:,.0f}</div>
+        <div class="card-sub">tokens to prefill after cache</div>
+    </div>
+    <div class="card-sm">
+        <div class="card-label">Total Prefill</div>
+        <div class="card-value">{_total_prefill:.0f}s</div>
+        <div class="card-sub">across {len(metrics)} requests</div>
+    </div>
+</div>
+""", unsafe_allow_html=True)
 
 st.markdown("---")
 
