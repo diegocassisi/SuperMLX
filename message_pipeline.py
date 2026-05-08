@@ -588,3 +588,38 @@ def _extract_session_context(
         session_id=session_id, parent_session_id=parent_session_id,
         branch_id=branch_id, source=source,
     )
+
+
+def _assert_cache_key_safety(
+    original_prompt: str,
+    cache_key_prompt: str,
+    context: str = "",
+    log_fn: Optional[Callable] = None,
+) -> bool:
+    """
+    Safety invariant check for the dual-pipeline architecture.
+    Asserts that the cache key is not dramatically shorter than the original prompt,
+    which would indicate over-matching normalization silently deleting content.
+
+    Only called when CACHE_NORM_SAFETY_CHECK=true (off by default — no latency impact).
+
+    Returns True if invariant holds.  On violation: logs an error and returns False.
+    The caller must fall back to using original_prompt as the cache key.
+    """
+    if not isinstance(original_prompt, str) or not isinstance(cache_key_prompt, str):
+        return True
+    orig_len = len(original_prompt)
+    if orig_len == 0:
+        return True
+    key_len = len(cache_key_prompt)
+    ratio = key_len / orig_len
+    if ratio < 0.90:
+        if log_fn:
+            log_fn(
+                "❌",
+                f"[CACHE-SAFETY] cache_key is {ratio:.1%} of original prompt "
+                f"({key_len} vs {orig_len} chars) — normalization over-matched. "
+                f"Falling back to original prompt as cache key. context={context}",
+            )
+        return False
+    return True

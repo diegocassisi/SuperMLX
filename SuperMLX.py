@@ -198,8 +198,7 @@ except ImportError:
 SCRIPT_DIR = Path(__file__).resolve().parent
 DOTENV_PATH = SCRIPT_DIR / ".env"
 
-# Thread-local VLM diagnostics (used_prefix_stable, etc.) for cache-debug logging.
-_vlm_diagnostics = threading.local()
+
 if DOTENV_PATH.exists():
     load_dotenv(dotenv_path=DOTENV_PATH, override=True)
 
@@ -619,6 +618,7 @@ from message_pipeline import (
     _flatten_content, _prepare_messages_for_template,
     _scrub_cache_key, _canonicalize_inbound_context_block,
     _canonicalize_messages, _extract_session_context,
+    _assert_cache_key_safety,
     _COMPACT_RUNNER_SIGNALS, _RAG_BYPASS_SIGNALS_USER, _RAG_BYPASS_SIGNALS_SYSTEM,
 )
 
@@ -637,7 +637,7 @@ _PIPELINE_LOG_DIR = SETTINGS.log_root / "requests"
 
 # ANSI color codes for terminal log highlighting
 _ANSI_YELLOW = "\033[33m"
-_ANSI_RED = "\033[31m"
+
 _ANSI_RESET = "\033[0m"
 # Stages that get yellow highlighting (compression/compaction events)
 _HIGHLIGHT_STAGES = {"COMPRESS", "COMPACT_RUNNER"}
@@ -1726,20 +1726,6 @@ def _cache_log_session_id(
     return _cache_session_id(cache_session_tokens)
 
 
-def _messages_have_images(messages: List[Dict[str, Any]]) -> bool:
-    """True if any message has content list containing image_url or input_image."""
-    for msg in messages:
-        content = msg.get("content")
-        if not isinstance(content, list):
-            continue
-        for part in content:
-            if isinstance(part, dict):
-                t = (part.get("type") or "").strip().lower()
-                if t in ("image_url", "input_image"):
-                    return True
-                if "image_url" in part or "input_image" in part:
-                    return True
-    return False
 
 
 def _extract_images_from_messages(messages: List[Dict[str, Any]]) -> List[Any]:
@@ -1944,21 +1930,6 @@ def _vlm_sync_before_generation(pixel_values: Any, mask: Any) -> None:
             mx.eval(*to_eval)
         except Exception:
             pass
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
@@ -2225,7 +2196,7 @@ def _kv_cache_offset(cache: Any) -> Optional[int]:
     return None
 
 
-# No call sites remain after Phase 6 cleanup.  Use _scrub_cache_key() directly.
+
 
 
 
@@ -2707,9 +2678,6 @@ def _warmup_save_cache(
     return _wm.save_cache(tokens, prompt_cache, path, prefix_hash=prefix_hash, log_fn=_terminal_status)
 
 
-def _warmup_load_cache(path: Path) -> Tuple[Optional[List[int]], Optional[Any]]:
-    """Thin wrapper → warmup_manager.load_cache(). Backward compat for embedded cache load."""
-    return _wm.load_cache(path, model, SETTINGS.max_kv_size, is_vlm=is_vlm, log_fn=_terminal_status)
 
 
 def _run_startup_warmup() -> None:
@@ -3839,7 +3807,8 @@ class APIHandler(BaseHTTPRequestHandler):
             # Safety invariant: cache key must not be dramatically shorter than the original.
             if SETTINGS.cache_norm_safety_check:
                 if not _assert_cache_key_safety(
-                    prompt, cache_prompt, context="lm_path"
+                    prompt, cache_prompt, context="lm_path",
+                    log_fn=_terminal_status,
                 ):
                     # Normalization over-matched — fall back to using the original prompt
                     # as the cache key to prevent invisible content loss.
@@ -4310,9 +4279,7 @@ class APIHandler(BaseHTTPRequestHandler):
                             ],  # cap to avoid log bloat
                             **(
                                 {
-                                    "vlm_format_prefix_stable": getattr(
-                                        _vlm_diagnostics, "used_prefix_stable", False
-                                    ),
+                                    "vlm_format_prefix_stable": False,
                                     "prompt_token_prefix": list(prompt_tokens[:64]),
                                 }
                                 if is_vlm
