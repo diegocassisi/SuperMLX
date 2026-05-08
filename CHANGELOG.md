@@ -24,18 +24,24 @@ Versioning follows [Semantic Versioning](https://semver.org/).
     session context extraction, cache key safety check.
 - All extracted functions are pure (input → output). Global stores (`HEALING_STORE`,
   `_terminal_status`) are passed as parameters to maintain module independence.
-- `SuperMLX.py` reduced from ~5800 to ~4987 lines (~14% reduction).
+- `SuperMLX.py` reduced from ~5800 to ~4891 lines (~16% reduction).
 - **Deduplication:** Extracted 3 shared helpers replacing 6 copy-pasted blocks
   between streaming and non-streaming paths:
   - `_start_prefill_progress()` — replaces 2× ~30-line inline closures.
   - `_update_healing_store()` — replaces 2× ~8-line inline blocks.
   - `_post_generation_cache_update()` — replaces 2× ~40-line cache insertion blocks.
+  - `_build_timing_dict()` — replaces 2× ~15-line inline timing dict construction.
+  - `_log_generation_telemetry()` — replaces 2× ~33-line inline GEN/RESP/MSG_OUT logging.
+- **Module extraction:** `_debug_token_divergence()` moved to `debug_tools.py`;
+  `_hoist_system_messages()` moved to `message_pipeline.py` (was nested, recreated
+  per request).
 
 ### Removed
 - `_ANSI_RED` — defined but never referenced (only `_ANSI_YELLOW` was used).
 - `_vlm_diagnostics` — thread-local never written to, always returned `False`.
 - `_messages_have_images()` — 14-line function with zero call sites.
 - `_warmup_load_cache()` — backward-compat wrapper with zero callers post-modularization.
+- `_mem_snapshot()` — empty function (`pass`) called 4 times in cache reaper; dead telemetry.
 - 17 consecutive blank lines (sed extraction residue).
 - Orphaned comment referencing deleted Phase 6 function.
 
