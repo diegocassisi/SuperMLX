@@ -156,8 +156,12 @@ For 12GB machines, use `PROMPT_CACHE_MAX_ENTRIES_GLOBAL=1` and `MEMORY_GUARD_THR
 ## Modules
 
 | File | Purpose |
-|------|---------|
+|------|---------| 
 | `SuperMLX.py` | Main server: HTTP handler, cache management, generation pipeline |
+| `config.py` | Environment helpers + `Settings` dataclass (pure, no side effects) |
+| `tool_parsing.py` | Regex patterns, `<think>` extraction, OpenAI tool-call parsing |
+| `message_pipeline.py` | Canonicalization, healing, loop breaker, detection, session context |
+| `debug_tools.py` | Cache divergence analysis, token inspection diagnostics |
 | `warmup_manager.py` | Dynamic Prefix Capture: disk persistence, hash validation, startup reload |
 | `rag_enricher.py` | RAG enrichment + LLMLingua-2 compression pipeline |
 | `emergency_compressor.py` | Last-resort content compression for OOM prevention |
