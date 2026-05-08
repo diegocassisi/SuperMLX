@@ -236,17 +236,17 @@ FEATURE_EMERGENCY_COMPRESS    = _env_str("EMERGENCY_CONTENT_COMPRESS", "true").l
 FEATURE_RAG_ENRICHMENT        = _env_str("FEATURE_RAG_ENRICHMENT", "false").lower() in ("1", "true", "yes")
 FEATURE_RAG_WORKSPACE_ROOT    = _env_str("RAG_WORKSPACE_ROOT", "")
 
-# Headers HTTP de diagnóstico (X-Pipeline-Compression-Ms, X-Pipeline-RAG-Ms, etc.)
+# Diagnostic HTTP headers (X-Pipeline-Compression-Ms, X-Pipeline-RAG-Ms, etc.)
 FEATURE_DIAGNOSTIC_HEADERS = True
 
 # Logging exhaustivo de todas las etapas del pipeline.
 # Master switch: si False, todos los FEATURE_LOG_* se desactivan.
 FEATURE_FULL_LOGGING       = True
 
-# Sub-flags de logging (sólo activos cuando FEATURE_FULL_LOGGING = True)
+# Sub-flags for logging (only active when FEATURE_FULL_LOGGING = True)
 FEATURE_LOG_PROMPTS        = _env_bool("LOG_PROMPTS", True)    # Dump de prompts/messages a disco (logs/requests/)
 FEATURE_LOG_TOOLS          = _env_bool("LOG_TOOLS", True)      # Detalle de tool schemas + tool_results en historial
-FEATURE_LOG_COMPRESSION    = True   # Antes/después de compresión + chunks + timing
+FEATURE_LOG_COMPRESSION    = True   # Before/after compression + chunks + timing
 FEATURE_LOG_RAG            = True   # Chunks RAG inyectados, scores de relevancia
 FEATURE_LOG_CACHE          = True   # Hit/miss/shorter, stable prefix, evictions
 FEATURE_LOG_HEALING        = True   # Healing store operations (hits, store size)
@@ -374,7 +374,7 @@ def _compress_with_cache(
 
 # RAG: config
 FEATURE_RAG_TOP_K             = 5      # chunks a recuperar de LanceDB
-FEATURE_RAG_RELEVANCE_THRESHOLD = 1.6  # Qwen3-Embed asimétrico (docs sin prefijo). Probado 0.8: filtra demasiado
+FEATURE_RAG_RELEVANCE_THRESHOLD = 1.6  # Qwen3-Embed asymmetric (docs without prefix). Tested 0.8: filters too much
 
 # Tool Call Loop Breaker: detect and break infinite tool-call retry loops.
 # When the model retries the same failed tool N consecutive times, inject a
@@ -919,8 +919,8 @@ class LRUPromptCache:
         """
         Cost-Aware Eviction: Finds the entry with the highest eviction score.
         Protects long 'trunks' and frequently used templates; penalizes old, short branches.
-        Kripper Base Slot: entradas con pinned=True son inmunes a evicción.
-        Solo si TODOS los slots están pinned, se evicta el más viejo (safety fallback).
+        Kripper Base Slot: entries with pinned=True are immune to eviction.
+        Only if ALL slots are pinned, the oldest is evicted (safety fallback).
         """
         now = time.time()
         best_key = None
@@ -943,7 +943,7 @@ class LRUPromptCache:
                 max_score = score
                 best_key = key
 
-        # Safety fallback: si TODOS los slots están pinned, evictar el pinned más viejo
+        # Safety fallback: if ALL slots are pinned, evict the oldest pinned
         # (evita deadlock de memoria por pinning excesivo)
         if best_key is None:
             oldest_key = None
@@ -955,7 +955,7 @@ class LRUPromptCache:
             if oldest_key:
                 _terminal_status(
                     "⚠️",
-                    "Kripper slot: todos los slots están pinned, evictando el más viejo",
+                    "Kripper slot: all slots are pinned, evicting the oldest",
                 )
                 self._delete(oldest_key[0], oldest_key[1])
             return
@@ -1163,7 +1163,7 @@ PROMPT_CACHE = LRUPromptCache(
 
 # KRIPPER DUAL-SLOT: LRU dedicado para el compact runner de OpenClaw.
 # Isolado de PROMPT_CACHE para que nunca evicte el slot MAIN.
-# max_size=1: el compact genera un resumen puntual, no necesita histórico.
+# max_size=1: compact generates a one-shot summary, no history needed.
 PROMPT_CACHE_COMPACT = LRUPromptCache(
     max_size=1,
     ttl_seconds=SETTINGS.prompt_cache_ttl_seconds,
@@ -2147,7 +2147,7 @@ def _insert_cache_entries(
     if _is_compact_save:
         # ── AUTO-SAVE EMBEDDED/COMPACT CACHE ──────────────────────────────
         # Guardar el estado del compact runner en EMBEDDED_CACHE_PERSIST_PATH.
-        # Solo si: hay path configurado, no fue guardado aún (o hit rate bajo), y tokens suficientes.
+        # Only if: persist path configured, not yet saved (or low hit rate), and enough tokens.
         embedded_persist_path = Path(SETTINGS.embedded_cache_persist_path) if SETTINGS.embedded_cache_persist_path else None
         _emb_should_save = False
         _emb_save_reason = ""
@@ -2178,7 +2178,7 @@ def _insert_cache_entries(
         _should_save = False
         _save_reason = ""
         if persist_path and is_warmup_candidate and len(cache_key) > 5000:
-            # Diagnóstico explícito — siempre visible cuando es un real startup
+            # Explicit diagnostic — always visible on real startup
             _terminal_status(
                 "🔍",
                 f"Auto-save check: saved={_DPC.disk_cache_saved} | hit={cache_hit_ratio:.0%} | "
@@ -2678,7 +2678,7 @@ if FEATURE_RAG_ENRICHMENT:
             f" | relevance_threshold={FEATURE_RAG_RELEVANCE_THRESHOLD}"
             f" | embedding={_rag_mod.EMBED_MODEL_NAME} (MPS)"
         )
-        # RAG index: bloqueante — SYSTEM READY aparece solo cuando el índice esté listo.
+        # RAG index: blocking — SYSTEM READY appears only when the index is ready.
         if FEATURE_RAG_WORKSPACE_ROOT:
             try:
                 _terminal_status("🔍", f"RAG: indexando workspace | root={FEATURE_RAG_WORKSPACE_ROOT}")
@@ -2687,7 +2687,7 @@ if FEATURE_RAG_ENRICHMENT:
             except Exception as _idx_err:
                 _terminal_status("⚠️", f"RAG: indexing failed ({_idx_err})")
         else:
-            _terminal_status("ℹ️", "RAG: no RAG_WORKSPACE_ROOT set — enricher activo pero índice vacío")
+            _terminal_status("ℹ️", "RAG: no RAG_WORKSPACE_ROOT set — enricher active but index empty")
     except ImportError as e:
         _terminal_status("⚠️", f"RAG Enricher: UNAVAILABLE (import failed: {e})")
     except Exception as e:
@@ -2718,7 +2718,7 @@ if FEATURE_COMPRESSOR:
             _compressor_module._load_llmlingua()
             _terminal_status("✅", "Compressor: modelos auxiliares listos en CPU")
         except Exception as _preload_err:
-            _terminal_status("⚠️", f"Compressor: precarga parcial ({_preload_err}) — cargará lazy en primer request")
+            _terminal_status("⚠️", f"Compressor: partial preload ({_preload_err}) — will load lazily on first request")
     except ImportError as e:
         _terminal_status("⚠️", f"Compressor: UNAVAILABLE (import failed: {e})")
     except Exception as e:
@@ -2742,7 +2742,7 @@ if not FEATURE_COMPRESSOR and FEATURE_EMERGENCY_COMPRESS and _compressor_module 
             _compressor_module._load_llmlingua()
             _terminal_status("✅", "Emergency Compressor: LLMLingua listo en CPU (standalone)")
         except Exception as _preload_err:
-            _terminal_status("⚠️", f"Emergency Compressor: precarga parcial ({_preload_err}) — cargará lazy")
+            _terminal_status("⚠️", f"Emergency Compressor: partial preload ({_preload_err}) — will load lazily")
     except ImportError as e:
         _terminal_status("⚠️", f"Emergency Compressor: UNAVAILABLE (import failed: {e})")
         _compressor_module = None
@@ -3429,15 +3429,15 @@ class APIHandler(BaseHTTPRequestHandler):
             return
 
         # ── DPC GATE ────────────────────────────────────────────────────────
-        # Si DPC está configurado y aún no terminó el boot, el primer request espera
-        # hasta que el cache hash esté cargado. Para todos los requests siguientes
-        # _WARMUP_DONE.is_set() == True → no hay overhead (operación O(1)).
+        # If DPC is configured and boot hasn't finished yet, the first request waits
+        # until the cache hash is loaded. For all subsequent requests
+        # _WARMUP_DONE.is_set() == True → no overhead (O(1) operation).
         # Timeout de 120s por si el boot falla: el request procede igual (cold start).
         if not _WARMUP_DONE.is_set() and SETTINGS.cache_persist_path:
             _wg_t0 = time.time()
             _WARMUP_DONE.wait(timeout=120)
             _wg_elapsed = time.time() - _wg_t0
-            if _wg_elapsed > 0.5:  # Solo loguear si realmente esperó
+            if _wg_elapsed > 0.5:  # Only log if actually waited
                 with console_lock:
                     print(
                         f"  [WARMUP_GATE] {datetime.now().strftime('%H:%M:%S')} "
@@ -3515,10 +3515,10 @@ class APIHandler(BaseHTTPRequestHandler):
         _pipeline_timings = {}  # stage -> ms
         raw_messages_inbound = body.get("messages", [])
 
-        # ── TOOL RESULT TRUNCATION (medida temporal hasta implementar plan §11) ──
-        # Impide que web_fetch/pdf de documentos grandes vuelen la memoria del GPU.
-        # Cuando §11 esté implementado (workspace efímero + embeddings), este bloque
-        # puede eliminarse porque el modelo nunca recibirá el documento completo.
+        # ── TOOL RESULT TRUNCATION (temporary measure until plan §11 is implemented) ──
+        # Prevents web_fetch/pdf of large documents from blowing GPU memory.
+        # When §11 is implemented (ephemeral workspace + embeddings), this block
+        # can be removed because the model will never receive the full document.
         _MAX_TOOL_RESULT_CHARS = int(os.environ.get("MAX_TOOL_RESULT_CHARS", "20000"))
         _tool_truncations = 0
         for _msg in raw_messages_inbound:
@@ -3527,8 +3527,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 if isinstance(_tc, str) and len(_tc) > _MAX_TOOL_RESULT_CHARS:
                     _msg["content"] = (
                         _tc[:_MAX_TOOL_RESULT_CHARS]
-                        + f"\n\n[TRUNCADO: el resultado de la herramienta excedió {_MAX_TOOL_RESULT_CHARS} caracteres. "
-                        f"Implementar plan §11 (workspace efímero + embeddings) para eliminar este límite.]"
+                        + f"\n\n[TRUNCATED: tool result exceeded {_MAX_TOOL_RESULT_CHARS} characters. "
+                        f"Implement plan §11 (ephemeral workspace + embeddings) to remove this limit.]"
                     )
                     _tool_truncations += 1
         if _tool_truncations > 0:

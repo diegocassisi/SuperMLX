@@ -44,7 +44,7 @@ rag = ["lancedb>=0.26.1", "sentence-transformers>=5.2.0", "llmlingua>=0.2.2"]
 supermlx = "supermlx.server:run"
 
 [project.urls]
-Homepage = "https://github.com/dcassisi/SuperMLX"
+Homepage = "https://github.com/diegocassisi/SuperMLX"
 
 [tool.setuptools.packages.find]
 include = ["supermlx*"]

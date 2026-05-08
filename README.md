@@ -1,35 +1,54 @@
-# SuperMLX
+<p align="center">
+  <img src="assets/banner.png" alt="SuperMLX — Agentic inference for Apple Silicon" width="800">
+</p>
 
-**Production-grade MLX inference server for agentic AI on Apple Silicon.**
+# ⚡ SuperMLX — Agentic inference for Apple Silicon
 
-SuperMLX is an OpenAI-compatible inference server built specifically for multi-agent AI workflows running on Apple Silicon. While other servers handle 1:1 chat well, they break down when agentic frameworks (OpenClaw, Claude Code, Cursor) run sub-agents, compact memory, and retry failed tool calls — all hitting the same model concurrently.
+**Make small local models work for agentic AI. No cloud required.**
 
-SuperMLX solves the 5 problems that make local agentic AI unusable:
+SuperMLX is an OpenAI-compatible inference server that turns a local model on your Mac into a practical backend for multi-agent frameworks. Built and tested with [OpenClaw](https://github.com/openclaw/openclaw), it works with any framework that speaks the OpenAI API (Claude Code, Cursor, LangChain, etc.). It eliminates the infrastructure overhead that makes local inference unusable: 30+ second waiting.., cache misses on every turn, memory exhaustion, and infinite tool-call loops — making it a smart local agent solution.
 
-| Problem | mlx-lm | Ollama | llama.cpp | SuperMLX |
-|---------|:------:|:------:|:---------:|:--------:|
-| KV cache survives sub-agent compaction | ❌ | ❌ | ❌ | ✅ Dual-Slot |
-| Auto-persists & restores warm cache | ❌ | ❌ | ❌ | ✅ DPC |
-| Cache stable despite volatile metadata | ❌ | ❌ | ❌ | ✅ Canonicalization |
-| Breaks infinite tool-call loops | ❌ | ❌ | ❌ | ✅ Loop Breaker |
-| Recovers from idle cache eviction | ❌ | ❌ | ❌ | ✅ Post-Reaper Reload |
+[Install](#quick-start) · [Features](#features) · [Architecture](#architecture) · [Configuration](#configuration) · [Benchmarks](#benchmarks) · [Pipeline Monitor](#pipeline-monitor) · [Roadmap](#roadmap--v20)
+
+---
+
+## Why This Exists
+
+Frontier APIs prefill 30,000-token prompts in milliseconds. Agentic frameworks were designed for that reality — a typical session injects personality files, tool definitions, memory, and user config before the first message. On Claude, that's invisible. On a local model with 24GB of RAM, it's a **32-second cold start every turn** if you don't manage the KV cache correctly.
+
+SuperMLX's approach: reuse the KV cache aggressively. When a 13,000-token prompt grows by 200 tokens on the next turn, only the 200 new tokens get prefilled — dropping time-to-first-token from 32s to under 3s. The hard part is making cache reuse survive the chaos that agentic frameworks create: sub-agent compaction, volatile metadata, idle eviction, and retry storms.
+
+| Problem | Other servers | SuperMLX |
+|---------|:------------:|:--------:|
+| KV cache survives sub-agent compaction | ❌ | ✅ Dual-Slot |
+| Auto-persists & restores warm cache across restarts | ❌ | ✅ DPC |
+| Cache stable despite volatile metadata every turn | ❌ | ✅ Canonicalization |
+| Breaks infinite tool-call retry loops | ❌ | ✅ Loop Breaker |
+| Recovers from idle cache eviction automatically | ❌ | ✅ Post-Reaper Reload |
 
 ---
 
 ## Quick Start
 
 ```bash
-# Clone and install
-git clone https://github.com/YOUR_USER/SuperMLX.git
-cd SuperMLX
-pip install -r requirements.txt
+# Install
+pip install supermlx
 
-# Copy and configure
+# Configure
 cp .env.example .env
 # Edit .env: set MODEL_PATH, adjust MEMORY_GUARD_THRESHOLD_GB for your RAM
 
 # Run
-python SuperMLX.py
+supermlx
+```
+
+Or from source:
+
+```bash
+git clone https://github.com/diegocassisi/SuperMLX.git
+cd SuperMLX
+pip install -e .
+supermlx
 ```
 
 Three endpoints start automatically:
@@ -37,32 +56,40 @@ Three endpoints start automatically:
 | Endpoint | Port | Purpose |
 |----------|:----:|---------|
 | **LiteLLM Proxy** | 4000 | Point your agentic framework here (OpenAI-compatible) |
-| **MLX Direct** | 8080 | Raw MLX endpoint (used by the proxy internally) |
-| **Sidecar** | 8081 | Lightweight endpoint for scripts/sensors (ephemeral cache) |
+| **MLX Direct** | 8080 | Raw MLX engine (used by the proxy internally) |
+| **Sidecar** | 8081 | Lightweight endpoint for scripts,  and other needs (ephemeral cache, no session tracking) |
 
 ---
 
-## Key Innovations
+## Features
 
-### 1. Kripper Dual-Slot KV Cache
+### Kripper Dual-Slot KV Cache
 
-Two isolated LRU stores — `PROMPT_CACHE` (main agent) and `PROMPT_CACHE_COMPACT` (compaction agent). When your framework runs a background compaction agent, it uses the COMPACT slot. The main agent's warm cache is never evicted.
+Two isolated LRU stores — one for the main agent, one for compaction sub-agents. When your framework runs a background compaction, it uses the COMPACT slot. The main agent's warm cache is never evicted.
 
-### 2. Dynamic Prefix Capture (DPC)
+### Dynamic Prefix Capture (DPC)
 
-No manual seed files. SuperMLX auto-captures the system prompt KV state from the first real request, validates it with a SHA-256 hash, and persists to disk. On restart (or after idle eviction), the cache reloads in <2 seconds instead of a 32-second cold prefill.
+No manual seed files. Auto-captures the system prompt KV state from the first real request, validates with SHA-256, and persists to disk. On restart, the cache reloads in <2s instead of a 32s cold prefill.
 
-### 3. Cache Canonicalization
+### Cache Canonicalization
 
-Dual-pipeline architecture: the model sees the original prompt (correct output), but cache lookups use a canonicalized version where volatile fields (timestamps, message IDs, runtime metadata) are masked to stable sentinels. Achieves **97%+ cache hit rates** where naive implementations average 50%.
+The model sees the original prompt. Cache lookups use a version where volatile fields (timestamps, message IDs, billing headers) are masked to stable sentinels. **97%+ cache hit rates** where naive implementations average 50%.
 
-### 4. Tool Call Loop Breaker
+### Tool Call Loop Breaker
 
-Three detection modes — error loops (model retries a failed tool call), duplicate calls (identical tool+args), and spam calls (same tool repeated N times). Injects a stop instruction to break infinite retry cycles. Solves a universal pain point in agentic AI.
+Three detection modes — error loops, duplicate calls, and spam calls. Injects a stop instruction to break infinite retry cycles. Solves a universal pain point in agentic AI.
 
-### 5. Post-Reaper Cache Reload *(v1.4.0)*
+### RAG Enrichment *(optional)*
 
-When the background reaper prunes expired cache entries after idle time, the next request triggers an automatic reload from disk via a background thread. Uses double-check locking to prevent concurrent reload races. Eliminates permanent cold-start degradation after overnight idle.
+Injects relevant codebase context via LanceDB vector search before generation. Increases prompt length but meaningfully improves output on code tasks where the model lacks project-specific knowledge. Configurable, bypassable per-request.
+
+### Cascade Routing *(experimental)*
+
+Allows the local model to delegate to a frontier API (Gemini, Claude, etc.) when RAG confidence is low. The idea: a 9B model handles 80% of tasks at zero API cost; the remaining 20% get forwarded to a larger model. Triggering logic and cost-aware routing are areas for contributors.
+
+### Post-Reaper Cache Reload
+
+Background reaper prunes expired cache entries after idle time. Next request triggers automatic reload from disk via double-check locking. Eliminates permanent cold-start degradation after overnight idle.
 
 ---
 
@@ -93,51 +120,72 @@ OpenClaw / Claude Code ──→ LiteLLM Proxy :4000 ──→ MLX Engine :8080
 
 ## Configuration
 
-All configuration is via environment variables (`.env` file). See [`.env.example`](.env.example) for the full reference.
-
-### Essential Settings
+All via `.env`. See [`.env.example`](.env.example) for the full reference.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MODEL_PATH` | `mlx-community/Qwen3.5-9B-4bit` | HuggingFace model ID or local path |
-| `FORCE_TEXT_MODE` | `false` | Skip VLM detection for text-only models (faster load) |
+| `FORCE_TEXT_MODE` | `false` | Skip VLM detection for text-only models |
 | `MAX_KV_SIZE` | `196608` | Max tokens in KV cache per session |
-| `MEMORY_GUARD_THRESHOLD_GB` | `total_ram - 8` | GPU RAM threshold for cache eviction (0 = disabled) |
-| `CACHE_PERSIST_PATH` | `""` | Path for DPC disk persistence (e.g. `logs/warmup_cache.safetensors`) |
-| `PROMPT_CACHE_TTL_SECONDS` | `1800` | Cache entry TTL before reaper prunes it |
-| `CACHE_REAPER_INTERVAL_SECONDS` | `60` | How often the reaper checks for expired entries |
-
-### Feature Flags
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `FEATURE_RAG_ENRICHMENT` | `false` | Inject relevant codebase chunks via LanceDB |
-| `FEATURE_COMPRESSOR` | `false` | LLMLingua-2 prompt compression for long histories |
-| `EMERGENCY_CONTENT_COMPRESS` | `true` | Last-resort OOM compression defense |
-| `TOOL_LOOP_BREAKER` | `true` | Detect and break infinite tool-call loops |
-| `FEATURE_CASCADE` | `false` | Forward to frontier API on low RAG confidence |
+| `MEMORY_GUARD_THRESHOLD_GB` | `total_ram - 8` | GPU RAM threshold for cache eviction |
+| `CACHE_PERSIST_PATH` | `""` | DPC disk path (e.g. `logs/warmup_cache.safetensors`) |
+| `PROMPT_CACHE_TTL_SECONDS` | `1800` | TTL before reaper prunes cache entries |
+| `FEATURE_RAG_ENRICHMENT` | `false` | LanceDB codebase context injection |
+| `FEATURE_COMPRESSOR` | `false` | LLMLingua-2 prompt compression |
+| `FEATURE_CASCADE` | `false` | Frontier API fallback routing |
+| `TOOL_LOOP_BREAKER` | `true` | Break infinite tool-call loops |
 | `KV_BITS` | `None` | Native KV quantization (4 or 8 bit) |
 
 ---
 
 ## Multi-Model Support
 
-SuperMLX auto-detects the model family from `MODEL_PATH` and applies the correct tool-call parser and thinking-tag format:
+Auto-detects model family from `MODEL_PATH` and applies the correct tool-call parser:
 
-| Family | Models | Tool Call Format | Thinking | Status |
-|--------|--------|:----------------:|:--------:|:------:|
-| `qwen3` | Qwen 3/3.5 | `<tool_call><function=>` | `<think>` | ✅ Production-tested |
-| `hermes` | Hermes 3 | `<tool_call>` + JSON | `<think>` | ⚠️ Not tested |
-| `glm4` | GLM-4/4.5/4.7 | `<tool_call>` + JSON | `<think>` | ⚠️ Not tested |
-| `gemma4` | Gemma 4 | `<\|tool_call\|>` + JSON | `<\|think\|>` | ⚠️ Not tested |
-| `deepseek` | DeepSeek V3/R1 | JSON (via template) | `<think>` | ⚠️ Not tested |
+| Family | Models | Thinking | Status |
+|--------|--------|:--------:|:------:|
+| `qwen3` | Qwen 3 / 3.5 | `<think>` | ✅ Production-tested |
+| `hermes` | Hermes 3 | `<think>` | ⚠️ Untested |
+| `glm4` | GLM-4 / 4.5 / 4.7 | `<think>` | ⚠️ Untested |
+| `gemma4` | Gemma 4 | `<\|think\|>` | ⚠️ Untested |
+| `deepseek` | DeepSeek V3 / R1 | `<think>` | ⚠️ Untested |
 
-> Models marked ⚠️ have dedicated parsers but are not yet validated in production.
-> Community reports welcome via [Discussions](../../discussions).
+> Models marked ⚠️ have dedicated parsers but are not validated in production. Community testing welcome.
 
 ---
 
-## Memory Budget (24GB M4 Pro)
+## Pipeline Monitor
+
+Real-time Streamlit dashboard — reads structured logs, no server modifications needed.
+
+```bash
+pip install supermlx[monitor]
+streamlit run supermlx/pipeline_monitor.py -- --logs-dir ./logs
+```
+
+**Dashboard includes:**
+- 🎯 Cache hit gauge with session-level benchmark (time saved, speedup ×)
+- ⏱️ Per-request prefill/decode timing and token breakdown
+- 🔧 Tool call extraction and loop detection events
+- 💬 Full message history with role-colored rendering
+- 💾 System RAM and Metal GPU memory metrics
+
+---
+
+## Benchmarks
+
+Mac Mini M4 Pro (24GB), Qwen3.5-9B-4bit:
+
+| Metric | Cold Start | Warm Cache |
+|--------|:----------:|:----------:|
+| **TTFT** | ~32s | ~1-3s |
+| **Decode speed** | 38-44 tok/s | 38-44 tok/s |
+| **Cache hit rate** | 0% | 97%+ |
+| **Prefill throughput** | 300-330 tok/s | N/A (cached) |
+
+---
+
+## Memory Budget
 
 ```
 Model Qwen3.5-9B-4bit:   ~5.0 GB
@@ -146,108 +194,64 @@ Model Qwen3.5-9B-4bit:   ~5.0 GB
 Scratch prefill:          ~5.0 GB
 ──────────────────────────────────
 Total peak:               ~23.5 GB → safe with Memory Guard at 19.2GB
-Concurrent agents:        1-2 with warm cache
 ```
 
-For 12GB machines, use `PROMPT_CACHE_MAX_ENTRIES_GLOBAL=1` and `MEMORY_GUARD_THRESHOLD_GB=10.5`.
+For 16GB machines: `PROMPT_CACHE_MAX_ENTRIES_GLOBAL=1` and `MEMORY_GUARD_THRESHOLD_GB=10.5`.
 
 ---
 
-## Modules
+## Tested Environment
 
-| File | Purpose |
-|------|---------| 
-| `SuperMLX.py` | Main server: HTTP handler, cache management, generation pipeline |
-| `config.py` | Environment helpers + `Settings` dataclass (pure, no side effects) |
-| `tool_parsing.py` | Regex patterns, `<think>` extraction, OpenAI tool-call parsing |
-| `message_pipeline.py` | Canonicalization, healing, loop breaker, detection, session context |
-| `debug_tools.py` | Cache divergence analysis, token inspection diagnostics |
-| `warmup_manager.py` | Dynamic Prefix Capture: disk persistence, hash validation, startup reload |
-| `rag_enricher.py` | RAG enrichment + LLMLingua-2 compression pipeline |
-| `emergency_compressor.py` | Last-resort content compression for OOM prevention |
-| `pipeline_monitor.py` | Streamlit real-time observability dashboard |
+SuperMLX has been developed and tested on:
 
-### Why `SuperMLX.py` is large
+- **Hardware:** Mac Mini M4 Pro, 24GB unified memory
+- **Model:** `mlx-community/Qwen3.5-9B-4bit` (~5GB)
+- **Framework:** [OpenClaw](https://github.com/openclaw/openclaw)
 
-A typical web server can split cleanly into independent modules. An MLX inference
-server cannot — because **GPU memory is a shared physical resource** that doesn't
-modularize.
+Other model families have dedicated parsers but have **not been validated in production**. Community reports welcome.
 
-The KV cache, model weights, and tokenizer live in Metal GPU buffers managed by
-`mx`. Every component that touches generation — the HTTP handler, cache lookup,
-memory guard, prefill, decode, post-generation cache update — needs direct access
-to the same `mx` runtime, the same `model` singleton, and the same `prompt_cache_lock`
-mutex. This creates a "gravity well" where core logic is pulled toward the center.
-
-**What we extracted** (~1,400 lines across 4 modules): everything that is *pure* —
-config parsing, regex patterns, message canonicalization, healing, loop detection,
-debug diagnostics. These functions take inputs and return outputs with no GPU state.
-
-**What stays in `SuperMLX.py`** (~4,900 lines): everything coupled to GPU state —
-`LRUPromptCache` (calls `mx.clear_cache()`), the generation loop, the HTTP handler,
-the cache reaper thread, and the memory guard. Extracting these would require either
-circular imports or passing 10+ parameters through every call, trading real complexity
-for cosmetic file splitting.
-
-This is not a limitation to fix — it's an architectural reality of GPU-bound servers.
-Other MLX/llama.cpp servers with comparable features have similar structure.
-
-### Pipeline Monitor
-
-Real-time dashboard that reads SuperMLX's structured logs — no server modifications needed.
-
-```bash
-# Install monitor dependencies
-pip install streamlit plotly psutil
-
-# Run (auto-detects ./logs in the same directory)
-streamlit run pipeline_monitor.py
-
-# Or point to a specific logs directory
-streamlit run pipeline_monitor.py -- --logs-dir /path/to/logs
-```
-
-Shows per-request: cache hit rate, prefill/decode timing, rest tokens, tool calls, thinking blocks, and full message history with role-colored rendering. Includes system RAM and Metal GPU memory metrics.
+> **Tip:** Agentic frameworks inject large system prompts (12,000+ tokens) designed for frontier models. On local models, invest time trimming these files to what the model actually needs. A leaner prompt improves both speed and output quality.
 
 ---
 
-## Benchmarks
+## Project Structure
 
-Measured on Mac Mini M4 Pro (24GB), Qwen3.5-9B-4bit:
+| Module | Purpose |
+|--------|---------|
+| `supermlx/server.py` | Main server: HTTP handler, cache management, generation pipeline |
+| `supermlx/config.py` | Environment helpers + `Settings` dataclass |
+| `supermlx/tool_parsing.py` | Tool-call parsing, `<think>` extraction |
+| `supermlx/message_pipeline.py` | Canonicalization, healing, loop breaker, session context |
+| `supermlx/warmup_manager.py` | DPC: disk persistence, hash validation, startup reload |
+| `supermlx/rag_enricher.py` | RAG enrichment + LLMLingua-2 compression |
+| `supermlx/emergency_compressor.py` | Last-resort OOM compression |
+| `supermlx/debug_tools.py` | Cache divergence diagnostics |
+| `supermlx/pipeline_monitor.py` | Streamlit observability dashboard |
 
-| Metric | Cold Start | Warm Cache |
-|--------|:----------:|:----------:|
-| **TTFT** | ~32s | ~1-3s |
-| **Decode speed** | 41-44 tok/s | 41-44 tok/s |
-| **Cache hit rate** | 0% | 97%+ |
-| **Prefill throughput** | 300-330 tok/s | N/A (cached) |
+<details>
+<summary><strong>Why <code>server.py</code> is large (~4,900 lines)</strong></summary>
 
-## Roadmap — v2.0 (Future Rewrite)
+In Architectural reality of GPU-bound servers GPU memory is a shared physical resource that doesn't modularize. The KV cache, model weights, and tokenizer live in Metal GPU buffers. Every component that touches generation needs direct access to the same `mx` runtime, the same model singleton, and the same `prompt_cache_lock` mutex.
 
-v1.x works and is stable. The items below are architectural improvements that would
-require rewriting the core server. They are **aspirational, not committed** — contributions
-are welcome.
+</details>
+
+---
+
+## Roadmap — v2.0
+
+v1.x works and is stable. These are aspirational improvements — contributions welcome.
 
 | Feature | Description |
 |---------|-------------|
-| **Pipeline Architecture** | Replace the monolithic `do_POST` with a staged pipeline: `Adapter IN → Pipeline(canon → RAG → compress → cache → gen) → Adapter OUT`. Each stage receives a `RequestContext` dataclass — zero globals, testable per stage. |
-| **Multi-API Adapters** | Pluggable input/output adapters for OpenAI, Anthropic, and future API formats. The pipeline stays the same; only the request parsing and response formatting change. |
-| **Continuous Batching** | Process multiple concurrent requests on the GPU by interleaving token generation across users. Enables true parallel sidecar + main generation. Requires `mlx-lm.BatchGenerator` integration. |
-| **Paged KV Cache** | Block-based KV cache with Copy-on-Write and prefix sharing (trie or hash-indexed), replacing the current per-session LRU slots. Better memory utilization for multi-session workloads. |
-| **Structured Output** | JSON Schema-constrained generation via grammar-based sampling (e.g. `lm-format-enforcer`). Guarantees valid tool-call JSON without retry loops. |
-| **Multi-Model Serving** | LRU model eviction + pinning + per-model TTL. Load multiple models in unified memory, swap on demand. |
-| **Context Scaling** | Report scaled token counts so agentic frameworks (Claude Code, OpenClaw) trigger auto-compact at the right timing. |
-
-> These ideas draw inspiration from [omlx](https://github.com/jundot/omlx),
-> [vllm-mlx](https://github.com/waybarrios/vllm-mlx), and
-> [mlx-openai-server](https://github.com/cubist38/mlx-openai-server) —
-> excellent projects solving complementary problems on Apple Silicon.
-
+| **Pipeline Architecture** | Staged pipeline: `Adapter IN → Pipeline → Adapter OUT`. `RequestContext` dataclass — zero globals, testable per stage. |
+| **Multi-API Adapters** | Pluggable OpenAI / Anthropic / future format adapters. |
+| **Continuous Batching** | Concurrent GPU generation via `mlx-lm.BatchGenerator`. |
+| **Paged KV Cache** | Block-based with CoW and prefix sharing. |
+| **Structured Output** | JSON Schema-constrained sampling (grammar-based). |
+| **Multi-Model Serving** | LRU eviction + pinning + per-model TTL. |
+| **Context Scaling** | Scaled token counts for agentic auto-compact timing. |
 ---
 
-## Acknowledgments
-
-Cache architecture inspired by [openclaw-claude-code-mlx-server](https://github.com/nicobrenner/openclaw-claude-code-mlx-server). All cache canonicalization, Dynamic Prefix Capture, tool-call loop breaking, cascade routing, post-reaper reload, and RAG enrichment are original contributions.
 
 ## License
 
