@@ -707,7 +707,7 @@ for i, m in enumerate(metrics_display):
         f"finish={finish}"
     )
 
-    with st.expander(header, expanded=(i == 0)):
+    with st.expander(header, expanded=False):
         dcol1, dcol2, dcol3, dcol4 = st.columns(4)
         with dcol1:
             st.markdown(f"**Prompt Tokens:** `{prompt_tok:,}`")
