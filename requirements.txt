@@ -2,14 +2,14 @@
 # Tested on Python 3.11-3.13, macOS (Apple Silicon only)
 #
 # CORE (required)
-mlx>=0.31.2
-mlx-lm>=0.31.3
-python-dotenv>=1.2.1
-safetensors>=0.6.2
-torch>=2.9.1          # CPU only — used to quarantine MPS from MLX (see SuperMLX.py)
-transformers>=5.7.0
-tokenizers>=0.22.1
-numpy>=2.3.3
+mlx==0.31.1
+mlx-lm==0.31.2
+python-dotenv>=1.0.1
+safetensors>=0.7.0
+torch>=2.11.0          # CPU only — used to quarantine MPS from MLX (see SuperMLX.py)
+transformers>=5.5.0
+tokenizers>=0.22.2
+numpy>=2.2.6
 huggingface-hub>=1.9.0
 litellm>=1.83.2        # OpenAI-compatible reverse proxy
 
