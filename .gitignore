@@ -29,3 +29,4 @@ Private-docs/
 *.egg-info/
 dist/
 build/
+lab/
