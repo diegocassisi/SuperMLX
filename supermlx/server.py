@@ -4336,8 +4336,12 @@ class APIHandler(BaseHTTPRequestHandler):
                                 # Hybrid wash: reprocess suffix while keeping the polluted KV as
                                 # context. Risk: if KV is large, the attention computation for
                                 # the suffix over N existing tokens requires O(suffix × KV) scratch.
-                                # At >40K KV tokens this can OOM. Cold-start is safer.
-                                _HYBRID_WASH_KV_LIMIT = 40000
+                                # The scratch per attention layer ≈ prefill_chunk × KV × n_heads × 4 bytes.
+                                # With PREFILL_STEP_SIZE=512 and 16 GQA heads:
+                                #   512 × 100K × 16 × 4 = 3.3 GB/layer (safe on 24 GB)
+                                # Previously hardcoded at 40K which forced catastrophic cold starts
+                                # (128s + OOM risk) even when only 397 tokens needed washing.
+                                _HYBRID_WASH_KV_LIMIT = 100_000
                                 if _kv_off is not None and _kv_off > _HYBRID_WASH_KV_LIMIT:
                                     prompt_cache = None
                                     rest_tokens = model_tokens
