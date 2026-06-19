@@ -3714,10 +3714,13 @@ class APIHandler(BaseHTTPRequestHandler):
                 f"| TEMP measure until plan §11 (ephemeral workspace)")
 
 
+        # Always estimate prompt tokens — needed for Anthropic usage reporting
+        # even when FEATURE_FULL_LOGGING is off.
+        _est_tok = _estimate_token_count(raw_messages_inbound)
+
         if FEATURE_FULL_LOGGING:
             _roles = _count_roles(raw_messages_inbound)
             _roles_str = ", ".join(f"{r}:{c}" for r, c in sorted(_roles.items()))
-            _est_tok = _estimate_token_count(raw_messages_inbound)
             _last_user = ""
             for _m in reversed(raw_messages_inbound):
                 if (_m.get("role") or "").lower() == "user":
@@ -4702,6 +4705,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     full_response = openai_to_anthropic_response(
                         message_text, tool_calls, finish_reason,
                         self._anthropic_model,
+                        prompt_input_tokens=_est_tok,
                     )
                     self.wfile.write(json.dumps(full_response).encode("utf-8"))
                 else:
@@ -4878,6 +4882,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     anthropic_events = build_anthropic_sse_events(
                         message_text, tool_calls, finish_reason,
                         self._anthropic_model,
+                        prompt_input_tokens=_est_tok,
                     )
                     try:
                         for ev in anthropic_events:

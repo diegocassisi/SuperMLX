@@ -155,9 +155,15 @@ def openai_to_anthropic_response(
     tool_calls: list,
     finish_reason: str,
     requested_model: str,
+    prompt_input_tokens: int = 0,
 ) -> dict:
     """Build an Anthropic Messages response from already-processed generation
-    output (text + tool_calls) that came out of the existing SuperMLX pipeline."""
+    output (text + tool_calls) that came out of the existing SuperMLX pipeline.
+
+    prompt_input_tokens: estimated Anthropic prompt token count. Claude Code
+    uses usage.input_tokens from the response to drive auto-compact decisions.
+    Reporting 0 makes Claude Code think the context is empty → never compacts.
+    """
     content_blocks: List[Dict[str, Any]] = []
 
     if message_text:
@@ -193,7 +199,7 @@ def openai_to_anthropic_response(
         "stop_reason": stop_reason,
         "stop_sequence": None,
         "usage": {
-            "input_tokens": 0,
+            "input_tokens": prompt_input_tokens,
             "output_tokens": 0,
             "cache_creation_input_tokens": 0,
             "cache_read_input_tokens": 0,
@@ -208,20 +214,25 @@ def build_anthropic_sse_events(
     tool_calls: list,
     finish_reason: str,
     requested_model: str,
+    prompt_input_tokens: int = 0,
 ) -> List[str]:
     """Build a complete list of Anthropic SSE event strings from the
-    already-processed generation output.  Ready to write to the wire."""
+    already-processed generation output.  Ready to write to the wire.
+
+    prompt_input_tokens: estimated Anthropic prompt token count for
+    Claude Code auto-compact. See openai_to_anthropic_response docstring.
+    """
     message_id = f"msg_{uuid.uuid4().hex[:24]}"
     events: List[str] = []
 
-    # 1. message_start
+    # 1. message_start — input_tokens drives Claude Code's auto-compact math
     events.append(_sse("message_start", {
         "type": "message_start",
         "message": {
             "id": message_id, "type": "message", "role": "assistant",
             "model": requested_model, "content": [],
             "stop_reason": None, "stop_sequence": None,
-            "usage": {"input_tokens": 0, "output_tokens": 0},
+            "usage": {"input_tokens": prompt_input_tokens, "output_tokens": 0},
         },
     }))
 
