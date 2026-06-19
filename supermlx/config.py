@@ -136,6 +136,10 @@ class Settings:
     sidecar_max_tokens: int           # Max tokens for sidecar responses (keep low to minimize lock time)
     sidecar_enable_rag: bool          # Enable RAG enrichment on sidecar requests
     sidecar_rag_threshold: float      # L2 distance threshold for sidecar RAG (stricter than OpenClaw's 1.6)
+    moe_expert_capacity: int          # Max experts per MoE layer (0=auto, based on RAM)
+    moe_expert_profile: str           # Path to expert profile JSON for MoE pinning (""=none)
+    moe_shallow_pin_layers: int       # Pin top experts in first N MoE layers (0=disabled)
+    moe_shallow_pin_top: int          # How many experts to pin per shallow layer
 
 
 def _normalize_model_family(value: Optional[str]) -> str:
@@ -254,4 +258,8 @@ def build_settings(script_dir: Path = Path(__file__).parent) -> Settings:
         sidecar_max_tokens=_env_int("SIDECAR_MAX_TOKENS", 16384),
         sidecar_enable_rag=_env_bool("SIDECAR_ENABLE_RAG", True),
         sidecar_rag_threshold=_env_float("SIDECAR_RAG_THRESHOLD", 1.4),
+        moe_expert_capacity=_env_int("MOE_EXPERT_CAPACITY", 100),
+        moe_expert_profile=_env_str("MOE_EXPERT_PROFILE", ""),
+        moe_shallow_pin_layers=_env_int("MOE_SHALLOW_PIN_LAYERS", 5),
+        moe_shallow_pin_top=_env_int("MOE_SHALLOW_PIN_TOP", 6),
     )

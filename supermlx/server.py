@@ -568,6 +568,22 @@ def _memory_guard_pre_prefill(request_id: str = "") -> int:
             return 0
         # Over threshold — evict from both stores
         evicted = 0
+        # Step 1: Try evicting cold MoE experts first (cheaper than KV cache)
+        try:
+            from .expert_cache import evict_experts_for_memory
+            _expert_evicted = evict_experts_for_memory(model, target_free_gb=4.0)
+            if _expert_evicted > 0:
+                post_check = get_mem()
+                if post_check < threshold_bytes:
+                    _terminal_status(
+                        "⚠️",
+                        f"MEMORY GUARD: evicted {_expert_evicted} MoE experts "
+                        f"({active_bytes / (1024**3):.1f}GiB → {post_check / (1024**3):.1f}GiB)",
+                    )
+                    return 0  # Expert eviction was enough
+        except (ImportError, Exception):
+            pass  # expert_cache not available or no MoE model
+        # Step 2: Evict KV cache entries
         with prompt_cache_lock:
             evicted += PROMPT_CACHE.evict_unpinned()
             evicted += PROMPT_CACHE_COMPACT.evict_unpinned()
@@ -622,6 +638,11 @@ from .message_pipeline import (
     _COMPACT_RUNNER_SIGNALS, _RAG_BYPASS_SIGNALS_USER, _RAG_BYPASS_SIGNALS_SYSTEM,
 )
 from .debug_tools import _debug_token_divergence
+from .anthropic_compat import (
+    CLAUDE_MODEL_ALIASES, anthropic_to_openai_body,
+    openai_to_anthropic_response, build_anthropic_sse_events,
+)
+from . import memory_profiler as _mem_profiler
 
 
 
@@ -2633,18 +2654,50 @@ else:
     # Prevents "Fetching N files" network check on every boot.
     # If model isn't cached yet, we catch the error and retry online.
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    # Detect MoE models: load lazily to avoid materializing all experts (19.5 GB).
+    # After module replacement, only non-expert params (~1.4 GB) are materialized.
+    _is_moe_path = any(tag in SETTINGS.model_path for tag in ("A3B", "A14B", "MoE", "moe", "Mixtral", "mixtral"))
+    _load_kwargs = {"tokenizer_config": {"trust_remote_code": True}}
+    if _is_moe_path:
+        _load_kwargs["lazy"] = True
+        _terminal_status("🔧", "MoE model detected — loading with lazy=True (experts as placeholders)")
     try:
-        model, tokenizer = load(
-            SETTINGS.model_path, tokenizer_config={"trust_remote_code": True}
-        )
+        model, tokenizer = load(SETTINGS.model_path, **_load_kwargs)
     except Exception as _offline_err:
         _terminal_status("⚠️", f"Offline load failed ({_offline_err}) — retrying with network...")
         os.environ.pop("HF_HUB_OFFLINE", None)
-        model, tokenizer = load(
-            SETTINGS.model_path, tokenizer_config={"trust_remote_code": True}
-        )
+        model, tokenizer = load(SETTINGS.model_path, **_load_kwargs)
     _terminal_status("✅", "Model loaded (mlx-lm).")
     _terminal_status("⚡", "Torch acceleration: N/A (text-only model).")
+
+# ── MoE Expert Cache ──────────────────────────────────────────────────────
+# Phase 3 predictive cache: lazy load → module replacement → selective expert
+# materialization → zero-eval forward pass. See docs/MOE_EXPERT_CACHE.md.
+_moe_stats = {}
+try:
+    from .expert_cache import is_moe_model, enable_moe_cache
+    if is_moe_model(model):
+        _terminal_status("🔧", "MoE model detected — enabling predictive expert cache...")
+        # mx.eval of non-expert params happens INSIDE enable_moe_cache,
+        # AFTER module replacement, to avoid materializing all 19.5 GB.
+        _moe_stats = enable_moe_cache(
+            model,
+            SETTINGS.model_path,
+            capacity=SETTINGS.moe_expert_capacity,
+            profile_path=SETTINGS.moe_expert_profile or None,
+        )
+        _terminal_status(
+            "✅",
+            f"MoE Expert Cache: {_moe_stats.get('moe_layers', 0)} layers, "
+            f"{_moe_stats.get('num_experts', 0)} experts, "
+            f"cap={_moe_stats.get('capacity', 0)}, "
+            f"loaded={_moe_stats.get('expert_tensors_loaded', 0)}, "
+            f"mem={_moe_stats.get('active_memory_gb', 0):.1f}GB",
+        )
+except ImportError:
+    pass  # expert_cache not available — dense model, no action needed
+except Exception as _moe_err:
+    _terminal_status("⚠️", f"MoE Expert Cache failed: {_moe_err}")
 _terminal_status(
     "🧠",
     (
@@ -3009,10 +3062,49 @@ def _stream_generate_unified(
         for resp in stream_generate_vlm(model, processor, "", image=None, **kwargs):
             yield resp
     else:
+        # Dynamic cache update state for MoE models
+        _dcu_gen_count = 0
+        _dcu_no_swap_streak = 0
+        _dcu_low_fb_streak = 0
+        _dcu_last_fb_rate = 1.0
+        _dcu_enabled = hasattr(model, "_moe_config") and model._moe_config.get("moe_layers", 0) > 0
+        _dcu_func = None
+        _dcu_policy = None
+        if _dcu_enabled:
+            try:
+                from .expert_cache import dynamic_cache_update, dynamic_update_policy
+                _dcu_func = dynamic_cache_update
+                _dcu_policy = dynamic_update_policy
+            except ImportError:
+                _dcu_enabled = False
+
         for resp in stream_generate(
             **_stream_generate_kwargs(rest_tokens, max_tokens, sampler, prompt_cache)
         ):
             yield resp
+
+            # MoE dynamic cache update — swap cold experts for hot ones between tokens
+            if _dcu_enabled:
+                _dcu_gen_count += 1
+                interval, budget = _dcu_policy(
+                    _dcu_gen_count, _dcu_last_fb_rate,
+                    _dcu_no_swap_streak, _dcu_low_fb_streak,
+                )
+                if _dcu_gen_count % interval == 0:
+                    stats = _dcu_func(model, max_layer_updates=budget)
+                    swaps = sum(s.get("swaps", 0) for s in stats)
+                    fallbacks = sum(s.get("fallbacks", 0) for s in stats)
+                    requests = sum(s.get("requests", 0) for s in stats)
+                    if requests > 0:
+                        _dcu_last_fb_rate = fallbacks / requests
+                    if swaps == 0:
+                        _dcu_no_swap_streak += 1
+                    else:
+                        _dcu_no_swap_streak = 0
+                    if requests > 0 and (fallbacks / requests) <= 0.005:
+                        _dcu_low_fb_streak += 1
+                    else:
+                        _dcu_low_fb_streak = 0
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3383,50 +3475,117 @@ class SidecarHandler(BaseHTTPRequestHandler):
 
 
 class APIHandler(BaseHTTPRequestHandler):
+    # Per-request state set during routing.  Checked at response time to
+    # decide between OpenAI and Anthropic wire formats.
+    _is_anthropic: bool = False
+    _anthropic_model: str = ""
+
     def log_message(self, format, *args):
         # Keep terminal output focused on custom request lifecycle lines.
         return
 
+    def _route_path(self) -> str:
+        """Strip query string from self.path for route matching.
+
+        Claude Code appends ?beta=true to /v1/messages which broke plain
+        string matching against the path."""
+        return self.path.split("?")[0].rstrip("/")
+
+    def do_HEAD(self):
+        """Claude Code sends HEAD / as a connectivity health-check."""
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+
     def do_GET(self):
-        if self.path.rstrip("/") in ("/v1/models", "/models"):
+        route = self._route_path()
+        if route in ("/v1/models", "/models"):
+            # Include Claude model aliases so Claude Code discovers models
+            # with the 'claude-' prefix it requires.
+            models_data = [
+                {
+                    "id": SETTINGS.proxy_model_id,
+                    "object": "model",
+                    "created": int(time.time()),
+                    "owned_by": "mlx",
+                }
+            ]
+            for alias in CLAUDE_MODEL_ALIASES:
+                models_data.append({
+                    "id": alias,
+                    "object": "model",
+                    "created": int(time.time()),
+                    "owned_by": "anthropic",
+                })
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(
-                json.dumps(
-                    {
-                        "object": "list",
-                        "data": [
-                            {
-                                "id": SETTINGS.proxy_model_id,
-                                "object": "model",
-                                "created": int(time.time()),
-                                "owned_by": "mlx",
-                            }
-                        ],
-                    }
-                ).encode("utf-8")
+                json.dumps({"object": "list", "data": models_data}).encode("utf-8")
             )
+            return
+        if route == "":
+            # Root health-check (Claude Code sends HEAD /, browsers GET /)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"status": "ok"}).encode("utf-8"))
             return
         self.send_error(404, "Not Found")
 
     def do_POST(self):
-        if self.path.rstrip("/") in ("/v1/models", "/models"):
+        route = self._route_path()
+        if route in ("/v1/models", "/models"):
             return self.do_GET()
 
-        if self.path.rstrip("/") not in ("/v1/chat/completions", "/chat/completions"):
+        # Anthropic token-count stub — Claude Code calls this for validation.
+        if route in ("/v1/messages/count_tokens", "/messages/count_tokens"):
+            try:
+                cl = int(self.headers.get("Content-Length", 0))
+                self.rfile.read(cl)
+            except Exception:
+                pass
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"input_tokens": 0}).encode("utf-8"))
+            return
+
+        # ── Anthropic Messages API: inline translation ───────────────
+        # Translate the Anthropic body to OpenAI format and fall through
+        # to the same pipeline that handles /v1/chat/completions.
+        if route in ("/v1/messages", "/messages"):
+            try:
+                cl = int(self.headers["Content-Length"])
+                raw = json.loads(self.rfile.read(cl).decode("utf-8"))
+            except Exception:
+                self.send_error(400, "Bad Request")
+                return
+            self._is_anthropic = True
+            self._anthropic_model = raw.get("model", "claude-sonnet-4-20250514")
+            body = anthropic_to_openai_body(raw, SETTINGS.proxy_model_id)
+            # Jump past the body-parse block that follows.
+            self._handle_chat_completion(body)
+            return
+
+        if route not in ("/v1/chat/completions", "/chat/completions"):
             try:
                 self.send_error(404, "Not Found")
             except BrokenPipeError:
                 pass
             return
 
+        self._is_anthropic = False
+        self._anthropic_model = ""
         try:
             content_length = int(self.headers["Content-Length"])
             body = json.loads(self.rfile.read(content_length).decode("utf-8"))
         except Exception:
             self.send_error(400, "Bad Request")
             return
+        self._handle_chat_completion(body)
+
+    def _handle_chat_completion(self, body):
 
         # ── DPC GATE ────────────────────────────────────────────────────────
         # If DPC is configured and boot hasn't finished yet, the first request waits
@@ -3695,7 +3854,7 @@ class APIHandler(BaseHTTPRequestHandler):
             # KRIPPER FASE 3: Guard — never compress compact runner requests.
             # The compact runner sends the full session history intentionally;
             # compressing it would corrupt the summary output.
-            if _compressor_available and FEATURE_COMPRESSOR and not _is_embedded_agent:
+            if _compressor_available and FEATURE_COMPRESSOR and not _is_embedded_agent and not self._is_anthropic:
                 _pre_compress_count = len(raw_messages)
                 _pre_compress_est = _estimate_token_count(raw_messages)
                 try:
@@ -3751,7 +3910,7 @@ class APIHandler(BaseHTTPRequestHandler):
             # pollute the summary with irrelevant codebase chunks.
             # FASE 4: Also skip RAG for memory flush, summarization, and other
             # lightweight internal operations that don't need domain context.
-            _skip_rag = _is_embedded_agent or _is_rag_bypass_request(raw_messages)
+            _skip_rag = _is_embedded_agent or _is_rag_bypass_request(raw_messages) or self._is_anthropic
             _rag_meta = {"best_score": 999.0, "chunks_found": 0, "query_used": "", "search_ms": 0}
             if _rag_available and FEATURE_RAG_ENRICHMENT and not _skip_rag:
                 _rag_t0 = time.time()
@@ -3778,7 +3937,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     if FEATURE_FULL_LOGGING:
                         _pipeline_log("RAG", request_id, f"ERROR: {_re}")
             elif _skip_rag and FEATURE_FULL_LOGGING and FEATURE_LOG_RAG:
-                _reason = "compact_runner" if _is_embedded_agent else "rag_bypass(flush/summarize)"
+                _reason = "compact_runner" if _is_embedded_agent else ("anthropic" if self._is_anthropic else "rag_bypass(flush/summarize)")
                 _pipeline_log("RAG", request_id, f"SKIPPED | reason={_reason}")
 
             # ── PIPELINE: CASCADE ROUTING ──────────────────────────────────
@@ -3988,6 +4147,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 # This replaces the old evict_unpinned() approach which destroyed MAIN
                 # cache before compact, causing 70-110s cold-starts on the next MAIN request.
                 _active_cache_store = PROMPT_CACHE_COMPACT if _is_embedded_agent else PROMPT_CACHE
+                _mem_profiler.snapshot(request_id, "PRE_CACHE", is_anthropic=self._is_anthropic, prompt_tokens=len(prompt_tokens) if prompt_tokens else None, model_tokens=len(model_tokens) if model_tokens else None)
                 if _is_embedded_agent and FEATURE_FULL_LOGGING:
                     _pipeline_log("CACHE", request_id,
                         "COMPACT_RUNNER: using PROMPT_CACHE_COMPACT — MAIN cache untouched")
@@ -4025,6 +4185,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 rest_tokens = model_tokens[
                     _kv_off if _kv_off is not None else matched_prefix_len :
                 ]
+                _mem_profiler.snapshot(request_id, "POST_CACHE", is_anthropic=self._is_anthropic, rest_tokens=len(rest_tokens), kv_cache_offset=_kv_off, cache_hit_type=cache_match_type, matched_prefix=matched_prefix_len, prompt_tokens=len(prompt_tokens) if prompt_tokens else None)
 
                 # --- M3: Stable-prefix fallback ---
                 # If the global cache lookup found fewer cached tokens than the
@@ -4151,8 +4312,20 @@ class APIHandler(BaseHTTPRequestHandler):
                                 rest_tokens = model_tokens[_trim_to:]
                                 _terminal_status("DEBUG", f"FIX-31 v9: Trimmed KVCache {_kv_off} -> {_trim_to}")
                             else:
-                                rest_tokens = model_tokens[-_suffix_len:]
-                                _terminal_status("DEBUG", f"FIX-31 v9: Hybrid wash with {_suffix_len} tokens")
+                                # Hybrid wash: reprocess suffix while keeping the polluted KV as
+                                # context. Risk: if KV is large, the attention computation for
+                                # the suffix over N existing tokens requires O(suffix × KV) scratch.
+                                # At >40K KV tokens this can OOM. Cold-start is safer.
+                                _HYBRID_WASH_KV_LIMIT = 40000
+                                if _kv_off is not None and _kv_off > _HYBRID_WASH_KV_LIMIT:
+                                    prompt_cache = None
+                                    rest_tokens = model_tokens
+                                    _terminal_status("⚠️",
+                                        f"FIX-31 v9: KV too large for hybrid wash "
+                                        f"({_kv_off} > {_HYBRID_WASH_KV_LIMIT}) — cold start")
+                                else:
+                                    rest_tokens = model_tokens[-_suffix_len:]
+                                    _terminal_status("DEBUG", f"FIX-31 v9: Hybrid wash with {_suffix_len} tokens")
                         else:
                             rest_tokens = model_tokens[_kv_off:]
                             _terminal_status("DEBUG", f"FIX-31 v9: Normal continuation from {_kv_off}")
@@ -4236,14 +4409,19 @@ class APIHandler(BaseHTTPRequestHandler):
                 and not _is_embedded_agent
                 and rest_count is not None
             ):
-                _emergency_result = emergency_compress_if_needed(
-                    raw_messages=raw_messages,
-                    rest_tokens_count=rest_count,
-                    compressor_module=_compressor_module,
-                    session_key=_comp_session if '_comp_session' in dir() else request_id,
-                    log_fn=_terminal_status,
-                    request_id=request_id,
-                )
+                # For Anthropic: skip LLMLingua compression (BERT 512-token limit)
+                # but KEEP the overflow signal to prevent OOM crashes.
+                if self._is_anthropic:
+                    _emergency_result = None
+                else:
+                    _emergency_result = emergency_compress_if_needed(
+                        raw_messages=raw_messages,
+                        rest_tokens_count=rest_count,
+                        compressor_module=_compressor_module,
+                        session_key=_comp_session if '_comp_session' in dir() else request_id,
+                        log_fn=_terminal_status,
+                        request_id=request_id,
+                    )
                 if _emergency_result is not None:
                     # Emergency compression succeeded — re-run pipeline from healing
                     raw_messages = _emergency_result
@@ -4296,31 +4474,30 @@ class APIHandler(BaseHTTPRequestHandler):
                         f"EMERGENCY COMPRESSOR: pipeline re-done | new rest_tokens={rest_count} | "
                         f"cache_hit={cache_match_type} | matched={matched_prefix_len}/{len(prompt_tokens)}")
 
-                    # If STILL over limit after emergency compression, signal overflow (Capa 3)
-                    # Return "context length exceeded" → OpenClaw auto-compacts + retries transparently.
-                    # The user never sees this error; OpenClaw handles it automatically.
-                    if should_signal_overflow(rest_count):
-                        _terminal_status("⚠️",
-                            f"EMERGENCY COMPRESSOR: still over limit after compression | "
-                            f"rest={rest_count} — signaling overflow to client")
-                        _overflow_error = json.dumps({
-                            "error": {
-                                "message": f"context length exceeded: {rest_count} tokens exceed safe prefill limit",
-                                "type": "invalid_request_error",
-                                "code": "context_length_exceeded",
-                            }
-                        }).encode("utf-8")
-                        self.send_response(400)
-                        self.send_header("Content-Type", "application/json")
-                        self.send_header("Content-Length", str(len(_overflow_error)))
-                        self.end_headers()
-                        self.wfile.write(_overflow_error)
-                        if acquired:
-                            mx.clear_cache()
-                            import gc; gc.collect()
-                            model_lock.release()
-                            acquired = False
-                        return
+                # Overflow signal: applies to ALL requests (including Anthropic)
+                # to prevent OOM crashes from prompts exceeding safe prefill limit.
+                if should_signal_overflow(rest_count):
+                    _terminal_status("⚠️",
+                        f"OVERFLOW GUARD: rest={rest_count} tokens exceed safe prefill limit "
+                        f"— signaling overflow to client")
+                    _overflow_error = json.dumps({
+                        "error": {
+                            "message": f"context length exceeded: {rest_count} tokens exceed safe prefill limit",
+                            "type": "invalid_request_error",
+                            "code": "context_length_exceeded",
+                        }
+                    }).encode("utf-8")
+                    self.send_response(400)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(_overflow_error)))
+                    self.end_headers()
+                    self.wfile.write(_overflow_error)
+                    if acquired:
+                        mx.clear_cache()
+                        import gc; gc.collect()
+                        model_lock.release()
+                        acquired = False
+                    return
 
             # ── PIPELINE LOG: CACHE & TQ ───────────────────────────────────
             if FEATURE_FULL_LOGGING and FEATURE_LOG_CACHE:
@@ -4431,6 +4608,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 f"session={session_ctx.session_id[:16]} ({cache_selection_source}) | family={SETTINGS.model_family}",
                 indent=1,
             )
+            _mem_profiler.snapshot(request_id, "PRE_PREFILL", is_anthropic=self._is_anthropic, rest_tokens=rest_count, kv_cache_offset=_kv_off)
+            _mem_profiler.reset_peak()
 
             if not is_streaming:
                 self.send_response(200)
@@ -4501,28 +4680,35 @@ class APIHandler(BaseHTTPRequestHandler):
                         is_embedded_agent=_is_embedded_agent,
                     )
 
-                response_id = f"chatcmpl-{int(time.time())}"
-                full_response = {
-                    "id": response_id,
-                    "object": "chat.completion",
-                    "created": int(time.time()),
-                    "model": SETTINGS.proxy_model_id,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "message": {"role": "assistant", "content": message_text},
-                            "finish_reason": finish_reason,
-                        }
-                    ],
-                    "usage": {
-                        "prompt_tokens": 0,
-                        "completion_tokens": 0,
-                        "total_tokens": 0,
-                    },
-                }
-                if tool_calls:
-                    full_response["choices"][0]["message"]["tool_calls"] = tool_calls
-                self.wfile.write(json.dumps(full_response).encode("utf-8"))
+                if self._is_anthropic:
+                    full_response = openai_to_anthropic_response(
+                        message_text, tool_calls, finish_reason,
+                        self._anthropic_model,
+                    )
+                    self.wfile.write(json.dumps(full_response).encode("utf-8"))
+                else:
+                    response_id = f"chatcmpl-{int(time.time())}"
+                    full_response = {
+                        "id": response_id,
+                        "object": "chat.completion",
+                        "created": int(time.time()),
+                        "model": SETTINGS.proxy_model_id,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "message": {"role": "assistant", "content": message_text},
+                                "finish_reason": finish_reason,
+                            }
+                        ],
+                        "usage": {
+                            "prompt_tokens": 0,
+                            "completion_tokens": 0,
+                            "total_tokens": 0,
+                        },
+                    }
+                    if tool_calls:
+                        full_response["choices"][0]["message"]["tool_calls"] = tool_calls
+                    self.wfile.write(json.dumps(full_response).encode("utf-8"))
                 timing = _build_timing_dict(first_token_at, generation_started_at, rest_count, generated_tokens)
                 if request_logger:
                     request_logger.log(
@@ -4549,28 +4735,32 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
                 self.send_header("Cache-Control", "no-cache")
-                self.send_header("Connection", "keep-alive")
+                if self._is_anthropic:
+                    self.send_header("Connection", "close")
+                else:
+                    self.send_header("Connection", "keep-alive")
                 self.end_headers()
 
                 response_id = f"chatcmpl-{int(time.time())}"
-                role_chunk = {
-                    "id": response_id,
-                    "object": "chat.completion.chunk",
-                    "created": int(time.time()),
-                    "model": SETTINGS.proxy_model_id,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {"role": "assistant"},
-                            "finish_reason": None,
-                        }
-                    ],
-                }
-                _wire_payload = f"data: {json.dumps(role_chunk)}\n\n"
-                _pipeline_log("WIRE", request_id, f"SEND role_chunk | len={len(_wire_payload)}")
-                self.wfile.write(_wire_payload.encode("utf-8"))
-                self.wfile.flush()
-                _pipeline_log("WIRE", request_id, "FLUSH role_chunk OK")
+                if not self._is_anthropic:
+                    role_chunk = {
+                        "id": response_id,
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": SETTINGS.proxy_model_id,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"role": "assistant"},
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                    _wire_payload = f"data: {json.dumps(role_chunk)}\n\n"
+                    _pipeline_log("WIRE", request_id, f"SEND role_chunk | len={len(_wire_payload)}")
+                    self.wfile.write(_wire_payload.encode("utf-8"))
+                    self.wfile.flush()
+                    _pipeline_log("WIRE", request_id, "FLUSH role_chunk OK")
 
                 # --- SSE KEEPALIVE THREAD ---
                 # During prefill (~58s) and decode, no SSE events are sent because
@@ -4663,33 +4853,29 @@ class APIHandler(BaseHTTPRequestHandler):
                         is_embedded_agent=_is_embedded_agent,
                     )
 
-                if message_text:
-                    chunk = {
-                        "id": response_id,
-                        "object": "chat.completion.chunk",
-                        "created": int(time.time()),
-                        "model": SETTINGS.proxy_model_id,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {"content": message_text},
-                                "finish_reason": None,
-                            }
-                        ],
-                    }
-                    _wire_payload = f"data: {json.dumps(chunk)}\n\n"
-                    _pipeline_log("WIRE", request_id, f"SEND content_chunk | content_len={len(message_text)} | wire_len={len(_wire_payload)}")
-                    try:
-                        self.wfile.write(_wire_payload.encode("utf-8"))
-                        self.wfile.flush()
-                        _pipeline_log("WIRE", request_id, "FLUSH content_chunk OK")
-                    except BrokenPipeError:
-                        _pipeline_log("WIRE", request_id, "❌ BROKEN PIPE on content_chunk — client already disconnected")
-                        raise
+                finish_reason = "tool_calls" if tool_calls else "stop"
 
-                if tool_calls:
-                    for idx, tc in enumerate(tool_calls):
-                        tc_chunk = {
+                # ── ANTHROPIC SSE OUTPUT ──────────────────────────────────
+                if self._is_anthropic:
+                    anthropic_events = build_anthropic_sse_events(
+                        message_text, tool_calls, finish_reason,
+                        self._anthropic_model,
+                    )
+                    try:
+                        for ev in anthropic_events:
+                            self.wfile.write(ev.encode("utf-8"))
+                        self.wfile.flush()
+                        self.close_connection = True
+                        _pipeline_log("WIRE", request_id,
+                            f"ANTHROPIC SSE delivered | blocks={len(anthropic_events)} | finish={finish_reason}")
+                    except BrokenPipeError:
+                        _pipeline_log("WIRE", request_id,
+                            "❌ BROKEN PIPE on Anthropic SSE — client disconnected")
+                        raise
+                # ── OPENAI SSE OUTPUT (original) ─────────────────────────
+                else:
+                    if message_text:
+                        chunk = {
                             "id": response_id,
                             "object": "chat.completion.chunk",
                             "created": int(time.time()),
@@ -4697,42 +4883,66 @@ class APIHandler(BaseHTTPRequestHandler):
                             "choices": [
                                 {
                                     "index": 0,
-                                    "delta": {"tool_calls": [{**tc, "index": idx}]},
+                                    "delta": {"content": message_text},
                                     "finish_reason": None,
                                 }
                             ],
                         }
-                        _wire_payload = f"data: {json.dumps(tc_chunk)}\n\n"
-                        _tc_name = tc.get('function', {}).get('name', '?')
-                        _pipeline_log("WIRE", request_id, f"SEND tool_call_chunk[{idx}] | name={_tc_name} | wire_len={len(_wire_payload)}")
+                        _wire_payload = f"data: {json.dumps(chunk)}\n\n"
+                        _pipeline_log("WIRE", request_id, f"SEND content_chunk | content_len={len(message_text)} | wire_len={len(_wire_payload)}")
                         try:
                             self.wfile.write(_wire_payload.encode("utf-8"))
                             self.wfile.flush()
-                            _pipeline_log("WIRE", request_id, f"FLUSH tool_call_chunk[{idx}] OK")
+                            _pipeline_log("WIRE", request_id, "FLUSH content_chunk OK")
                         except BrokenPipeError:
-                            _pipeline_log("WIRE", request_id, f"❌ BROKEN PIPE on tool_call_chunk[{idx}] — client already disconnected")
+                            _pipeline_log("WIRE", request_id, "❌ BROKEN PIPE on content_chunk — client already disconnected")
                             raise
 
-                finish_reason = "tool_calls" if tool_calls else "stop"
-                final_chunk = {
-                    "id": response_id,
-                    "object": "chat.completion.chunk",
-                    "created": int(time.time()),
-                    "model": SETTINGS.proxy_model_id,
-                    "choices": [
-                        {"index": 0, "delta": {}, "finish_reason": finish_reason}
-                    ],
-                }
-                _wire_payload = f"data: {json.dumps(final_chunk)}\n\n"
-                _pipeline_log("WIRE", request_id, f"SEND final_chunk | finish_reason={finish_reason} | wire_len={len(_wire_payload)}")
-                try:
-                    self.wfile.write(_wire_payload.encode("utf-8"))
-                    self.wfile.write(b"data: [DONE]\n\n")
-                    self.wfile.flush()
-                    _pipeline_log("WIRE", request_id, "FLUSH final+DONE OK — response fully delivered")
-                except BrokenPipeError:
-                    _pipeline_log("WIRE", request_id, "❌ BROKEN PIPE on final_chunk — client disconnected before receiving response")
-                    raise
+                    if tool_calls:
+                        for idx, tc in enumerate(tool_calls):
+                            tc_chunk = {
+                                "id": response_id,
+                                "object": "chat.completion.chunk",
+                                "created": int(time.time()),
+                                "model": SETTINGS.proxy_model_id,
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "delta": {"tool_calls": [{**tc, "index": idx}]},
+                                        "finish_reason": None,
+                                    }
+                                ],
+                            }
+                            _wire_payload = f"data: {json.dumps(tc_chunk)}\n\n"
+                            _tc_name = tc.get('function', {}).get('name', '?')
+                            _pipeline_log("WIRE", request_id, f"SEND tool_call_chunk[{idx}] | name={_tc_name} | wire_len={len(_wire_payload)}")
+                            try:
+                                self.wfile.write(_wire_payload.encode("utf-8"))
+                                self.wfile.flush()
+                                _pipeline_log("WIRE", request_id, f"FLUSH tool_call_chunk[{idx}] OK")
+                            except BrokenPipeError:
+                                _pipeline_log("WIRE", request_id, f"❌ BROKEN PIPE on tool_call_chunk[{idx}] — client already disconnected")
+                                raise
+
+                    final_chunk = {
+                        "id": response_id,
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": SETTINGS.proxy_model_id,
+                        "choices": [
+                            {"index": 0, "delta": {}, "finish_reason": finish_reason}
+                        ],
+                    }
+                    _wire_payload = f"data: {json.dumps(final_chunk)}\n\n"
+                    _pipeline_log("WIRE", request_id, f"SEND final_chunk | finish_reason={finish_reason} | wire_len={len(_wire_payload)}")
+                    try:
+                        self.wfile.write(_wire_payload.encode("utf-8"))
+                        self.wfile.write(b"data: [DONE]\n\n")
+                        self.wfile.flush()
+                        _pipeline_log("WIRE", request_id, "FLUSH final+DONE OK — response fully delivered")
+                    except BrokenPipeError:
+                        _pipeline_log("WIRE", request_id, "❌ BROKEN PIPE on final_chunk — client disconnected before receiving response")
+                        raise
                 timing = _build_timing_dict(first_token_at, generation_started_at, rest_count, generated_tokens)
                 if request_logger:
                     request_logger.log(
@@ -4798,16 +5008,25 @@ class APIHandler(BaseHTTPRequestHandler):
                     prefill_tps = (
                         rest_count / prefill_seconds if prefill_seconds > 0 else 0.0
                     )
-                    _terminal_status(
-                        "✅",
-                        (
+                    _req_log = (
                             f"Request {request_id} finished | output_tokens={token_breakdown} | "
                             f"elapsed={elapsed:.2f}s | tok/s={speed:.2f} | "
                             f"prefill={prefill_seconds:.2f}s ({prefill_tps:.0f} tok/s) | "
                             f"decode={decode_seconds:.2f}s ({decode_tps:.1f} tok/s)"
-                        ),
-                        indent=1,
                     )
+                    # Append MoE stats if active
+                    _moe_suffix = ""
+                    try:
+                        from .expert_cache import get_cache_stats
+                        _mcs = get_cache_stats(model)
+                        if _mcs.get("moe_active"):
+                            _moe_suffix = (
+                                f" | moe_hit={_mcs['hit_rate']:.0%}"
+                                f" fallback={_mcs['fallback_rate']:.0%}"
+                            )
+                    except (ImportError, Exception):
+                        pass
+                    _terminal_status("✅", _req_log + _moe_suffix, indent=1)
                 else:
                     _terminal_status(
                         "✅",
@@ -4824,6 +5043,34 @@ class APIHandler(BaseHTTPRequestHandler):
                 # KRIPPER DUAL-SLOT: compact runner's KV cache is stored in PROMPT_CACHE_COMPACT
                 # (not released). No need to null-out prompt_cache here — the LRU manages it.
                 # MAIN cache is always untouched.
+
+                # ── ANTHROPIC SAFETY EVICTION ──────────────────────────────
+                # After large Anthropic requests, the KV cache can hold 128K+
+                # token positions. Evict only if Metal active memory is too
+                # close to device limit — data-driven, not hardcoded threshold.
+                # Profiling shows 33K-token requests peak at ~12 GiB on 24 GB.
+                if self._is_anthropic and rest_count is not None and rest_count > 10000:
+                    try:
+                        _post_active = mx.get_active_memory()
+                        _device_total = mx.device_info()["memory_size"]
+                        _pressure = _post_active / _device_total if _device_total > 0 else 1.0
+                        if _pressure > 0.80:
+                            with prompt_cache_lock:
+                                _evicted = PROMPT_CACHE.evict_unpinned()
+                            if _evicted > 0:
+                                _terminal_status("🧹",
+                                    f"ANTHROPIC SAFETY: evicted {_evicted} cache entries | "
+                                    f"pressure={_pressure:.0%} ({_post_active / (1024**3):.1f}/{_device_total / (1024**3):.1f} GiB)",
+                                    indent=1)
+                        elif FEATURE_FULL_LOGGING:
+                            _terminal_status("💾",
+                                f"ANTHROPIC SAFETY: cache RETAINED | "
+                                f"pressure={_pressure:.0%} ({_post_active / (1024**3):.1f}/{_device_total / (1024**3):.1f} GiB) < 80%",
+                                indent=1)
+                    except Exception:
+                        pass  # mx API unavailable — skip eviction decision
+
+                _mem_profiler.snapshot(request_id, "POST_GENERATION", is_anthropic=self._is_anthropic, rest_tokens=rest_count if 'rest_count' in dir() else None, output_tokens=output_tokens if 'output_tokens' in dir() else None, kv_cache_offset=_kv_off if '_kv_off' in dir() else None)
                 mx.clear_cache()
                 import gc; gc.collect()
                 if FEATURE_FULL_LOGGING:
@@ -4864,6 +5111,7 @@ def run():
         print("\n⏳ Waiting for warmup to complete before accepting requests...")
         _WARMUP_DONE.wait(timeout=300)  # 5 min max, warmup typically takes ~82s
 
+    _mem_profiler.init(SETTINGS.log_root)
     print("\n" + "=" * 50)
     print("🟢 SYSTEM READY")
     print(f"   • Mode:         {'VLM (vision)' if is_vlm else 'LM (text-only)'}")
