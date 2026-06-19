@@ -903,6 +903,168 @@ def enable_moe_cache(
     return stats
 
 
+def expand_expert_capacity(
+    model: nn.Module,
+    target_capacity: int,
+    profile_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Expand expert cache from initial_capacity to target_capacity.
+
+    Two-stage loading: startup uses low capacity (safe for cold prefill),
+    then this function expands after the KV cache is warm (only tiny suffix
+    prefills needed, so more experts fit in the scratch headroom).
+
+    Operates in-place on existing PredictiveExpertCache instances:
+    1. Creates new larger stacked tensors
+    2. Copies existing loaded experts
+    3. Loads additional experts from SSD
+    4. Rebuilds lookup tables
+
+    Must be called under model_lock.
+    """
+    t0 = time.time()
+
+    config = getattr(model, "_moe_config", None)
+    st_map = getattr(model, "_st_map", None)
+    if config is None or st_map is None:
+        logger.warning("[MOE] expand_expert_capacity: no MoE config found")
+        return {"expanded": False}
+
+    num_experts = config["num_experts"]
+    old_capacity = config["capacity"]
+    effective_target = min(target_capacity, num_experts)
+
+    if effective_target <= old_capacity:
+        logger.info("[MOE] expand: target %d <= current %d, skip", effective_target, old_capacity)
+        return {"expanded": False, "reason": "target <= current"}
+
+    profile = None
+    if profile_path and Path(profile_path).exists():
+        profile = load_expert_profile(profile_path)
+
+    expanded_layers = 0
+    total_new_experts = 0
+
+    for i, layer in enumerate(model.layers):
+        switch, _ = _find_switch_mlp(layer, i)
+        if switch is None:
+            continue
+        proj = getattr(switch, "up_proj", None)
+        if not isinstance(proj, PredictiveCachedSwitchLinear):
+            continue
+
+        cache = proj._cache
+        old_ids = list(cache.cached_ids)
+        old_set = set(old_ids)
+
+        # Select experts for expanded capacity
+        target_ids = _select_experts_for_layer(i, num_experts, effective_target, profile)
+        new_ids = [eid for eid in target_ids if eid not in old_set]
+        new_ids = new_ids[:effective_target - old_capacity]
+
+        if not new_ids:
+            continue
+
+        new_eids_arr = np.array(new_ids, dtype=np.int32)
+
+        # Expand stacked tensors for each projection
+        for proj_name in _PROJ_NAMES:
+            old_w = cache.weights.get(proj_name)
+            old_s = cache.scales.get(proj_name)
+            old_b = cache.biases.get(proj_name)
+            if old_w is None:
+                continue
+
+            key_prefix = cache._key_prefixes.get(proj_name)
+            if key_prefix is None:
+                continue
+
+            # Load new expert weights from SSD
+            w_key = f"{key_prefix}.weight"
+            s_key = f"{key_prefix}.scales"
+            b_key = f"{key_prefix}.biases"
+
+            new_w = st_map.get_expert_slices(w_key, new_eids_arr)
+            new_s = st_map.get_expert_slices(s_key, new_eids_arr)
+            new_b = st_map.get_expert_slices(b_key, new_eids_arr) if b_key in st_map else None
+
+            if new_b is None:
+                mx.eval(new_w, new_s)
+            else:
+                mx.eval(new_w, new_s, new_b)
+
+            # Concatenate old + new into expanded stacked tensor
+            cache.weights[proj_name] = mx.concatenate([old_w, new_w], axis=0)
+            cache.scales[proj_name] = mx.concatenate([old_s, new_s], axis=0)
+            if old_b is not None and new_b is not None:
+                cache.biases[proj_name] = mx.concatenate([old_b, new_b], axis=0)
+
+        # Eval the expanded tensors
+        to_eval = []
+        for proj_name in _PROJ_NAMES:
+            if proj_name in cache.weights:
+                to_eval.extend([cache.weights[proj_name], cache.scales[proj_name]])
+                if cache.biases.get(proj_name) is not None:
+                    to_eval.append(cache.biases[proj_name])
+        if to_eval:
+            mx.eval(*to_eval)
+
+        # Update bookkeeping
+        all_ids = old_ids + new_ids
+        cache.capacity = len(all_ids)
+        cache.cached_ids = all_ids
+        cache.cached_set = set(all_ids)
+        for eid in new_ids:
+            cache.frequency.setdefault(eid, 1)
+            cache.last_active.setdefault(eid, 0)
+
+        # Rebuild lookup + hit mask
+        cache.rebuild_lookup()
+        mx.eval(cache.lookup, cache.hit_mask)
+
+        # Re-pin from profile
+        if profile:
+            _pin_from_profile(cache, i, profile)
+
+        expanded_layers += 1
+        total_new_experts += len(new_ids)
+
+    mx.clear_cache()
+
+    # Re-wire memory with new footprint
+    if hasattr(mx, "set_wired_limit"):
+        PREFILL_SCRATCH_RESERVE_GB = 4.0  # Less reserve needed with warm cache
+        active = mx.get_active_memory()
+        metal_total = mx.device_info()["memory_size"]
+        headroom = int(metal_total - PREFILL_SCRATCH_RESERVE_GB * 1e9)
+        wired = min(active, headroom)
+        mx.set_wired_limit(wired)
+
+    elapsed = time.time() - t0
+    active_gb = mx.get_active_memory() / 1e9
+
+    # Update model config
+    model._moe_config["capacity"] = effective_target
+    model._moe_config["active_memory_gb"] = round(active_gb, 1)
+
+    logger.info(
+        "[MOE] ✅ Expanded: %d→%d cap | +%d experts across %d layers | "
+        "%.1fs | mem=%.1fGB",
+        old_capacity, effective_target, total_new_experts,
+        expanded_layers, elapsed, active_gb,
+    )
+
+    return {
+        "expanded": True,
+        "old_capacity": old_capacity,
+        "new_capacity": effective_target,
+        "new_experts_loaded": total_new_experts,
+        "layers_expanded": expanded_layers,
+        "elapsed_seconds": round(elapsed, 1),
+        "active_memory_gb": round(active_gb, 1),
+    }
+
+
 def _select_experts_for_layer(
     layer_idx: int,
     num_experts: int,

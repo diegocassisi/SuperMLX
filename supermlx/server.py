@@ -2715,6 +2715,16 @@ except ImportError:
     pass  # expert_cache not available — dense model, no action needed
 except Exception as _moe_err:
     _terminal_status("⚠️", f"MoE Expert Cache failed: {_moe_err}")
+
+# Two-stage expert loading: expand after first successful response
+_moe_expand_pending = (
+    SETTINGS.moe_target_capacity > SETTINGS.moe_expert_capacity
+    and _moe_stats.get("moe_layers", 0) > 0
+)
+if _moe_expand_pending:
+    _terminal_status("📋",
+        f"Staged loading: {SETTINGS.moe_expert_capacity}→{SETTINGS.moe_target_capacity} "
+        f"experts after first warm response")
 _terminal_status(
     "🧠",
     (
@@ -5106,6 +5116,33 @@ class APIHandler(BaseHTTPRequestHandler):
                     if generation_started_at is not None:
                         _held_ms = (time.time() - generation_started_at) * 1000
                         _pipeline_log("METAL", request_id, f"model_lock released | held_for={_held_ms/1000:.2f}s")
+
+                # ── TWO-STAGE EXPERT EXPANSION ────────────────────────────
+                # After first successful response, KV cache is warm → expand
+                # expert capacity. Runs under model_lock (already held).
+                global _moe_expand_pending
+                if _moe_expand_pending and output_tokens > 0:
+                    try:
+                        from .expert_cache import expand_expert_capacity
+                        _terminal_status("🔄",
+                            f"Expanding experts: {SETTINGS.moe_expert_capacity}"
+                            f"→{SETTINGS.moe_target_capacity}...")
+                        _expand_stats = expand_expert_capacity(
+                            model,
+                            target_capacity=SETTINGS.moe_target_capacity,
+                            profile_path=SETTINGS.moe_expert_profile or None,
+                        )
+                        if _expand_stats.get("expanded"):
+                            _terminal_status("✅",
+                                f"Expert expansion complete: "
+                                f"{_expand_stats['old_capacity']}→{_expand_stats['new_capacity']} | "
+                                f"+{_expand_stats['new_experts_loaded']} experts | "
+                                f"{_expand_stats['elapsed_seconds']}s | "
+                                f"mem={_expand_stats['active_memory_gb']}GB")
+                    except Exception as _exp_err:
+                        _terminal_status("⚠️", f"Expert expansion failed: {_exp_err}")
+                    _moe_expand_pending = False
+
                 model_lock.release()
 
 
