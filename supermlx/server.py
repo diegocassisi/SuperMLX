@@ -230,6 +230,11 @@ FEATURE_COMPRESSOR            = _env_str("FEATURE_COMPRESSOR", "false").lower() 
 # Only needs LLMLingua (CPU BERT), not the full reranker+compression pipeline.
 FEATURE_EMERGENCY_COMPRESS    = _env_str("EMERGENCY_CONTENT_COMPRESS", "true").lower() in ("1", "true", "yes")
 
+# Prefill step size: tokens processed per chunk during prompt prefill.
+# Smaller = less Metal scratch memory (score matrix = chunk × kv_length per attn layer).
+# Default 512 keeps peak under ~14 GB for 47K-token cold-starts on 24 GB machines.
+PREFILL_STEP_SIZE             = int(_env_str("PREFILL_STEP_SIZE", "512"))
+
 # RAG codebase enrichment: inyecta chunks relevantes del codebase en el context.
 # Requiere rag_enricher.py + lancedb + sentence-transformers.
 # Env: FEATURE_RAG_ENRICHMENT=true | RAG_WORKSPACE_ROOT=/path/to/workspace
@@ -1897,6 +1902,18 @@ def _vlm_sync_before_generation(pixel_values: Any, mask: Any) -> None:
 
 # ── Shared helpers: deduplicate streaming / non-streaming do_POST paths ───────
 
+def _metal_mem_str() -> str:
+    """Return a compact Metal memory status string. Best-effort, never raises."""
+    try:
+        import mlx.core as mx
+        active_gb = mx.metal.get_active_memory() / 1e9
+        peak_gb = mx.metal.get_peak_memory() / 1e9
+        cache_gb = mx.metal.get_cache_memory() / 1e9
+        return f"metal={active_gb:.2f}GB peak={peak_gb:.2f}GB cache={cache_gb:.2f}GB"
+    except Exception:
+        return ""
+
+
 def _start_prefill_progress(
     request_id: str, rest_count: int, log_fn=None, rate: int = 300
 ) -> Tuple[threading.Event, Optional[threading.Thread]]:
@@ -1912,7 +1929,7 @@ def _start_prefill_progress(
         _log(
             "⏳",
             f"Request {request_id} PREFILL starting | 0% | ETA ~{est_total:.0f}s | "
-            f"tokens={rest_count}",
+            f"tokens={rest_count} | {_metal_mem_str()}",
             indent=1,
         )
         while not done.is_set():
@@ -1926,7 +1943,7 @@ def _start_prefill_progress(
                 "🔄",
                 f"Request {request_id} PREFILL | {pct:.0f}% | "
                 f"{elapsed:.0f}s/{est_total:.0f}s | ~{eta:.0f}s remaining | "
-                f"tokens={rest_count}",
+                f"tokens={rest_count} | {_metal_mem_str()}",
                 indent=1,
             )
 
@@ -2995,6 +3012,7 @@ def _stream_generate_kwargs(prompt_tokens, max_tokens, sampler, prompt_cache):
         "prompt_cache": prompt_cache,
         "max_kv_size": SETTINGS.max_kv_size,
         "kv_group_size": SETTINGS.kv_group_size,
+        "prefill_step_size": PREFILL_STEP_SIZE,
     }
     if SETTINGS.kv_bits is not None:
         kwargs["kv_bits"] = SETTINGS.kv_bits
