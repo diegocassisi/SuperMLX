@@ -5161,23 +5161,19 @@ def run():
         _terminal_status("🔄", "Startup warmup: generating dummy token to warm cache...")
         try:
             _warmup_tokens = tokenizer.encode("hola")
-            _warmup_cache = make_prompt_cache(model)
+            _warmup_cache = make_prompt_cache(model, max_kv_size=SETTINGS.max_kv_size)
+            _warmup_kwargs = {
+                "model": model,
+                "tokenizer": tokenizer,
+                "prompt": _warmup_tokens,
+                "max_tokens": 1,
+                "prompt_cache": _warmup_cache,
+                "prefill_step_size": PREFILL_STEP_SIZE,
+            }
             if SETTINGS.kv_bits is not None:
-                _warmup_cache = make_prompt_cache(
-                    model,
-                    max_kv_size=SETTINGS.max_kv_size,
-                    kv_group_size=SETTINGS.kv_group_size,
-                    kv_bits=int(SETTINGS.kv_bits),
-                )
-            for _resp in stream_generate(
-                model=model,
-                tokenizer=tokenizer,
-                prompt=_warmup_tokens,
-                max_tokens=1,
-                prompt_cache=_warmup_cache,
-                prefill_step_size=PREFILL_STEP_SIZE,
-            ):
-                pass  # consume the single token
+                _warmup_kwargs["kv_bits"] = int(SETTINGS.kv_bits)
+            for _resp in stream_generate(**_warmup_kwargs):
+                pass
             del _warmup_cache
             mx.clear_cache()
             import gc; gc.collect()
