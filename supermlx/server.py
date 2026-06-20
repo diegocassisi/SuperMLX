@@ -5117,31 +5117,8 @@ class APIHandler(BaseHTTPRequestHandler):
                         _held_ms = (time.time() - generation_started_at) * 1000
                         _pipeline_log("METAL", request_id, f"model_lock released | held_for={_held_ms/1000:.2f}s")
 
-                # ── TWO-STAGE EXPERT EXPANSION ────────────────────────────
-                # After first successful response, KV cache is warm → expand
-                # expert capacity. Runs under model_lock (already held).
-                global _moe_expand_pending
-                if _moe_expand_pending and output_tokens > 0:
-                    try:
-                        from .expert_cache import expand_expert_capacity
-                        _terminal_status("🔄",
-                            f"Expanding experts: {SETTINGS.moe_expert_capacity}"
-                            f"→{SETTINGS.moe_target_capacity}...")
-                        _expand_stats = expand_expert_capacity(
-                            model,
-                            target_capacity=SETTINGS.moe_target_capacity,
-                            profile_path=SETTINGS.moe_expert_profile or None,
-                        )
-                        if _expand_stats.get("expanded"):
-                            _terminal_status("✅",
-                                f"Expert expansion complete: "
-                                f"{_expand_stats['old_capacity']}→{_expand_stats['new_capacity']} | "
-                                f"+{_expand_stats['new_experts_loaded']} experts | "
-                                f"{_expand_stats['elapsed_seconds']}s | "
-                                f"mem={_expand_stats['active_memory_gb']}GB")
-                    except Exception as _exp_err:
-                        _terminal_status("⚠️", f"Expert expansion failed: {_exp_err}")
-                    _moe_expand_pending = False
+                # Two-stage expert expansion moved to startup (run() function).
+                # Expansion happens before SYSTEM READY, so all requests see full capacity.
 
                 model_lock.release()
 
@@ -5174,6 +5151,60 @@ def run():
     if not _WARMUP_DONE.is_set():
         print("\n⏳ Waiting for warmup to complete before accepting requests...")
         _WARMUP_DONE.wait(timeout=300)  # 5 min max, warmup typically takes ~82s
+
+    # ── TWO-STAGE EXPERT EXPANSION: warmup + expand at startup ─────────
+    # Generate 1 token with a dummy prompt to warm the KV cache, then expand
+    # experts before accepting real requests. This ensures Claude Code never
+    # sees the low-quality initial-capacity phase (59% fallback at cap=100).
+    global _moe_expand_pending
+    if _moe_expand_pending:
+        _terminal_status("🔄", "Startup warmup: generating dummy token to warm cache...")
+        try:
+            _warmup_tokens = tokenizer.encode("hola")
+            _warmup_cache = make_prompt_cache(model)
+            if SETTINGS.kv_bits is not None:
+                _warmup_cache = make_prompt_cache(
+                    model,
+                    max_kv_size=SETTINGS.max_kv_size,
+                    kv_group_size=SETTINGS.kv_group_size,
+                    kv_bits=int(SETTINGS.kv_bits),
+                )
+            for _resp in stream_generate(
+                model=model,
+                tokenizer=tokenizer,
+                prompt=_warmup_tokens,
+                max_tokens=1,
+                prompt_cache=_warmup_cache,
+                prefill_step_size=PREFILL_STEP_SIZE,
+            ):
+                pass  # consume the single token
+            del _warmup_cache
+            mx.clear_cache()
+            import gc; gc.collect()
+            _terminal_status("✅", "Startup warmup complete — cache warm")
+
+            # Now expand experts while we have headroom
+            from .expert_cache import expand_expert_capacity
+            _terminal_status("🔄",
+                f"Expanding experts: {SETTINGS.moe_expert_capacity}"
+                f"→{SETTINGS.moe_target_capacity}...")
+            _expand_stats = expand_expert_capacity(
+                model,
+                target_capacity=SETTINGS.moe_target_capacity,
+                profile_path=SETTINGS.moe_expert_profile or None,
+            )
+            if _expand_stats.get("expanded"):
+                _terminal_status("✅",
+                    f"Expert expansion complete: "
+                    f"{_expand_stats['old_capacity']}→{_expand_stats['new_capacity']} | "
+                    f"+{_expand_stats['new_experts_loaded']} experts | "
+                    f"{_expand_stats['elapsed_seconds']}s | "
+                    f"mem={_expand_stats['active_memory_gb']}GB")
+            _moe_expand_pending = False
+        except Exception as _warmup_err:
+            _terminal_status("⚠️", f"Startup warmup/expand failed: {_warmup_err}")
+            import traceback; traceback.print_exc()
+            _moe_expand_pending = False
 
     _mem_profiler.init(SETTINGS.log_root)
     print("\n" + "=" * 50)
