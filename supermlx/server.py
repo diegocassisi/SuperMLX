@@ -174,6 +174,7 @@ from mlx_lm.models.cache import (
     can_trim_prompt_cache,
     trim_prompt_cache,
 )
+import supermlx.tool_prefix_cache as _tpc
 
 # Optional VLM support (Blaizzy/mlx-vlm). If unavailable, is_vlm is always False.
 try:
@@ -2913,6 +2914,11 @@ def _run_startup_warmup() -> None:
         model_path=SETTINGS.model_path,
         log_fn=_terminal_status,
     )
+    # Load tool prefix KV cache from disk (non-blocking — first request triggers
+    # compute if no saved state exists).
+    if SETTINGS.cache_persist_path:
+        _tpc.init(SETTINGS.cache_persist_path)
+        _tpc.load_from_disk(model, SETTINGS.max_kv_size)
 
 
 # ── Launch DPC daemon thread ────────────────────────────────────────────────
@@ -4451,11 +4457,64 @@ class APIHandler(BaseHTTPRequestHandler):
                     if is_vlm and hasattr(model, "language_model")
                     else model
                 )
-                prompt_cache = make_prompt_cache(
-                    cache_model, max_kv_size=SETTINGS.max_kv_size
-                )
-                # Full miss: model prefills all original tokens (never canonical).
-                rest_tokens = model_tokens
+                # ── TOOL PREFIX KV INJECTION ─────────────────────────────────
+                # On LRU miss, inject pre-computed KV for system+tools (~33K tok).
+                # Only for MAIN agent requests with tools (not compact runner).
+                _tpc_injected = False
+                if (
+                    not _is_embedded_agent
+                    and tools
+                    and not is_vlm
+                    and _tpc.is_configured()
+                ):
+                    try:
+                        # Use the full system message (including billing header) for the prefix.
+                        # Stripping the header caused tokenization to diverge from model_tokens.
+                        # The hash invalidates on Claude Code version changes (rare, acceptable).
+                        _sys_body = ""
+                        for _m in messages:
+                            if (_m.get("role") or "").lower() == "system":
+                                _sys_body = _m.get("content", "")
+                                break
+                        if _sys_body:
+                            _pc_clone, _ptoks, _recomputed = _tpc.get_prefix_cache_clone(
+                                system_body=_sys_body,
+                                tools=tools,
+                                tokenizer=tokenizer,
+                                model=cache_model,
+                                max_kv_size=SETTINGS.max_kv_size,
+                                kv_bits=getattr(SETTINGS, "kv_bits", None),
+                                enable_thinking=enable_thinking,
+                            )
+                            if _pc_clone is not None and _ptoks:
+                                _ptok_len = len(_ptoks)
+                                # Verify prefix alignment: model_tokens must start with prefix
+                                if (len(model_tokens) > _ptok_len
+                                        and model_tokens[:_ptok_len] == _ptoks):
+                                    prompt_cache = _pc_clone
+                                    rest_tokens = model_tokens[_ptok_len:]
+                                    _tpc_injected = True
+                                    _terminal_status(
+                                        "🔧",
+                                        f"TPC: injected | prefix={_ptok_len} tok | "
+                                        f"rest={len(rest_tokens)} tok | "
+                                        f"recomputed={_recomputed}",
+                                    )
+                                else:
+                                    _terminal_status(
+                                        "⚠️",
+                                        f"TPC: prefix mismatch — falling back to full prefill "
+                                        f"(prefix_len={_ptok_len} model_len={len(model_tokens)})",
+                                    )
+                    except Exception as _tpc_err:
+                        _terminal_status("⚠️", f"TPC: error — falling back to full prefill ({_tpc_err})")
+
+                if not _tpc_injected:
+                    prompt_cache = make_prompt_cache(
+                        cache_model, max_kv_size=SETTINGS.max_kv_size
+                    )
+                    # Full miss: model prefills all original tokens (never canonical).
+                    rest_tokens = model_tokens
 
 
             rest_count = len(rest_tokens) if rest_tokens is not None else _m_len
