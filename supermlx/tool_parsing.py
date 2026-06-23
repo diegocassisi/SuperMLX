@@ -212,6 +212,9 @@ def _normalize_assistant_text(text, enable_thinking, model_family):
 
 def _coerce_arg_value(raw_value):
     value = raw_value.strip()
+    # Handle Python-style booleans that json.loads rejects (case-sensitive)
+    if value in ("True", "False"):
+        return value == "True"
     try:
         return json.loads(value)
     except Exception:

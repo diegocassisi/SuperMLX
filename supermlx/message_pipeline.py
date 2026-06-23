@@ -140,7 +140,7 @@ def _inject_loop_stop(
     messages: List[Dict[str, Any]], tool_idx: int,
     tool_name: str, count: int, mode: str, request_id: str,
     instruction: str, log_fn: Optional[Callable] = None,
-) -> Tuple[List[Dict[str, Any]], bool]:
+) -> Tuple[List[Dict[str, Any]], int]:
     """Inject a stop instruction into the last tool result to break the loop."""
     messages = list(messages)
     messages[tool_idx] = dict(messages[tool_idx])
@@ -153,19 +153,20 @@ def _inject_loop_stop(
             f"consecutive_calls={count} | "
             f"injected stop instruction at msg[{tool_idx}]",
         )
-    return messages, True
+    return messages, count
 
 
 def _break_tool_call_loop(
     messages: List[Dict[str, Any]], request_id: str = "",
     enabled: bool = True, max_retries: int = 3,
     log_fn: Optional[Callable] = None,
-) -> Tuple[List[Dict[str, Any]], bool]:
-    """Detect and break infinite tool-call retry loops (ERROR/DUPLICATE/SPAM)."""
+) -> Tuple[List[Dict[str, Any]], int]:
+    """Detect and break infinite tool-call retry loops (ERROR/DUPLICATE/SPAM).
+    Returns (messages, consecutive_count). consecutive_count > 0 means loop detected."""
     if not enabled or len(messages) < 4:
-        return messages, False
+        return messages, 0
 
-    SPAM_THRESHOLD = 5
+    SPAM_THRESHOLD = 15
     DUPLICATE_THRESHOLD = 2
     consecutive_calls: List[Dict[str, Any]] = []
     i = len(messages) - 1
@@ -184,18 +185,25 @@ def _break_tool_call_loop(
         i -= 2
 
     if consecutive_calls:
-        seen_sigs: Dict[str, int] = {}
-        for c in consecutive_calls:
-            key = f"{c['tool_name']}::{c['tool_args']}"
-            seen_sigs[key] = seen_sigs.get(key, 0) + 1
-        for sig_key, count in seen_sigs.items():
-            if count >= DUPLICATE_THRESHOLD:
-                dup_name = sig_key.split("::")[0]
+        # DUPLICATE: only check if the LAST N calls at the tail are identical.
+        # Old duplicates buried under different tool calls are NOT loops.
+        if len(consecutive_calls) >= DUPLICATE_THRESHOLD:
+            tail = consecutive_calls[:DUPLICATE_THRESHOLD]  # [0] = most recent
+            tail_sigs = [f"{c['tool_name']}::{c['tool_args']}" for c in tail]
+            if len(set(tail_sigs)) == 1:  # all identical
+                dup_name = tail[0]["tool_name"]
+                dup_count = DUPLICATE_THRESHOLD
+                # Count further back to get the real consecutive count
+                for c in consecutive_calls[DUPLICATE_THRESHOLD:]:
+                    if f"{c['tool_name']}::{c['tool_args']}" == tail_sigs[0]:
+                        dup_count += 1
+                    else:
+                        break
                 return _inject_loop_stop(
                     messages, consecutive_calls[0]["tool_idx"],
-                    dup_name, count, "DUPLICATE", request_id,
+                    dup_name, dup_count, "DUPLICATE", request_id,
                     f"You already called '{dup_name}' with the EXACT same arguments "
-                    f"{count} times and got the same results each time. "
+                    f"{dup_count} times and got the same results each time. "
                     f"The information you need is NOT available via this tool. "
                     f"DO NOT call '{dup_name}' again. "
                     f"Respond with a text message using your own knowledge instead.",
@@ -205,7 +213,7 @@ def _break_tool_call_loop(
             first_name = consecutive_calls[0]["tool_name"]
             same_name_count = sum(1 for c in consecutive_calls if c["tool_name"] == first_name)
             if same_name_count >= SPAM_THRESHOLD:
-                return _inject_loop_stop(
+                msgs, count = _inject_loop_stop(
                     messages, consecutive_calls[0]["tool_idx"],
                     first_name, same_name_count, "SPAM", request_id,
                     f"You have called '{first_name}' {same_name_count} consecutive times "
@@ -215,6 +223,9 @@ def _break_tool_call_loop(
                     f"or explain that you couldn't find what you needed.",
                     log_fn,
                 )
+                # Return -count so escalation (>= 5) doesn't fire for SPAM
+                # (different args each time = likely progress, not a real loop)
+                return msgs, -count
 
     failures: List[Dict[str, Any]] = []
     i = len(messages) - 1
@@ -244,7 +255,7 @@ def _break_tool_call_loop(
         i -= 2
 
     if len(failures) < max_retries:
-        return messages, False
+        return messages, 0
 
     name_counts: Dict[str, int] = {}
     for f in failures:
@@ -253,7 +264,7 @@ def _break_tool_call_loop(
     most_common_count = name_counts[most_common_name]
 
     if most_common_count < max_retries:
-        return messages, False
+        return messages, 0
 
     return _inject_loop_stop(
         messages, failures[0]["tool_idx"],

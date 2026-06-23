@@ -146,7 +146,7 @@ import signal
 import math
 from datetime import datetime
 try:
-    from .emergency_compressor import emergency_compress_if_needed, should_signal_overflow
+    from .emergency_compressor import emergency_compress_if_needed, should_signal_overflow, _max_safe_prefill
     _emergency_compressor_available = True
 except ImportError:
     _emergency_compressor_available = False
@@ -646,6 +646,7 @@ from .debug_tools import _debug_token_divergence
 from .anthropic_compat import (
     CLAUDE_MODEL_ALIASES, anthropic_to_openai_body,
     openai_to_anthropic_response, build_anthropic_sse_events,
+    _sse as _sse_event,
 )
 from . import memory_profiler as _mem_profiler
 
@@ -3591,6 +3592,32 @@ class APIHandler(BaseHTTPRequestHandler):
                 return
             self._is_anthropic = True
             self._anthropic_model = raw.get("model", "claude-sonnet-4-20250514")
+
+            # ── COMPACT TOOL STRIP ────────────────────────────────────
+            # Compact requests say "Do NOT call any tools" but Claude Code
+            # still sends all 28 tool definitions (~130K chars, ~30K tokens).
+            # Stripping them cuts prefill from ~37K to ~5K model_tokens,
+            # eliminating OOM and reducing compact time from ~130s to ~17s.
+            _compact_stripped_tools = 0
+            if raw.get("tools"):
+                _last_user = ""
+                for _m in reversed(raw.get("messages", [])):
+                    if _m.get("role") == "user":
+                        _c = _m.get("content", "")
+                        if isinstance(_c, str):
+                            _last_user = _c
+                        elif isinstance(_c, list):
+                            _last_user = " ".join(
+                                b.get("text", "") for b in _c
+                                if isinstance(b, dict) and b.get("type") == "text"
+                            )
+                        break
+                if "CRITICAL: Respond with TEXT ONLY" in _last_user[:200]:
+                    _compact_stripped_tools = len(raw["tools"])
+                    raw["tools"] = []
+                    _terminal_status("🪶",
+                        f"COMPACT TOOL STRIP: removed {_compact_stripped_tools} tool definitions from compact request")
+
             body = anthropic_to_openai_body(raw, SETTINGS.proxy_model_id)
             # Jump past the body-parse block that follows.
             self._handle_chat_completion(body)
@@ -4509,30 +4536,49 @@ class APIHandler(BaseHTTPRequestHandler):
                         f"EMERGENCY COMPRESSOR: pipeline re-done | new rest_tokens={rest_count} | "
                         f"cache_hit={cache_match_type} | matched={matched_prefix_len}/{len(prompt_tokens)}")
 
-                # Overflow signal: applies to ALL requests (including Anthropic)
-                # to prevent OOM crashes from prompts exceeding safe prefill limit.
-                if should_signal_overflow(rest_count):
-                    _terminal_status("⚠️",
-                        f"OVERFLOW GUARD: rest={rest_count} tokens exceed safe prefill limit "
-                        f"— signaling overflow to client")
-                    _overflow_error = json.dumps({
-                        "error": {
-                            "message": f"context length exceeded: {rest_count} tokens exceed safe prefill limit",
-                            "type": "invalid_request_error",
-                            "code": "context_length_exceeded",
-                        }
-                    }).encode("utf-8")
-                    self.send_response(400)
-                    self.send_header("Content-Type", "application/json")
-                    self.send_header("Content-Length", str(len(_overflow_error)))
-                    self.end_headers()
-                    self.wfile.write(_overflow_error)
-                    if acquired:
-                        mx.clear_cache()
-                        import gc; gc.collect()
-                        model_lock.release()
-                        acquired = False
-                    return
+            # ── COMPACT GUARD: OVERFLOW + MEMORY PRESSURE ─────────────────
+            # Applies to ALL requests unconditionally (including Anthropic).
+            # Prevents OOM crashes by rejecting oversized prefills before they start.
+            # Uses "prompt is too long" wording to trigger Claude Code's reactive compact.
+            _memory_pressure = False
+            _pressure_reason = ""
+            if should_signal_overflow(rest_count):
+                _memory_pressure = True
+                _pressure_reason = f"rest={rest_count} tokens exceed safe prefill limit ({_max_safe_prefill()})"
+            else:
+                try:
+                    _get_mem = getattr(mx, 'get_active_memory', None) or getattr(mx.metal, 'get_active_memory', None)
+                    if _get_mem:
+                        _active_gb = _get_mem() / 1e9
+                        _threshold_gb = float(os.environ.get("MEMORY_COMPACT_THRESHOLD_GB", "21.0"))
+                        if _active_gb > _threshold_gb and len(prompt_tokens) > 80000:
+                            _memory_pressure = True
+                            _pressure_reason = f"metal={_active_gb:.1f}GB > {_threshold_gb}GB threshold (prompt={len(prompt_tokens)} tokens)"
+                except Exception:
+                    pass
+
+            if _memory_pressure:
+                _terminal_status("⚠️",
+                    f"COMPACT GUARD: {_pressure_reason} "
+                    f"— sending 'prompt is too long' to trigger client compaction")
+                _overflow_error = json.dumps({
+                    "type": "error",
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": f"prompt is too long: {len(prompt_tokens)} tokens > {len(prompt_tokens) - 1000} maximum",
+                    }
+                }).encode("utf-8")
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(_overflow_error)))
+                self.end_headers()
+                self.wfile.write(_overflow_error)
+                if acquired:
+                    mx.clear_cache()
+                    import gc; gc.collect()
+                    model_lock.release()
+                    acquired = False
+                return
 
             # ── PIPELINE LOG: CACHE & TQ ───────────────────────────────────
             if FEATURE_FULL_LOGGING and FEATURE_LOG_CACHE:
@@ -4699,6 +4745,20 @@ class APIHandler(BaseHTTPRequestHandler):
                     _update_healing_store(raw_response_text, message_text, tool_calls)
 
                 finish_reason = "tool_calls" if tool_calls else "stop"
+                # LOOP BREAK ESCALATION: if LOOP_BREAK fired but model still
+                # generated tool_calls, strip them and force stop. The model
+                # ignored the injected instruction — intercept at output level.
+                if _loop_broken >= 3 and tool_calls:
+                    _terminal_status("🛑",
+                        f"LOOP ESCALATION: model ignored LOOP_BREAK, stripping tool_calls",
+                        indent=1)
+                    message_text = (
+                        "Your last tool call was identical to a previous one and was blocked "
+                        "to prevent an infinite loop. Continue working on your current task "
+                        "using a different approach or different arguments."
+                    )
+                    tool_calls = []
+                    finish_reason = "stop"
                 cache_key.extend(generated_tokens)
                 with prompt_cache_lock:
                     _post_generation_cache_update(
@@ -4778,7 +4838,31 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.end_headers()
 
                 response_id = f"chatcmpl-{int(time.time())}"
-                if not self._is_anthropic:
+                # ── ANTHROPIC: send message_start + content_block_start immediately ──
+                _anthropic_streaming = self._is_anthropic
+                _anthropic_think_done = False
+                _anthropic_streamed_text = []  # chunks already sent via SSE
+                _anthropic_block_idx = 0
+                if _anthropic_streaming:
+                    _msg_id = f"msg_{uuid.uuid4().hex[:24]}"
+                    _msg_start = _sse_event("message_start", {
+                        "type": "message_start",
+                        "message": {
+                            "id": _msg_id, "type": "message", "role": "assistant",
+                            "model": self._anthropic_model, "content": [],
+                            "stop_reason": None, "stop_sequence": None,
+                            "usage": {"input_tokens": _est_tok, "output_tokens": 0},
+                        },
+                    })
+                    _block_start = _sse_event("content_block_start", {
+                        "type": "content_block_start", "index": 0,
+                        "content_block": {"type": "text", "text": ""},
+                    })
+                    self.wfile.write(_msg_start.encode("utf-8"))
+                    self.wfile.write(_block_start.encode("utf-8"))
+                    self.wfile.flush()
+                    _pipeline_log("WIRE", request_id, "ANTHROPIC SSE: sent message_start + content_block_start")
+                else:
                     role_chunk = {
                         "id": response_id,
                         "object": "chat.completion.chunk",
@@ -4844,6 +4928,49 @@ class APIHandler(BaseHTTPRequestHandler):
                         response_text = response.text
                         if response_text:
                             raw_parts.append(response_text)
+                            # ── ANTHROPIC LIVE STREAMING ─────────────────────
+                            # Stream output tokens as content_block_delta after
+                            # the </think> block ends. During thinking, the
+                            # keepalive thread keeps the connection alive.
+                            # If model doesn't think at all (no <think> tag),
+                            # start streaming from the first token.
+                            if _anthropic_streaming and not _anthropic_think_done:
+                                _acc = "".join(raw_parts)
+                                if "</think>" in _acc:
+                                    _anthropic_think_done = True
+                                    # Extract text after </think>
+                                    _post_think = _acc.split("</think>", 1)[1].lstrip("\n")
+                                    if _post_think:
+                                        _delta_ev = _sse_event("content_block_delta", {
+                                            "type": "content_block_delta", "index": 0,
+                                            "delta": {"type": "text_delta", "text": _post_think},
+                                        })
+                                        self.wfile.write(_delta_ev.encode("utf-8"))
+                                        self.wfile.flush()
+                                        _anthropic_streamed_text.append(_post_think)
+                                elif not _acc.lstrip().startswith("<think"):
+                                    # Model isn't thinking — stream immediately
+                                    _anthropic_think_done = True
+                                    _delta_ev = _sse_event("content_block_delta", {
+                                        "type": "content_block_delta", "index": 0,
+                                        "delta": {"type": "text_delta", "text": _acc},
+                                    })
+                                    self.wfile.write(_delta_ev.encode("utf-8"))
+                                    self.wfile.flush()
+                                    _anthropic_streamed_text.append(_acc)
+                            elif _anthropic_streaming and _anthropic_think_done:
+                                _delta_ev = _sse_event("content_block_delta", {
+                                    "type": "content_block_delta", "index": 0,
+                                    "delta": {"type": "text_delta", "text": response_text},
+                                })
+                                try:
+                                    self.wfile.write(_delta_ev.encode("utf-8"))
+                                    self.wfile.flush()
+                                    _anthropic_streamed_text.append(response_text)
+                                except BrokenPipeError:
+                                    _pipeline_log("WIRE", request_id,
+                                        "❌ BROKEN PIPE during Anthropic SSE streaming")
+                                    raise
                         if (
                             len(generated_tokens) % 64 == 0
                             and (time.time() - progress_last_at) >= 1.0
@@ -4890,25 +5017,100 @@ class APIHandler(BaseHTTPRequestHandler):
                     )
 
                 finish_reason = "tool_calls" if tool_calls else "stop"
+                # LOOP BREAK ESCALATION: if LOOP_BREAK fired but model still
+                # generated tool_calls, strip them and force stop.
+                if _loop_broken >= 3 and tool_calls:
+                    _terminal_status("🛑",
+                        f"LOOP ESCALATION: model ignored LOOP_BREAK, stripping tool_calls",
+                        indent=1)
+                    message_text = (
+                        "Your last tool call was identical to a previous one and was blocked "
+                        "to prevent an infinite loop. Continue working on your current task "
+                        "using a different approach or different arguments."
+                    )
+                    tool_calls = []
+                    finish_reason = "stop"
 
                 # ── ANTHROPIC SSE OUTPUT ──────────────────────────────────
                 if self._is_anthropic:
-                    anthropic_events = build_anthropic_sse_events(
-                        message_text, tool_calls, finish_reason,
-                        self._anthropic_model,
-                        prompt_input_tokens=_est_tok,
-                    )
-                    try:
-                        for ev in anthropic_events:
-                            self.wfile.write(ev.encode("utf-8"))
-                        self.wfile.flush()
-                        self.close_connection = True
-                        _pipeline_log("WIRE", request_id,
-                            f"ANTHROPIC SSE delivered | blocks={len(anthropic_events)} | finish={finish_reason}")
-                    except BrokenPipeError:
-                        _pipeline_log("WIRE", request_id,
-                            "❌ BROKEN PIPE on Anthropic SSE — client disconnected")
-                        raise
+                    if _anthropic_streaming and _anthropic_think_done:
+                        # We already streamed content_block_delta events during
+                        # generation. Now close the block and message.
+                        _stop_reason = "end_turn"
+                        if tool_calls:
+                            _stop_reason = "tool_use"
+                        elif finish_reason == "length":
+                            _stop_reason = "max_tokens"
+                        _closing_events = [
+                            _sse_event("content_block_stop", {
+                                "type": "content_block_stop", "index": 0,
+                            }),
+                        ]
+                        # If there are tool_calls, add tool_use blocks
+                        if tool_calls:
+                            _tc_idx = 1
+                            for tc in tool_calls:
+                                func = tc.get("function", {})
+                                try:
+                                    tc_input = json.loads(func.get("arguments", "{}"))
+                                except (json.JSONDecodeError, TypeError):
+                                    tc_input = {"raw": func.get("arguments", "")}
+                                tc_id = tc.get("id", f"toolu_{uuid.uuid4().hex[:12]}")
+                                _closing_events.append(_sse_event("content_block_start", {
+                                    "type": "content_block_start", "index": _tc_idx,
+                                    "content_block": {
+                                        "type": "tool_use", "id": tc_id,
+                                        "name": func.get("name", ""), "input": {},
+                                    },
+                                }))
+                                _closing_events.append(_sse_event("content_block_delta", {
+                                    "type": "content_block_delta", "index": _tc_idx,
+                                    "delta": {
+                                        "type": "input_json_delta",
+                                        "partial_json": json.dumps(tc_input, ensure_ascii=False),
+                                    },
+                                }))
+                                _closing_events.append(_sse_event("content_block_stop", {
+                                    "type": "content_block_stop", "index": _tc_idx,
+                                }))
+                                _tc_idx += 1
+                        _closing_events.append(_sse_event("message_delta", {
+                            "type": "message_delta",
+                            "delta": {"stop_reason": _stop_reason, "stop_sequence": None},
+                            "usage": {"output_tokens": len(generated_tokens)},
+                        }))
+                        _closing_events.append(_sse_event("message_stop", {"type": "message_stop"}))
+                        try:
+                            for ev in _closing_events:
+                                self.wfile.write(ev.encode("utf-8"))
+                            self.wfile.flush()
+                            self.close_connection = True
+                            _streamed_chars = sum(len(s) for s in _anthropic_streamed_text)
+                            _pipeline_log("WIRE", request_id,
+                                f"ANTHROPIC SSE streamed | chars={_streamed_chars} | finish={_stop_reason}")
+                        except BrokenPipeError:
+                            _pipeline_log("WIRE", request_id,
+                                "❌ BROKEN PIPE on Anthropic SSE closing — client disconnected")
+                            raise
+                    else:
+                        # Fallback: model didn't think or streaming wasn't active.
+                        # Use the original buffered approach.
+                        anthropic_events = build_anthropic_sse_events(
+                            message_text, tool_calls, finish_reason,
+                            self._anthropic_model,
+                            prompt_input_tokens=_est_tok,
+                        )
+                        try:
+                            for ev in anthropic_events:
+                                self.wfile.write(ev.encode("utf-8"))
+                            self.wfile.flush()
+                            self.close_connection = True
+                            _pipeline_log("WIRE", request_id,
+                                f"ANTHROPIC SSE delivered | blocks={len(anthropic_events)} | finish={finish_reason}")
+                        except BrokenPipeError:
+                            _pipeline_log("WIRE", request_id,
+                                "❌ BROKEN PIPE on Anthropic SSE — client disconnected")
+                            raise
                 # ── OPENAI SSE OUTPUT (original) ─────────────────────────
                 else:
                     if message_text:
@@ -5016,7 +5218,32 @@ class APIHandler(BaseHTTPRequestHandler):
                     request_id=request_id,
                 )
         except Exception as e:
-            _terminal_status("❌", f"Request {request_id} failed: {e}", indent=1)
+            _err_str = str(e).lower()
+            _is_oom = any(k in _err_str for k in ("out of memory", "memory", "allocation", "metal"))
+            if _is_oom and not generated_tokens:
+                # OOM during prefill, before any content was streamed.
+                # Send SSE error event with "prompt is too long" to trigger
+                # Claude Code's reactive compact (auto-compacts and retries).
+                _terminal_status("🧠", f"Request {request_id} OOM during prefill — sending 'prompt is too long' to trigger compact", indent=1)
+                try:
+                    _oom_error = json.dumps({
+                        "type": "error",
+                        "error": {
+                            "type": "invalid_request_error",
+                            "message": f"prompt is too long: OOM during prefill ({e})",
+                        }
+                    })
+                    self.wfile.write(f"event: error\ndata: {_oom_error}\n\n".encode("utf-8"))
+                    self.wfile.flush()
+                except Exception:
+                    pass
+                try:
+                    mx.clear_cache()
+                    import gc; gc.collect()
+                except Exception:
+                    pass
+            else:
+                _terminal_status("❌", f"Request {request_id} failed: {e}", indent=1)
             if request_logger:
                 request_logger.log("generation", f"error: {e}", request_id=request_id)
         finally:
