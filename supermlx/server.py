@@ -4183,7 +4183,9 @@ class APIHandler(BaseHTTPRequestHandler):
         rest_count = len(model_tokens)
         request_logger = None
         sampler, sampler_kwargs = _build_sampler(body)
-        max_tokens = body.get("max_tokens", SETTINGS.default_max_tokens)
+        # Always use server DEFAULT_MAX_TOKENS — Claude Code sends max_tokens=8192
+        # which truncates long code generation. We override it entirely.
+        max_tokens = SETTINGS.default_max_tokens
         is_streaming = body.get("stream", False)
 
         acquired = False
