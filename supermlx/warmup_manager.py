@@ -163,7 +163,8 @@ def save_cache(
         path.parent.mkdir(parents=True, exist_ok=True)
         arrays: Dict[str, Any] = {}
         arrays["tokens"] = mx.array(tokens, dtype=mx.int32)
-        arrays["n_layers"] = mx.array([len(prompt_cache)], dtype=mx.int32)
+        # n_kv_layers: count of layers that actually have KV cache state
+        # (hybrid models like DeltaNet/Attention have fewer KV layers than total layers)
         saved_layers = 0
         for i, layer in enumerate(prompt_cache):
             if not hasattr(layer, "keys") or layer.keys is None:
@@ -171,15 +172,26 @@ def save_cache(
             offset = int(getattr(layer, "offset", 0))
             if offset == 0:
                 continue
-            # Handle list-wrapping: some MLX cache layers store keys/values
-            # as [mx.array] (single-element list) instead of bare mx.array.
-            k_arr = layer.keys[0] if isinstance(layer.keys, list) else layer.keys
-            v_arr = layer.values[0] if isinstance(layer.values, list) else layer.values
-            # Only save the valid token slice (skip pre-allocated zeros)
-            arrays[f"k{i}"] = k_arr[..., :offset, :]
-            arrays[f"v{i}"] = v_arr[..., :offset, :]
+            is_quantized = isinstance(layer.keys, tuple)
+            if is_quantized:
+                # QuantizedKVCache: keys/values are tuples of (data, scales, biases)
+                group_size = getattr(layer, "group_size", 64)
+                bits = getattr(layer, "bits", 8)
+                arrays[f"qmeta{i}"] = mx.array([group_size, bits], dtype=mx.int32)
+                for part_idx, part in enumerate(layer.keys):
+                    arrays[f"k{i}_{part_idx}"] = part[..., :offset, :]
+                for part_idx, part in enumerate(layer.values):
+                    arrays[f"v{i}_{part_idx}"] = part[..., :offset, :]
+            else:
+                # KVCache: keys/values are plain arrays (or single-element lists)
+                k_arr = layer.keys[0] if isinstance(layer.keys, list) else layer.keys
+                v_arr = layer.values[0] if isinstance(layer.values, list) else layer.values
+                arrays[f"k{i}"] = k_arr[..., :offset, :]
+                arrays[f"v{i}"] = v_arr[..., :offset, :]
             arrays[f"o{i}"] = mx.array([offset], dtype=mx.int32)
             saved_layers += 1
+        # Save actual KV layer count (not total model layers)
+        arrays["n_layers"] = mx.array([saved_layers], dtype=mx.int32)
         # Force evaluation before writing to disk
         live = [v for v in arrays.values() if hasattr(v, "shape")]
         if live:
@@ -239,34 +251,66 @@ def load_cache(
 
         restored_layers = 0
         for i, layer in enumerate(prompt_cache):
-            k_key = f"k{i}"
-            if k_key not in arrays:
+            # Detect format: quantized (k{i}_0) vs plain (k{i})
+            is_quantized = f"k{i}_0" in arrays
+            if not is_quantized and f"k{i}" not in arrays:
                 continue
-            offset = int(arrays[f"o{i}"].tolist()[0])
+            o_key = f"o{i}"
+            if o_key not in arrays:
+                continue
+            offset = int(arrays[o_key].tolist()[0])
             if offset == 0:
                 continue
 
-            saved_k = arrays[k_key]   # shape [B, n_heads, offset, head_dim]
-            saved_v = arrays[f"v{i}"]
-
-            # Pad to KVCache step boundary (default step=256) to match internal layout
             step = int(getattr(layer, "step", 256))
             capacity = math.ceil(offset / step) * step
-            current_len = saved_k.shape[2]
-            if capacity > current_len:
-                pad_len = capacity - current_len
-                zeros_k = mx.zeros(
-                    (*saved_k.shape[:2], pad_len, saved_k.shape[3]), dtype=saved_k.dtype
-                )
-                zeros_v = mx.zeros(
-                    (*saved_v.shape[:2], pad_len, saved_v.shape[3]), dtype=saved_v.dtype
-                )
-                layer.keys = mx.concatenate([saved_k, zeros_k], axis=2)
-                layer.values = mx.concatenate([saved_v, zeros_v], axis=2)
+
+            if is_quantized:
+                # QuantizedKVCache format: restore tuples + convert layer type
+                qmeta = arrays.get(f"qmeta{i}")
+                group_size = int(qmeta.tolist()[0]) if qmeta is not None else 64
+                bits = int(qmeta.tolist()[1]) if qmeta is not None else 8
+
+                def _pad_parts(prefix: str) -> tuple:
+                    parts = []
+                    for p in range(3):
+                        arr = arrays[f"{prefix}{i}_{p}"]
+                        current_len = arr.shape[2]
+                        if capacity > current_len:
+                            pad = mx.zeros(
+                                (*arr.shape[:2], capacity - current_len, arr.shape[3]),
+                                dtype=arr.dtype,
+                            )
+                            arr = mx.concatenate([arr, pad], axis=2)
+                        parts.append(arr)
+                    return tuple(parts)
+
+                # Replace the KVCache layer with a QuantizedKVCache
+                from mlx_lm.models.cache import QuantizedKVCache
+                qlayer = QuantizedKVCache(group_size=group_size, bits=bits)
+                qlayer.keys = _pad_parts("k")
+                qlayer.values = _pad_parts("v")
+                qlayer.offset = offset
+                prompt_cache[i] = qlayer
             else:
-                layer.keys = saved_k
-                layer.values = saved_v
-            layer.offset = offset
+                # Plain KVCache format
+                saved_k = arrays[f"k{i}"]
+                saved_v = arrays[f"v{i}"]
+                current_len = saved_k.shape[2]
+                if capacity > current_len:
+                    pad_len = capacity - current_len
+                    zeros_k = mx.zeros(
+                        (*saved_k.shape[:2], pad_len, saved_k.shape[3]), dtype=saved_k.dtype
+                    )
+                    zeros_v = mx.zeros(
+                        (*saved_v.shape[:2], pad_len, saved_v.shape[3]), dtype=saved_v.dtype
+                    )
+                    layer.keys = mx.concatenate([saved_k, zeros_k], axis=2)
+                    layer.values = mx.concatenate([saved_v, zeros_v], axis=2)
+                else:
+                    layer.keys = saved_k
+                    layer.values = saved_v
+                layer.offset = offset
             restored_layers += 1
 
         # Force GPU evaluation of all reconstructed tensors
@@ -281,13 +325,14 @@ def load_cache(
             "💾",
             f"DPC: disk cache loaded | layers={restored_layers} | tokens={len(tokens)}",
         )
-        # Guard: if not ALL layers were restored (hybrid model: ArraysCache + KVCache),
-        # the cache is inconsistent and will cause broadcast shape errors.
-        total_layers = len(prompt_cache)
-        if restored_layers < total_layers:
+        # Guard: restored layers must match what was originally saved.
+        # Hybrid models (DeltaNet/Attention) save fewer layers than total model layers
+        # because DeltaNet layers use recurrent state, not KV cache.
+        expected_kv_layers = int(arrays["n_layers"].tolist()[0]) if "n_layers" in arrays else total_layers
+        if restored_layers < expected_kv_layers:
             _log(
                 "⚠️",
-                f"DPC: partial cache ({restored_layers}/{total_layers} layers) — "
+                f"DPC: partial cache ({restored_layers}/{expected_kv_layers} kv-layers) — "
                 f"discarding to avoid shape mismatch. Will cold-start.",
             )
             return None, None
