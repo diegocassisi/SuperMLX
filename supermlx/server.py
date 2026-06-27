@@ -1907,10 +1907,9 @@ def _vlm_sync_before_generation(pixel_values: Any, mask: Any) -> None:
 def _metal_mem_str() -> str:
     """Return a compact Metal memory status string. Best-effort, never raises."""
     try:
-        import mlx.core as mx
-        active_gb = mx.metal.get_active_memory() / 1e9
-        peak_gb = mx.metal.get_peak_memory() / 1e9
-        cache_gb = mx.metal.get_cache_memory() / 1e9
+        active_gb = mx.get_active_memory() / 1e9
+        peak_gb = mx.get_peak_memory() / 1e9
+        cache_gb = mx.get_cache_memory() / 1e9
         return f"metal={active_gb:.2f}GB peak={peak_gb:.2f}GB cache={cache_gb:.2f}GB"
     except Exception:
         return ""
@@ -4597,6 +4596,18 @@ class APIHandler(BaseHTTPRequestHandler):
                         f"EMERGENCY COMPRESSOR: pipeline re-done | new rest_tokens={rest_count} | "
                         f"cache_hit={cache_match_type} | matched={matched_prefix_len}/{len(prompt_tokens)}")
 
+            # ── DIAGNOSTIC: prompt_tokens vs model_tokens divergence ──────
+            # FIXME: temporary — remove after diagnosing 146K vs 34K bug on dense models
+            if prompt_tokens and model_tokens and abs(len(prompt_tokens) - len(model_tokens)) > len(model_tokens) * 0.5:
+                _terminal_status("🔍",
+                    f"TOKEN DIVERGENCE: prompt_tokens={len(prompt_tokens)} model_tokens={len(model_tokens)} "
+                    f"ratio={len(prompt_tokens)/max(1,len(model_tokens)):.2f}x | "
+                    f"pt_type={type(prompt_tokens).__name__} mt_type={type(model_tokens).__name__} | "
+                    f"pt[0]={prompt_tokens[0] if prompt_tokens else '?'} (type={type(prompt_tokens[0]).__name__ if prompt_tokens else '?'}) | "
+                    f"mt[0]={model_tokens[0] if model_tokens else '?'} (type={type(model_tokens[0]).__name__ if model_tokens else '?'}) | "
+                    f"cache_prompt_type={type(cache_prompt).__name__ if 'cache_prompt' in dir() else 'N/A'} "
+                    f"cache_prompt_len={len(cache_prompt) if 'cache_prompt' in dir() and cache_prompt else 'N/A'}")
+
             # ── COMPACT GUARD: OVERFLOW + MEMORY PRESSURE ─────────────────
             # Applies to ALL requests unconditionally (including Anthropic).
             # Prevents OOM crashes by rejecting oversized prefills before they start.
@@ -4612,9 +4623,12 @@ class APIHandler(BaseHTTPRequestHandler):
                     if _get_mem:
                         _active_gb = _get_mem() / 1e9
                         _threshold_gb = float(os.environ.get("MEMORY_COMPACT_THRESHOLD_GB", "21.0"))
-                        if _active_gb > _threshold_gb and len(prompt_tokens) > 80000:
+                        # Use model_tokens (actual token count) not prompt_tokens
+                        # (canonical cache key, can be inflated by scrub masking).
+                        _real_token_count = len(model_tokens) if model_tokens else len(prompt_tokens)
+                        if _active_gb > _threshold_gb and _real_token_count > 80000:
                             _memory_pressure = True
-                            _pressure_reason = f"metal={_active_gb:.1f}GB > {_threshold_gb}GB threshold (prompt={len(prompt_tokens)} tokens)"
+                            _pressure_reason = f"metal={_active_gb:.1f}GB > {_threshold_gb}GB threshold (prompt={_real_token_count} tokens)"
                 except Exception:
                     pass
 
@@ -4788,7 +4802,7 @@ class APIHandler(BaseHTTPRequestHandler):
                         progress_last_at = time.time()
                         _terminal_status(
                             "⏳",
-                            f"Request {request_id} in progress | generated_tokens={len(generated_tokens)}",
+                            f"Request {request_id} in progress | generated_tokens={len(generated_tokens)} | {_metal_mem_str()}",
                             indent=1,
                         )
                 response_text = "".join(generated_parts)
@@ -5039,7 +5053,7 @@ class APIHandler(BaseHTTPRequestHandler):
                             progress_last_at = time.time()
                             _terminal_status(
                                 "⏳",
-                                f"Request {request_id} in progress | generated_tokens={len(generated_tokens)}",
+                                f"Request {request_id} in progress | generated_tokens={len(generated_tokens)} | {_metal_mem_str()}",
                                 indent=1,
                             )
                 finally:
@@ -5351,7 +5365,16 @@ class APIHandler(BaseHTTPRequestHandler):
                             )
                     except (ImportError, Exception):
                         pass
-                    _terminal_status("✅", _req_log + _moe_suffix, indent=1)
+                    # Metal memory snapshot — monitor fragmentation and pressure
+                    _mem_suffix = ""
+                    try:
+                        _m_active = mx.get_active_memory() / 1e9
+                        _m_cache = mx.get_cache_memory() / 1e9
+                        _m_peak = mx.get_peak_memory() / 1e9
+                        _mem_suffix = f" | mem={_m_active:.1f}GB active/{_m_cache:.1f}GB cache/{_m_peak:.1f}GB peak"
+                    except Exception:
+                        pass
+                    _terminal_status("✅", _req_log + _moe_suffix + _mem_suffix, indent=1)
                 else:
                     _terminal_status(
                         "✅",

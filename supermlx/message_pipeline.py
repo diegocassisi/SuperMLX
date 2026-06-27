@@ -460,8 +460,17 @@ def _scrub_cache_key(prompt: str, canonicalize: bool = True) -> str:
     if not canonicalize:
         return prompt
 
+    # Use a repeating word that tokenizes efficiently (~4 chars/token, like
+    # normal text) instead of single "0" chars which tokenize ~1:1 and inflate
+    # the canonical token count by 4x on large system-reminder blocks.
+    _MASK_WORD = "MASK"
+    _MASK_WORD_LEN = len(_MASK_WORD)
+
     def _mask(match):
-        return "0" * len(match.group(0))
+        n = len(match.group(0))
+        repeats = n // _MASK_WORD_LEN
+        remainder = n % _MASK_WORD_LEN
+        return _MASK_WORD * repeats + "0" * remainder
 
     normalized = CACHE_TIME_PATTERN.sub(_mask, prompt)
     normalized = CACHE_TIME_COLON_PATTERN.sub(_mask, normalized)
