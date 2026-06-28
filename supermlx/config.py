@@ -116,6 +116,8 @@ class Settings:
     default_min_p: float
     default_repetition_penalty: float
     default_repetition_context_size: int
+    default_presence_penalty: float
+    default_presence_context_size: int
     default_max_tokens: int
     enable_request_logging: bool
     default_thinking: bool
@@ -217,6 +219,8 @@ def build_settings(script_dir: Path = Path(__file__).parent) -> Settings:
         default_repetition_context_size=_env_int(
             "DEFAULT_REPETITION_CONTEXT_SIZE", 512
         ),
+        default_presence_penalty=_env_float("DEFAULT_PRESENCE_PENALTY", 0.0),
+        default_presence_context_size=_env_int("DEFAULT_PRESENCE_CONTEXT_SIZE", 20),
         default_max_tokens=_env_int("DEFAULT_MAX_TOKENS", 2048),
         enable_request_logging=_env_bool("ENABLE_REQUEST_LOGGING", True),
         default_thinking=_env_bool("DEFAULT_THINKING", True),

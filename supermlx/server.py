@@ -2391,6 +2391,12 @@ def _build_sampler(body):
         "repetition_context_size": body.get(
             "repetition_context_size", SETTINGS.default_repetition_context_size
         ),
+        "presence_penalty": body.get(
+            "presence_penalty", SETTINGS.default_presence_penalty
+        ),
+        "presence_context_size": body.get(
+            "presence_context_size", SETTINGS.default_presence_context_size
+        ),
     }
 
     # Some mlx_lm versions don't support all params. Drop unsupported keys progressively.
@@ -4345,10 +4351,14 @@ class APIHandler(BaseHTTPRequestHandler):
                                 else:
                                     _suffix_len = _m_len
                                     prompt_cache = None
+                                    PROMPT_CACHE.evict_unpinned()
+                                    gc.collect()
                             else:
                                 # No frozen cache available — full re-prefill is the only safe option.
                                 _suffix_len = _m_len
                                 prompt_cache = None
+                                PROMPT_CACHE.evict_unpinned()
+                                gc.collect()
                         else:
                             _suffix_len = max(1, len(prompt_tokens) - matched_prefix_len)
                             
@@ -4388,6 +4398,8 @@ class APIHandler(BaseHTTPRequestHandler):
                                 _HYBRID_WASH_KV_LIMIT = 100_000
                                 if _kv_off is not None and _kv_off > _HYBRID_WASH_KV_LIMIT:
                                     prompt_cache = None
+                                    PROMPT_CACHE.evict_unpinned()
+                                    gc.collect()
                                     rest_tokens = model_tokens
                                     _terminal_status("⚠️",
                                         f"FIX-31 v9: KV too large for hybrid wash "
