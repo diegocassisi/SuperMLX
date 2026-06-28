@@ -1915,6 +1915,32 @@ def _metal_mem_str() -> str:
         return ""
 
 
+# Threshold (tokens) above which we run aggressive memory relief before prefill
+_PREFILL_MEMORY_RELIEF_THRESHOLD = 20000
+
+def _pre_prefill_memory_relief(request_id: str, rest_count: int) -> None:
+    """Free OS and Metal memory before large prefills to reduce peak pressure.
+
+    Runs gc.collect + mx.metal.clear_cache + malloc_zone_pressure_relief
+    (macOS-specific: tells the C allocator to return freed pages to the OS).
+    Only triggers for prefills above _PREFILL_MEMORY_RELIEF_THRESHOLD tokens.
+    """
+    if rest_count < _PREFILL_MEMORY_RELIEF_THRESHOLD:
+        return
+    import gc as _gc
+    _gc.collect()
+    mx.metal.clear_cache()
+    # macOS: return freed malloc pages to the OS
+    try:
+        import ctypes
+        _libc = ctypes.CDLL("libSystem.dylib")
+        _libc.malloc_zone_pressure_relief(0, 0)
+    except Exception:
+        pass  # Non-macOS or ctypes unavailable
+    _pipeline_log("METAL", request_id,
+        f"PRE_PREFILL_RELIEF: gc+metal_clear+malloc_pressure | rest={rest_count} | {_metal_mem_str()}")
+
+
 def _start_prefill_progress(
     request_id: str, rest_count: int, log_fn=None, rate: int = 300
 ) -> Tuple[threading.Event, Optional[threading.Thread]]:
@@ -4788,6 +4814,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     self.send_header("X-Pipeline-Heal-Ms", f"{_pipeline_timings.get('heal', 0):.1f}")
                 self.end_headers()
 
+                _pre_prefill_memory_relief(request_id, rest_count)
                 _prefill_done, _prefill_thread = _start_prefill_progress(request_id, rest_count)
 
                 generated_parts = []
@@ -5010,6 +5037,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 )
                 _keepalive_thread.start()
 
+                _pre_prefill_memory_relief(request_id, rest_count)
                 _prefill_done_s, _ = _start_prefill_progress(request_id, rest_count)
 
                 raw_parts = []
