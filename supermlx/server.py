@@ -1969,11 +1969,12 @@ def _start_prefill_progress(
             elapsed = time.time() - start
             pct = min(99, (elapsed / est_total) * 100) if est_total > 0 else 0
             eta = max(0, est_total - elapsed)
+            _est_tps = rest_count / elapsed if elapsed > 0 else 0
             _log(
                 "🔄",
                 f"Request {request_id} PREFILL | {pct:.0f}% | "
                 f"{elapsed:.0f}s/{est_total:.0f}s | ~{eta:.0f}s remaining | "
-                f"tokens={rest_count} | {_metal_mem_str()}",
+                f"{_est_tps:.0f} tok/s | tokens={rest_count} | {_metal_mem_str()}",
                 indent=1,
             )
 
@@ -4860,9 +4861,10 @@ class APIHandler(BaseHTTPRequestHandler):
                         and (time.time() - progress_last_at) >= 1.0
                     ):
                         progress_last_at = time.time()
+                        _decode_tps = len(generated_tokens) / (time.time() - first_token_at) if first_token_at else 0
                         _terminal_status(
                             "⏳",
-                            f"Request {request_id} in progress | generated_tokens={len(generated_tokens)} | {_metal_mem_str()}",
+                            f"Request {request_id} in progress | generated_tokens={len(generated_tokens)} | {_decode_tps:.1f} tok/s | {_metal_mem_str()}",
                             indent=1,
                         )
                 response_text = "".join(generated_parts)
@@ -5132,9 +5134,10 @@ class APIHandler(BaseHTTPRequestHandler):
                             and (time.time() - progress_last_at) >= 1.0
                         ):
                             progress_last_at = time.time()
+                            _decode_tps = len(generated_tokens) / (time.time() - first_token_at) if first_token_at else 0
                             _terminal_status(
                                 "⏳",
-                                f"Request {request_id} in progress | generated_tokens={len(generated_tokens)} | {_metal_mem_str()}",
+                                f"Request {request_id} in progress | generated_tokens={len(generated_tokens)} | {_decode_tps:.1f} tok/s | {_metal_mem_str()}",
                                 indent=1,
                             )
                 finally:
