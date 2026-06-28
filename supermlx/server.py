@@ -1921,7 +1921,7 @@ _PREFILL_MEMORY_RELIEF_THRESHOLD = 20000
 def _pre_prefill_memory_relief(request_id: str, rest_count: int) -> None:
     """Free OS and Metal memory before large prefills to reduce peak pressure.
 
-    Runs gc.collect + mx.metal.clear_cache + malloc_zone_pressure_relief
+    Runs gc.collect + mx.clear_cache + malloc_zone_pressure_relief
     (macOS-specific: tells the C allocator to return freed pages to the OS).
     Only triggers for prefills above _PREFILL_MEMORY_RELIEF_THRESHOLD tokens.
     """
@@ -1929,7 +1929,7 @@ def _pre_prefill_memory_relief(request_id: str, rest_count: int) -> None:
         return
     import gc as _gc
     _gc.collect()
-    mx.metal.clear_cache()
+    mx.clear_cache()
     # macOS: return freed malloc pages to the OS
     try:
         import ctypes
