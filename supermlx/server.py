@@ -1927,6 +1927,7 @@ def _pre_prefill_memory_relief(request_id: str, rest_count: int) -> None:
     """
     if rest_count < _PREFILL_MEMORY_RELIEF_THRESHOLD:
         return
+    _mem_before = _metal_mem_str()
     import gc as _gc
     _gc.collect()
     mx.clear_cache()
@@ -1937,8 +1938,10 @@ def _pre_prefill_memory_relief(request_id: str, rest_count: int) -> None:
         _libc.malloc_zone_pressure_relief(0, 0)
     except Exception:
         pass  # Non-macOS or ctypes unavailable
+    _mem_after = _metal_mem_str()
     _pipeline_log("METAL", request_id,
-        f"PRE_PREFILL_RELIEF: gc+metal_clear+malloc_pressure | rest={rest_count} | {_metal_mem_str()}")
+        f"PRE_PREFILL_RELIEF: gc+clear_cache+malloc_pressure | "
+        f"rest={rest_count} | before={_mem_before} | after={_mem_after}")
 
 
 def _start_prefill_progress(
