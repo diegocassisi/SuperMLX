@@ -4791,6 +4791,9 @@ class APIHandler(BaseHTTPRequestHandler):
                 _prefill_done, _prefill_thread = _start_prefill_progress(request_id, rest_count)
 
                 generated_parts = []
+                _thinking_token_count_ns = 0
+                _in_think_ns = False
+                _max_thinking_ns = SETTINGS.max_thinking_tokens
                 progress_last_at = time.time()
                 for response in _stream_generate_unified(
                     rest_tokens,
@@ -4807,6 +4810,21 @@ class APIHandler(BaseHTTPRequestHandler):
                     if first_token_at is None:
                         first_token_at = time.time()
                         _prefill_done.set()  # Stop prefill progress
+                    # Track think state for token limit
+                    if "<think>" in response.text:
+                        _in_think_ns = True
+                    if "</think>" in response.text:
+                        _in_think_ns = False
+                    if _in_think_ns and _max_thinking_ns > 0:
+                        _thinking_token_count_ns += 1
+                        if _thinking_token_count_ns >= _max_thinking_ns:
+                            _terminal_status(
+                                "🛑",
+                                f"THINKING LIMIT: {_thinking_token_count_ns} tokens in <think> "
+                                f"(limit={_max_thinking_ns}). Breaking generation.",
+                                indent=1,
+                            )
+                            break
                     if (
                         len(generated_tokens) % 64 == 0
                         and (time.time() - progress_last_at) >= 1.0
@@ -4995,6 +5013,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 _prefill_done_s, _ = _start_prefill_progress(request_id, rest_count)
 
                 raw_parts = []
+                _thinking_token_count = 0
+                _max_thinking = SETTINGS.max_thinking_tokens  # 0=unlimited
 
                 progress_last_at = time.time()
                 try:
@@ -5013,6 +5033,24 @@ class APIHandler(BaseHTTPRequestHandler):
                             first_token_at = time.time()
                             _prefill_done_s.set()  # Stop prefill progress
                         response_text = response.text
+
+                        # ── THINKING TOKEN LIMIT ──────────────────────────
+                        # Count tokens while still inside <think> block.
+                        # When limit is exceeded, break generation to prevent
+                        # circular reasoning loops that produce 0 output.
+                        if not _anthropic_think_done and _max_thinking > 0:
+                            _thinking_token_count += 1
+                            if _thinking_token_count >= _max_thinking:
+                                _terminal_status(
+                                    "🛑",
+                                    f"THINKING LIMIT: {_thinking_token_count} tokens in <think> block "
+                                    f"(limit={_max_thinking}). Forcing generation stop.",
+                                    indent=1,
+                                )
+                                _pipeline_log("GEN", request_id,
+                                    f"THINKING_LIMIT_HIT: {_thinking_token_count} thinking tokens, "
+                                    f"limit={_max_thinking}. Breaking generation loop.")
+                                break
                         if response_text:
                             raw_parts.append(response_text)
                             # ── ANTHROPIC LIVE STREAMING ─────────────────────

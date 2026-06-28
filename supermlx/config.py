@@ -121,6 +121,7 @@ class Settings:
     default_max_tokens: int
     enable_request_logging: bool
     default_thinking: bool
+    max_thinking_tokens: int            # Max tokens in <think> block before forcing transition (0=unlimited)
     vlm_cache_debug: bool
     normalize_write_tool_content_for_prompt: bool
     cache_canonicalize_tool_context: bool
@@ -224,6 +225,7 @@ def build_settings(script_dir: Path = Path(__file__).parent) -> Settings:
         default_max_tokens=_env_int("DEFAULT_MAX_TOKENS", 2048),
         enable_request_logging=_env_bool("ENABLE_REQUEST_LOGGING", True),
         default_thinking=_env_bool("DEFAULT_THINKING", True),
+        max_thinking_tokens=_env_int("MAX_THINKING_TOKENS", 4096),
         vlm_cache_debug=_env_bool("VLM_CACHE_DEBUG", False),
         normalize_write_tool_content_for_prompt=_env_bool(
             "NORMALIZE_WRITE_TOOL_CONTENT_FOR_PROMPT", False
