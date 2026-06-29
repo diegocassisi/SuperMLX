@@ -29,6 +29,8 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from . import ssd_prefetch
+
 logger = logging.getLogger(__name__)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -157,7 +159,24 @@ class SafetensorsMap:
     def __getitem__(self, key: str) -> mx.array:
         return self.get_tensor(key)
 
+    def prefetch_experts(
+        self,
+        key_base: str,
+        expert_ids: List[int],
+        proj_names: tuple = _PROJ_NAMES,
+    ) -> None:
+        """Async prefetch expert byte ranges via F_RDADVISE.
+
+        Issues read-ahead hints to macOS kernel so pages are warm
+        in the page cache before the subsequent get_expert_slices call.
+        Non-blocking, fire-and-forget. Safe to call anytime.
+        """
+        ssd_prefetch.prefetch_experts(
+            self._index, self._fds, key_base, expert_ids, proj_names,
+        )
+
     def close(self):
+        ssd_prefetch.shutdown()
         for mm in self._mmaps.values():
             mm.close()
         for fd in self._fds.values():
@@ -379,8 +398,16 @@ class PredictiveExpertCache:
         if not swaps:
             return {"swaps": 0, "fallbacks": n_fallbacks, "requests": n_requests}
 
+        # Prefetch byte ranges before loading — warms page cache via F_RDADVISE
+        swap_eids = [new_eid for _, _, new_eid in swaps]
+        if self._st_map is not None:
+            for proj_name in _PROJ_NAMES:
+                key_prefix = self._key_prefixes.get(proj_name)
+                if key_prefix:
+                    self._st_map.prefetch_experts(key_prefix, swap_eids, (proj_name,))
+
         # Load new experts and swap into stacked tensors
-        new_eids = mx.array([new_eid for _, _, new_eid in swaps])
+        new_eids = mx.array(swap_eids)
         slot_indices = mx.array([slot for slot, _, _ in swaps])
         for proj_name in _PROJ_NAMES:
             key_prefix = self._key_prefixes[proj_name]
@@ -388,7 +415,7 @@ class PredictiveExpertCache:
             s_key = f"{key_prefix}.scales"
             b_key = f"{key_prefix}.biases"
 
-            # Load via mmap (byte-level slice)
+            # Load via mmap — pages pre-warmed by F_RDADVISE above
             new_w = self._st_map.get_expert_slices(w_key, new_eids)
             new_s = self._st_map.get_expert_slices(s_key, new_eids)
             new_b = self._st_map.get_expert_slices(b_key, new_eids) if b_key in self._st_map else None
@@ -817,9 +844,22 @@ def enable_moe_cache(
 
     # ── Pass 2: Load expert weights ──────────────────────────────────────
     # Load from SafetensorsMap via byte-level mmap slicing into caches.
+    # F_RDADVISE prefetch: while loading layer N, prefetch layer N+1's
+    # byte ranges so pages are warm when we get there.
     total_expert_tensors = 0
-    for i, (pred_cache, cached_ids) in layer_caches.items():
+    layer_indices = list(layer_caches.keys())
+    for idx, i in enumerate(layer_indices):
+        pred_cache, cached_ids = layer_caches[i]
         expert_ids_arr = np.array(cached_ids, dtype=np.int32)
+
+        # Prefetch NEXT layer's byte ranges while this layer loads
+        if idx + 1 < len(layer_indices):
+            next_i = layer_indices[idx + 1]
+            next_cache, next_ids = layer_caches[next_i]
+            for proj_name in _PROJ_NAMES:
+                kp = next_cache._key_prefixes.get(proj_name)
+                if kp:
+                    st_map.prefetch_experts(kp, next_ids, (proj_name,))
 
         for proj_name in _PROJ_NAMES:
             key_prefix = pred_cache._key_prefixes.get(proj_name)
@@ -877,6 +917,7 @@ def enable_moe_cache(
     elapsed = time.time() - t0
     active_gb = mx.get_active_memory() / 1e9
 
+    prefetch_stats = ssd_prefetch.get_stats()
     stats = {
         "moe_layers": moe_layers,
         "num_experts": num_experts,
@@ -887,6 +928,8 @@ def enable_moe_cache(
         "expert_tensors_loaded": total_expert_tensors,
         "elapsed_seconds": round(elapsed, 1),
         "active_memory_gb": round(active_gb, 1),
+        "prefetch_issued": prefetch_stats["issued"],
+        "prefetch_failed": prefetch_stats["failed"],
     }
 
     logger.info(
@@ -966,6 +1009,12 @@ def expand_expert_capacity(
             continue
 
         new_eids_arr = np.array(new_ids, dtype=np.int32)
+
+        # Prefetch byte ranges before loading from SSD
+        for proj_name in _PROJ_NAMES:
+            kp = cache._key_prefixes.get(proj_name)
+            if kp:
+                st_map.prefetch_experts(kp, new_ids, (proj_name,))
 
         # Expand stacked tensors for each projection
         for proj_name in _PROJ_NAMES:
