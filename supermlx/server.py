@@ -1916,7 +1916,7 @@ def _metal_mem_str() -> str:
 
 
 # Threshold (tokens) above which we run aggressive memory relief before prefill
-_PREFILL_MEMORY_RELIEF_THRESHOLD = 20000
+_PREFILL_MEMORY_RELIEF_THRESHOLD = 10000
 
 def _pre_prefill_memory_relief(request_id: str, rest_count: int) -> None:
     """Free OS and Metal memory before large prefills to reduce peak pressure.
