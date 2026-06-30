@@ -55,18 +55,24 @@ def init(cache_persist_path: str) -> None:
     logger.info("[CONFIG] tool_prefix_cache dir=%s", _cache_dir)
 
 
-def compute_tools_hash(system_body: str, tools: List[Dict]) -> str:
+def compute_tools_hash(system_body: str, tools: List[Dict], kv_bits: Optional[int] = None) -> str:
     """
-    Compute a stable MD5 hash over the system body + tool definitions.
+    Compute a stable MD5 hash over the system body + tool definitions + kv_bits.
 
     Args:
         system_body: System prompt text (billing header stripped).
         tools: Tool definition list from the inbound request.
+        kv_bits: KV cache quantization bits (None, 4, or 8). Included in hash
+                 so changing quantization invalidates the cached prefix.
 
     Returns:
         Hex MD5 string.
     """
-    payload = system_body + "\x00" + json.dumps(tools, sort_keys=True, ensure_ascii=False)
+    payload = (
+        system_body + "\x00"
+        + json.dumps(tools, sort_keys=True, ensure_ascii=False) + "\x00"
+        + str(kv_bits)
+    )
     return hashlib.md5(payload.encode("utf-8")).hexdigest()
 
 
@@ -269,7 +275,7 @@ def get_prefix_cache_clone(
         logger.warning("[DECISION] tool_prefix_cache not initialized — skipping")
         return None, None, False
 
-    current_hash = compute_tools_hash(system_body, tools)
+    current_hash = compute_tools_hash(system_body, tools, kv_bits=kv_bits)
 
     if _prefix_hash != current_hash or _prefix_cache is None:
         reason = "hash_mismatch" if _prefix_cache is not None else "cold_start"

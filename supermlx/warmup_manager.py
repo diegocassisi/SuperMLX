@@ -172,7 +172,9 @@ def save_cache(
             offset = int(getattr(layer, "offset", 0))
             if offset == 0:
                 continue
-            is_quantized = isinstance(layer.keys, tuple)
+            # tree_map converts tuples to lists, so check both types.
+            # QuantizedKVCache stores keys/values as 3-element sequences (data, scales, biases).
+            is_quantized = isinstance(layer.keys, (tuple, list)) and len(layer.keys) == 3
             if is_quantized:
                 # QuantizedKVCache: keys/values are tuples of (data, scales, biases)
                 group_size = getattr(layer, "group_size", 64)

@@ -5406,6 +5406,13 @@ class APIHandler(BaseHTTPRequestHandler):
             if request_logger:
                 request_logger.log("generation", f"error: {e}", request_id=request_id)
         finally:
+            # Cancel prefill progress threads (may still be running if generation
+            # failed before producing the first token).
+            for _evt_name in ("_prefill_done", "_prefill_done_s"):
+                _evt = locals().get(_evt_name)
+                if _evt is not None:
+                    _evt.set()
+
             if generation_started_at is not None:
                 end_at = time.time()
                 elapsed = max(end_at - generation_started_at, 1e-9)
