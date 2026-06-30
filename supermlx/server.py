@@ -2019,12 +2019,14 @@ def _post_generation_cache_update(
     _cache_hit_ratio = matched_prefix_len / max(len(prompt_tokens), 1) if prompt_tokens else 1.0
 
     if not is_embedded_agent:
-        # MAIN: detect real startup for disk cache auto-save
-        _last_msg_content = str(messages[-1].get("content", ""))
+        # MAIN: any first-turn request with enough tokens qualifies for warmup save.
+        # The old _STARTUP_MSG_PATTERN required phrases like "/new" or "session startup"
+        # that Claude Code never sends — so warmup_cache.safetensors was never created.
+        # Now: messages==2 (first turn) AND no cache on disk yet (or hash invalidated).
+        # The 5000-token guard in _insert_cache_entries still filters noise.
         _is_real_startup = (
             len(messages) == 2
-            and bool(_STARTUP_MSG_PATTERN.search(_last_msg_content))
-            and "filename slug" not in _last_msg_content.lower()
+            and not _DPC.disk_cache_saved
         )
         _insert_cache_entries(
             model_name=SETTINGS.model_path,
