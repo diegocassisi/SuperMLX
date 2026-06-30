@@ -2346,7 +2346,11 @@ def _insert_cache_entries(
                     _save_cache = None
             if _save_cache is not None:
                 # DPC: compute prefix hash from the prompt-only tokens for auto-healing
-                _prefix_hash = _wm.compute_prefix_hash(_prompt_only_key)
+                _prefix_hash = _wm.compute_prefix_hash(
+                    _prompt_only_key,
+                    model_path=SETTINGS.model_path,
+                    kv_bits=SETTINGS.kv_bits,
+                )
                 threading.Thread(
                     target=_warmup_save_cache,
                     args=(_prompt_only_key, _save_cache, persist_path),
