@@ -4804,25 +4804,6 @@ class APIHandler(BaseHTTPRequestHandler):
                 f"stream={body.get('stream', False)} | thinking={enable_thinking}",
             )
 
-            # ── 0-HIT EVICTION: free unpinned cache before cold prefill ─────
-            # Now that the cache lookup is complete and cache_match_type is
-            # definitive, evict unpinned entries if this is a full miss.
-            # Building a new KV cache from scratch with stale entries in GPU
-            # memory only wastes headroom during the prefill.
-            if cache_match_type == "miss" and rest_count > 0:
-                with prompt_cache_lock:
-                    _evicted_main = PROMPT_CACHE.evict_unpinned()
-                    _evicted_compact = PROMPT_CACHE_COMPACT.evict_unpinned()
-                _total_evicted = _evicted_main + _evicted_compact
-                if _total_evicted > 0:
-                    mx.clear_cache()
-                    _pipeline_log(
-                        "CACHE", request_id,
-                        f"0-hit eviction: freed {_total_evicted} unpinned entries "
-                        f"(main={_evicted_main} compact={_evicted_compact}) "
-                        f"before cold prefill | {_metal_mem_str()}",
-                    )
-
             # ── DPC: Auto-capture is handled by auto-save + prefix hash in
             # _insert_cache_entries → no need for seed file refresh. ────────
 
