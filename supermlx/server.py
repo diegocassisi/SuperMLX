@@ -1962,21 +1962,43 @@ def _start_prefill_progress(
             f"tokens={rest_count} | {_metal_mem_str()}",
             indent=1,
         )
+        
+        try:
+            last_cleared_mem = mx.get_active_memory()
+        except Exception:
+            last_cleared_mem = 0
+            
+        last_log_time = start
+        
         while not done.is_set():
-            done.wait(5.0)
+            done.wait(0.5)
             if done.is_set():
                 break
+                
+            # --- MEMORY-DRIVEN INTRA-PREFILL RELIEF ---
+            try:
+                current_mem = mx.get_active_memory()
+                if last_cleared_mem > 0 and current_mem - last_cleared_mem >= 600 * 1024 * 1024:  # 600 MB threshold
+                    mx.clear_cache()
+                    _log("🧹", f"Memory Guard: Purged intra-prefill transient memory. Was {current_mem/1e9:.2f}GB", indent=2)
+                    last_cleared_mem = mx.get_active_memory()
+            except Exception:
+                pass  # Avoid silent thread death
+            # ------------------------------------------
+
             elapsed = time.time() - start
-            pct = min(99, (elapsed / est_total) * 100) if est_total > 0 else 0
-            eta = max(0, est_total - elapsed)
-            _est_tps = rest_count / elapsed if elapsed > 0 else 0
-            _log(
-                "🔄",
-                f"Request {request_id} PREFILL | {pct:.0f}% | "
-                f"{elapsed:.0f}s/{est_total:.0f}s | ~{eta:.0f}s remaining | "
-                f"{_est_tps:.0f} tok/s | tokens={rest_count} | {_metal_mem_str()}",
-                indent=1,
-            )
+            if time.time() - last_log_time >= 5.0:
+                pct = min(99, (elapsed / est_total) * 100) if est_total > 0 else 0
+                eta = max(0, est_total - elapsed)
+                _est_tps = rest_count / elapsed if elapsed > 0 else 0
+                _log(
+                    "🔄",
+                    f"Request {request_id} PREFILL | {pct:.0f}% | "
+                    f"{elapsed:.0f}s/{est_total:.0f}s | ~{eta:.0f}s remaining | "
+                    f"{_est_tps:.0f} tok/s | tokens={rest_count} | {_metal_mem_str()}",
+                    indent=1,
+                )
+                last_log_time = time.time()
 
     t = threading.Thread(target=_progress, daemon=True)
     t.start()

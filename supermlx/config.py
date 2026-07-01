@@ -211,7 +211,8 @@ def build_settings(script_dir: Path = Path(__file__).parent) -> Settings:
         kv_group_size=_env_int("KV_GROUP_SIZE", 64),
         kv_bits=_env_kv_bits("KV_BITS", None),
         kv_quant_scheme=_env_str("KV_QUANT_SCHEME", "uniform"),
-        quantized_kv_start=_env_int("QUANTIZED_KV_START", 5000),
+        #cambiado por diego, original 50
+        quantized_kv_start=_env_int("QUANTIZED_KV_START", 0),
         default_temperature=_env_float("DEFAULT_TEMPERATURE", 0.6),
         default_top_p=_env_float("DEFAULT_TOP_P", 0.95),
         default_top_k=_env_int("DEFAULT_TOP_K", 20),
