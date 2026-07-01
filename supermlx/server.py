@@ -4500,6 +4500,25 @@ class APIHandler(BaseHTTPRequestHandler):
                 rest_tokens = model_tokens
                 rest_count = len(rest_tokens)
 
+            # ── 0-HIT EVICTION: free unpinned cache before cold prefill ─────
+            # When matched_prefix_len == 0, the existing cached KV states are
+            # useless for this request. We are about to build a new KV cache
+            # from scratch. Keeping unpinned entries in GPU memory only
+            # competes with the new prefill allocation → evict them now.
+            if matched_prefix_len == 0 and rest_count > 0:
+                with prompt_cache_lock:
+                    _evicted_main = PROMPT_CACHE.evict_unpinned()
+                    _evicted_compact = PROMPT_CACHE_COMPACT.evict_unpinned()
+                _total_evicted = _evicted_main + _evicted_compact
+                if _total_evicted > 0:
+                    mx.clear_cache()
+                    _pipeline_log(
+                        "CACHE", request_id,
+                        f"0-hit eviction: freed {_total_evicted} unpinned entries "
+                        f"(main={_evicted_main} compact={_evicted_compact}) "
+                        f"before cold prefill | {_metal_mem_str()}",
+                    )
+
             if prompt_cache is None:
                 cache_model = (
                     model.language_model
