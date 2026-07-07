@@ -80,8 +80,7 @@ warmup_manager.py handles DPC. rag_enricher.py handles RAG/Compressor.
   KV Cache:
     MAX_KV_SIZE                     (196608)    Max tokens per session
     PROMPT_CACHE_MAX_ENTRIES_GLOBAL (2)         Max LRU entries (2 = safe for 24GB)
-    PROMPT_CACHE_TTL_SECONDS        (1800)      Entry TTL before reaper prunes
-    CACHE_REAPER_INTERVAL_SECONDS   (60)        Reaper check frequency
+
     KV_BITS                         (None)      Native quantization (4 / 8 / None)
 
   Persistence (DPC):
@@ -572,23 +571,9 @@ def _memory_guard_pre_prefill(request_id: str = "") -> int:
         active_bytes = get_mem()
         if active_bytes < threshold_bytes:
             return 0
-        # Over threshold — evict from both stores
+        # Over threshold — evict KV cache stores
+        # (MoE expert memory is managed by Expert Breathing — breathe_down/up)
         evicted = 0
-        # Step 1: Try evicting cold MoE experts first (cheaper than KV cache)
-        try:
-            from .expert_cache import evict_experts_for_memory
-            _expert_evicted = evict_experts_for_memory(model, target_free_gb=4.0)
-            if _expert_evicted > 0:
-                post_check = get_mem()
-                if post_check < threshold_bytes:
-                    _terminal_status(
-                        "⚠️",
-                        f"MEMORY GUARD: evicted {_expert_evicted} MoE experts "
-                        f"({active_bytes / (1024**3):.1f}GiB → {post_check / (1024**3):.1f}GiB)",
-                    )
-                    return 0  # Expert eviction was enough
-        except (ImportError, Exception):
-            pass  # expert_cache not available or no MoE model
         # Step 2: Evict KV cache entries
         with prompt_cache_lock:
             evicted += PROMPT_CACHE.evict_unpinned()
@@ -1197,7 +1182,11 @@ PROMPT_CACHE_COMPACT = LRUPromptCache(
     ttl_seconds=SETTINGS.prompt_cache_ttl_seconds,
 )
 
-
+# Last tools list and system body from a MAIN (non-compact) request.
+# Used by _prewarm_post_compact to build canonical cache keys that match
+# the dual pipeline (model_tokens vs prompt_tokens/canonical).
+_LAST_MAIN_TOOLS: Optional[List[Dict[str, Any]]] = None
+_LAST_MAIN_SYSTEM_BODY: Optional[str] = None
 
 
 class SessionIndex:
@@ -1918,13 +1907,58 @@ def _metal_mem_str() -> str:
 # Threshold (tokens) above which we run aggressive memory relief before prefill
 _PREFILL_MEMORY_RELIEF_THRESHOLD = 10000
 
-def _pre_prefill_memory_relief(request_id: str, rest_count: int) -> None:
+# ── Metal budget (effective memory ceiling for prefill estimation) ─────────
+_metal_budget_gb_cached: Optional[float] = None
+
+def _get_metal_budget_gb() -> float:
+    """Return effective Metal budget in GB for dynamic guard calculations.
+
+    Priority: METAL_BUDGET_GB env var > device_info - 3GB (OS overhead).
+    Cached after first call. Note: iogpu.wired_limit_mb is NOT used here —
+    that controls MoE expert pinning, not the Metal allocation ceiling.
+    """
+    global _metal_budget_gb_cached
+    if _metal_budget_gb_cached is not None:
+        return _metal_budget_gb_cached
+
+    # 1. Explicit env var (most reliable)
+    _env_val = os.environ.get("METAL_BUDGET_GB")
+    if _env_val:
+        _metal_budget_gb_cached = float(_env_val)
+        return _metal_budget_gb_cached
+
+    # 2. Device total minus OS/system overhead (~3GB)
+    # On a 24GiB Mac: device_info reports 25.77GB, OOM occurs ~22.4GB → 3.3GB overhead.
+    try:
+        _device_gb = mx.device_info()["memory_size"] / 1e9
+        _metal_budget_gb_cached = _device_gb - 3.0
+    except Exception:
+        _metal_budget_gb_cached = 20.0  # conservative default
+    return _metal_budget_gb_cached
+
+# Threshold for Expert Breathing: rest tokens above this trigger breathe_down
+_BREATHE_DOWN_REST_THRESHOLD = int(os.environ.get("BREATHE_DOWN_REST_THRESHOLD", "15000"))
+
+# Track whether breathing is active for the current request
+_breathing_active = False
+
+
+def _find_switch_mlp_for_breathing(layer):
+    """Wrapper for expert_cache._find_switch_mlp without layer_idx (not needed here)."""
+    from .expert_cache import _find_switch_mlp
+    return _find_switch_mlp(layer)
+
+
+def _pre_prefill_memory_relief(request_id: str, rest_count: int, is_embedded_agent: bool = False) -> None:
     """Free OS and Metal memory before large prefills to reduce peak pressure.
 
     Runs gc.collect + mx.clear_cache + malloc_zone_pressure_relief
     (macOS-specific: tells the C allocator to return freed pages to the OS).
+    Also triggers Expert Breathing (breathe_down) for large MAIN requests.
     Only triggers for prefills above _PREFILL_MEMORY_RELIEF_THRESHOLD tokens.
     """
+    global _breathing_active
+
     if rest_count < _PREFILL_MEMORY_RELIEF_THRESHOLD:
         return
     _mem_before = _metal_mem_str()
@@ -1938,6 +1972,40 @@ def _pre_prefill_memory_relief(request_id: str, rest_count: int) -> None:
         _libc.malloc_zone_pressure_relief(0, 0)
     except Exception:
         pass  # Non-macOS or ctypes unavailable
+
+    # Expert Breathing: contract experts for large MAIN prefills
+    if (
+        not is_embedded_agent
+        and rest_count >= _BREATHE_DOWN_REST_THRESHOLD
+        and hasattr(model, "_moe_config")
+        and model._moe_config.get("capacity", 0) > 100
+    ):
+        try:
+            from .expert_cache import breathe_down, PredictiveCachedSwitchLinear
+            config = model._moe_config
+            current_cap = config.get("capacity", 256)
+            num_experts = config.get("num_experts", 256)
+            # Count experts with non-zero breathing priority (session*3 + historical*1)
+            # Target = keep only the ones that have SOME usage signal, evict the rest
+            min_used = current_cap  # worst case: keep all
+            for layer in model.layers:
+                switch, _ = _find_switch_mlp_for_breathing(layer)
+                if switch is None:
+                    continue
+                proj = getattr(switch, "up_proj", None)
+                if not isinstance(proj, PredictiveCachedSwitchLinear):
+                    continue
+                cache = proj._cache
+                used_count = sum(1 for eid in cache.cached_ids if cache.breathing_priority(eid) > 0)
+                min_used = min(min_used, used_count)
+            target = max(min_used, 64)  # Never below 64
+            if target < current_cap:
+                result = breathe_down(model, target, log_fn=_terminal_status)
+                if result.get("breathed"):
+                    _breathing_active = True
+        except Exception as _be:
+            _terminal_status("⚠️", f"BREATHE DOWN failed: {_be} | req={request_id[:8]}")
+
     _mem_after = _metal_mem_str()
     _pipeline_log("METAL", request_id,
         f"PRE_PREFILL_RELIEF: gc+clear_cache+malloc_pressure | "
@@ -2017,6 +2085,140 @@ def _update_healing_store(raw_text: str, message_text: str, tool_calls: Optional
         HEALING_STORE.move_to_end(h, last=True)
         while len(HEALING_STORE) > MAX_HEALING_STORE:
             HEALING_STORE.popitem(last=False)
+
+
+def _prewarm_post_compact(
+    summary_text: str,
+    messages: List[Dict[str, Any]],
+    request_id: str,
+) -> None:
+    """Pre-warm MAIN cache after compact using TPC + dual pipeline.
+
+    The compact runner just generated a summary. The old MAIN cache is dead.
+    This function builds a pre-warmed cache using the SAME dual pipeline as
+    the main request path:
+    - CANONICAL key (prompt_tokens space) for cache lookup matching
+    - MODEL tokens for KV state computation (via TPC clone + delta prefill)
+
+    Steps:
+    1. Build messages [system, summary_user_msg] with stored tools
+    2. Run dual pipeline: canonical → scrub → tokenize = canonical_key
+    3. Run model pipeline: original → tokenize = model_tokens
+    4. Clone TPC, prefill delta = model_tokens[tpc_len:]
+    5. Evict dead MAIN + COMPACT, insert (canonical_key, new_cache)
+
+    Must be called while model_lock is held (MLX is not thread-safe).
+    """
+    import copy
+    from mlx_lm.generate import generate_step
+
+    if not _tpc.is_initialized():
+        _terminal_status("⚠️",
+            f"POST-COMPACT: TPC not available, skipping | req={request_id[:8]}")
+        return
+
+    if _LAST_MAIN_TOOLS is None or _LAST_MAIN_SYSTEM_BODY is None:
+        _terminal_status("⚠️",
+            f"POST-COMPACT: no MAIN tools/system captured yet, skipping | req={request_id[:8]}")
+        return
+
+    t0 = time.time()
+
+    # 1. Build the expected post-compact messages
+    from .server_compact import COMPACT_USER_WRAPPER
+
+    summary_user_msg = {
+        "role": "user",
+        "content": COMPACT_USER_WRAPPER.format(summary=summary_text),
+    }
+    prewarm_messages = [
+        {"role": "system", "content": _LAST_MAIN_SYSTEM_BODY},
+        summary_user_msg,
+    ]
+
+    # 2. Dual pipeline — same as _handle_chat_completion (L4265-L4312)
+    enable_thinking = SETTINGS.default_thinking
+    original_msgs, canonical_msgs = _canonicalize_messages(prewarm_messages)
+    original_msgs = _hoist_system_messages(original_msgs)
+    canonical_msgs = _hoist_system_messages(canonical_msgs)
+    original_msgs = _prepare_messages_for_template(original_msgs, SETTINGS.normalize_write_tool_content_for_prompt)
+    canonical_msgs = _prepare_messages_for_template(canonical_msgs, SETTINGS.normalize_write_tool_content_for_prompt)
+
+    if hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template:
+        model_prompt = tokenizer.apply_chat_template(
+            original_msgs, tokenize=False, add_generation_prompt=True,
+            tools=_LAST_MAIN_TOOLS, enable_thinking=enable_thinking,
+        )
+        cache_prompt_raw = tokenizer.apply_chat_template(
+            canonical_msgs, tokenize=False, add_generation_prompt=True,
+            tools=_LAST_MAIN_TOOLS, enable_thinking=enable_thinking,
+        )
+    else:
+        _terminal_status("⚠️",
+            f"POST-COMPACT: no chat template, skipping | req={request_id[:8]}")
+        return
+
+    cache_prompt = _scrub_cache_key(cache_prompt_raw, SETTINGS.cache_canonicalize_tool_context)
+    canonical_key = _tokenize_prompt(cache_prompt)
+    model_tokens = _tokenize_prompt(model_prompt)
+
+    # 3. Verify TPC prefix alignment with model_tokens
+    tpc_tokens = list(_tpc._prefix_tokens)
+    tpc_len = len(tpc_tokens)
+
+    if len(model_tokens) <= tpc_len:
+        _terminal_status("⚠️",
+            f"POST-COMPACT: model_tokens({len(model_tokens)}) <= TPC({tpc_len}), skipping | req={request_id[:8]}")
+        return
+
+    if model_tokens[:tpc_len] != tpc_tokens:
+        _terminal_status("⚠️",
+            f"POST-COMPACT: TPC prefix mismatch, skipping | req={request_id[:8]}")
+        return
+
+    # 4. Clone TPC and prefill only the delta (summary tokens)
+    new_cache = copy.deepcopy(_tpc._prefix_cache)
+    delta_model_tokens = model_tokens[tpc_len:]
+
+    delta_prompt_array = mx.array(delta_model_tokens)
+    try:
+        gen = generate_step(
+            delta_prompt_array,
+            model,
+            max_tokens=1,
+            prompt_cache=new_cache,
+            prefill_step_size=PREFILL_STEP_SIZE,
+            kv_bits=SETTINGS.kv_bits,
+            kv_group_size=64,
+            quantized_kv_start=0,
+        )
+        _tok, _lp = next(gen)
+        mx.eval(_tok)
+    except Exception as e:
+        _terminal_status("⚠️",
+            f"POST-COMPACT: delta prefill failed ({e}), skipping | req={request_id[:8]}")
+        return
+
+    # Trim the 1 generated token so cache represents only the prefix
+    if can_trim_prompt_cache(new_cache):
+        trim_prompt_cache(new_cache, 1)
+
+    # 5. Evict dead MAIN + COMPACT caches, insert with canonical key
+    with prompt_cache_lock:
+        PROMPT_CACHE.evict_unpinned()
+        PROMPT_CACHE_COMPACT.evict_unpinned()
+        PROMPT_CACHE.insert_cache(SETTINGS.model_path, canonical_key, new_cache)
+
+    mx.clear_cache()
+
+    elapsed_ms = (time.time() - t0) * 1000
+    _terminal_status("🔥",
+        f"POST-COMPACT PRE-WARMUP: TPC({tpc_len}) + delta({len(delta_model_tokens)}) → MAIN | "
+        f"canonical_key={len(canonical_key)} | model_kv={len(model_tokens)} | "
+        f"{elapsed_ms:.0f}ms | {_metal_mem_str()} | req={request_id[:8]}")
+
+
+
 
 
 def _post_generation_cache_update(
@@ -2196,14 +2398,23 @@ def _insert_cache_entries(
     KRIPPER DUAL-SLOT: prompt_cache_store_override allows routing to a
     dedicated LRU (e.g. PROMPT_CACHE_COMPACT) without touching PROMPT_CACHE.
     """
-    # NOTE: Eviction guard removed — it was blocking ALL insertions because
-    # a tiny initial entry (285 tokens) caused all subsequent entries to have
-    # hit_ratio < 30%, preventing the cache from ever being populated.
-    # TODO: If cross-session thrashing is a problem, compare entry token counts
-    # instead of hit ratios (only block if existing entry is LARGER than new one).
-
-    # Select which LRU store to use: override (compact slot) or global MAIN store.
+    # Cross-session eviction guard (single-slot protection):
+    # When max_entries=1, a subagent request (short prompt, ~12K tokens) can
+    # evict the MAIN session's warm cache (~38K tokens), causing catastrophic
+    # cold starts. Block insertion if the existing entry is significantly larger.
     _store = prompt_cache_store_override if prompt_cache_store_override is not None else PROMPT_CACHE
+    if (
+        prompt_cache_store_override is None  # only guard MAIN store
+        and SETTINGS.prompt_cache_max_entries_global <= 1
+        and _store._entries  # there's already something cached
+    ):
+        _existing_len = max(
+            (len(e.tokens) for e in _store._entries.values()), default=0
+        )
+        _new_len = len(cache_key)
+        if _existing_len > _new_len * 1.5:
+            # Existing entry is >50% larger — don't evict it.
+            return
 
     # Only insert a prompt-only checkpoint for turns where it actually helps:
     # - tool_calls: next turn's prompt differs from cache key due to serialisation
@@ -2738,7 +2949,7 @@ else:
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
     # Detect MoE models: load lazily to avoid materializing all experts (19.5 GB).
     # After module replacement, only non-expert params (~1.4 GB) are materialized.
-    _is_moe_path = any(tag in SETTINGS.model_path for tag in ("A3B", "A14B", "MoE", "moe", "Mixtral", "mixtral"))
+    _is_moe_path = any(tag in SETTINGS.model_path for tag in ("A3B", "A14B", "MoE", "moe", "Mixtral", "mixtral", "Agents-A1"))
     _load_kwargs = {"tokenizer_config": {"trust_remote_code": True}}
     if _is_moe_path:
         _load_kwargs["lazy"] = True
@@ -2751,6 +2962,18 @@ else:
         model, tokenizer = load(SETTINGS.model_path, **_load_kwargs)
     _terminal_status("✅", "Model loaded (mlx-lm).")
     _terminal_status("⚡", "Torch acceleration: N/A (text-only model).")
+
+    # Some models (e.g. Agents-A1) ship chat_template.jinja separately instead of
+    # embedding it in tokenizer_config.json. Load it so tools get injected into the prompt.
+    if not getattr(tokenizer, "chat_template", None):
+        try:
+            from huggingface_hub import hf_hub_download
+            _jinja_path = hf_hub_download(SETTINGS.model_path, "chat_template.jinja")
+            with open(_jinja_path, "r") as f:
+                tokenizer.chat_template = f.read()
+            _terminal_status("🔧", "Loaded chat_template.jinja into tokenizer (was missing from tokenizer_config)")
+        except Exception:
+            pass  # No jinja file available, model uses a different template mechanism
 
 # ── MoE Expert Cache ──────────────────────────────────────────────────────
 # Phase 3 predictive cache: lazy load → module replacement → selective expert
@@ -2776,6 +2999,15 @@ try:
             f"loaded={_moe_stats.get('expert_tensors_loaded', 0)}, "
             f"mem={_moe_stats.get('active_memory_gb', 0):.1f}GB",
         )
+        # Load historical expert frequency stats for breathing decisions
+        try:
+            from .expert_cache import apply_historical_frequency
+            _stats_path = os.path.join("logs", "expert_stats.json")
+            _seeded = apply_historical_frequency(model, _stats_path)
+            if _seeded > 0:
+                _terminal_status("📊", f"Expert frequency stats loaded: {_seeded} layers from previous sessions")
+        except Exception as _freq_err:
+            _terminal_status("⚠️", f"Historical frequency load failed: {_freq_err}")
 except ImportError:
     pass  # expert_cache not available — dense model, no action needed
 except Exception as _moe_err:
@@ -2929,11 +3161,7 @@ _terminal_status(
 _DPC = _wm.DPCState()
 _WARMUP_DONE = _DPC.warmup_done  # Alias for backward compat (warmup gate, sidecar wait)
 
-# Post-reaper reload signal: set by reaper when it prunes entries,
-# cleared by request handler after launching reload thread.
-# Separate from _WARMUP_DONE to avoid impacting sidecar or DPCState.
-_CACHE_REAPED = threading.Event()
-_CACHE_RELOAD_LOCK = threading.Lock()  # prevents double-reload on concurrent requests
+
 
 
 # Pattern for startup detection (robust: case-insensitive, survives OpenClaw text changes)
@@ -3002,81 +3230,18 @@ else:
     )
     _WARMUP_DONE.set()
 
-# ── Background cache reaper: prune expired KV entries even when idle ─────────
-# Without this, expired cache entries hold Metal GPU buffers until the next
-# request triggers prune_expired(). This causes memory pressure to stay high
-# (yellow in Activity Monitor) even when no sessions are active.
-#
-# Key insight: mx.clear_cache() releases MLX's internal buffer pool back to
-# Metal, but Metal's allocator keeps GPU memory mapped until macOS forces
-# eviction at ~98% pressure. Setting mx.metal.set_cache_limit(0) tells Metal
-# to NOT hoard freed buffers, releasing them to the OS immediately.
-_CACHE_REAPER_INTERVAL_SECONDS = _env_int("CACHE_REAPER_INTERVAL_SECONDS", 60)
-
+# ── Metal cache limit ────────────────────────────────────────────────────────
 # Tell Metal to release freed GPU buffers above the model footprint.
 # set_cache_limit(0) is too aggressive (causes alloc/dealloc thrashing during generation).
 # ~6GB keeps model weights + warmup cached, but releases KV session buffers after use.
 _METAL_CACHE_LIMIT_BYTES = int(6.5 * (1024 ** 3))  # 6.5 GB ≈ model + warmup
 try:
-    # Prefer non-deprecated API (mx.set_cache_limit), fallback to mx.metal.set_cache_limit
     _set_cache_limit = getattr(mx, 'set_cache_limit', None) or getattr(mx.metal, 'set_cache_limit', None)
     if _set_cache_limit:
         _set_cache_limit(_METAL_CACHE_LIMIT_BYTES)
         _terminal_status("🧹", f"Metal cache limit: {_METAL_CACHE_LIMIT_BYTES / 1e9:.1f}GB (model + warmup)")
 except Exception:
     pass
-
-
-def _cache_reaper_loop():
-    """Periodically prune expired cache entries and release Metal memory."""
-    _get_active = getattr(mx, 'get_active_memory', None) or getattr(mx.metal, 'get_active_memory', None)
-    _get_cache = getattr(mx, 'get_cache_memory', None) or getattr(mx.metal, 'get_cache_memory', None)
-    _get_peak = getattr(mx, 'get_peak_memory', None) or getattr(mx.metal, 'get_peak_memory', None)
-
-
-
-    while True:
-        time.sleep(_CACHE_REAPER_INTERVAL_SECONDS)
-        try:
-            pruned = 0
-            with prompt_cache_lock:
-                before_main = len(PROMPT_CACHE._entries)
-                before_compact = len(PROMPT_CACHE_COMPACT._entries)
-
-
-
-                # Prune with telemetry enabled
-                for k in [k for k, v in PROMPT_CACHE._entries.items() if PROMPT_CACHE._is_expired(v)]:
-                    PROMPT_CACHE._delete(k[0], k[1], _reaper_telemetry=True)
-                    pruned += 1
-                for k in [k for k, v in PROMPT_CACHE_COMPACT._entries.items() if PROMPT_CACHE_COMPACT._is_expired(v)]:
-                    PROMPT_CACHE_COMPACT._delete(k[0], k[1], _reaper_telemetry=True)
-                    pruned += 1
-
-            if pruned > 0:
-                import gc; gc.collect()
-
-                mx.clear_cache()
-
-                _terminal_status(
-                    "🧹",
-                    f"CACHE REAPER: pruned {pruned} expired entries | "
-                    f"active={_get_active()/1e9:.2f}GB | "
-                    f"cache={_get_cache()/1e9:.2f}GB",
-                )
-                # Signal next request to reload cache from disk (post-reaper warm-up).
-                if SETTINGS.cache_persist_path:
-                    _CACHE_REAPED.set()
-                    _terminal_status("🧹", "CACHE REAPER: signaled _CACHE_REAPED → next request will reload from disk")
-        except Exception:
-            pass  # Never crash the reaper
-
-
-_reaper_thread = threading.Thread(
-    target=_cache_reaper_loop, daemon=True, name="cache-reaper"
-)
-_reaper_thread.start()
-_terminal_status("🧹", f"Cache reaper: active (every {_CACHE_REAPER_INTERVAL_SECONDS}s)")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3289,9 +3454,11 @@ class SidecarHandler(BaseHTTPRequestHandler):
 
         _terminal_status(
             "🛸", f"Sidecar request {request_id} | "
-            f"msgs={len(messages)} | stream={is_streaming} | max_tokens={max_tokens}",
+            f"from={self.client_address[0]} | msgs={len(messages)} | stream={is_streaming} | max_tokens={max_tokens}",
             indent=1,
         )
+        _last_content = str(messages[-1].get("content", ""))[:200] if messages else ""
+        _terminal_status("🛸", f"Sidecar {request_id} | preview: '{_last_content}'", indent=2)
 
         # ── RAG ENRICHMENT (optional) ──────────────────────────────────────
         if SETTINGS.sidecar_enable_rag and _rag_available and _rag_module is not None:
@@ -3729,22 +3896,7 @@ class APIHandler(BaseHTTPRequestHandler):
                         flush=True,
                     )
 
-        # ── POST-REAPER RELOAD GATE ─────────────────────────────────────────
-        # If the cache reaper pruned entries while idle, reload from disk on the
-        # first incoming request. Uses double-check locking to prevent concurrent
-        # requests from launching multiple reload threads simultaneously.
-        if _CACHE_REAPED.is_set() and SETTINGS.cache_persist_path:
-            with _CACHE_RELOAD_LOCK:
-                if _CACHE_REAPED.is_set():  # double-check inside lock
-                    _CACHE_REAPED.clear()
-                    _terminal_status("🔥", "DPC: post-reaper reload triggered | reloading from disk...")
-                    _reload_done = threading.Event()
-                    def _do_reload(_done=_reload_done):
-                        _run_startup_warmup()
-                        _done.set()
-                    threading.Thread(target=_do_reload, daemon=True, name="dpc-post-reaper").start()
-                    _reload_done.wait(timeout=120)
-        # ── END POST-REAPER RELOAD GATE ─────────────────────────────────────
+
 
         # ── END DPC GATE ────────────────────────────────────────────────────
 
@@ -4249,6 +4401,10 @@ class APIHandler(BaseHTTPRequestHandler):
         # Always use server DEFAULT_MAX_TOKENS — Claude Code sends max_tokens=8192
         # which truncates long code generation. We override it entirely.
         max_tokens = SETTINGS.default_max_tokens
+        # Compact runner (title generation) needs ~20 output tokens.
+        # Cap total budget to avoid wasting 35s on thinking for a JSON title.
+        if _is_embedded_agent:
+            max_tokens = 256
         is_streaming = body.get("stream", False)
 
         acquired = False
@@ -4453,11 +4609,30 @@ class APIHandler(BaseHTTPRequestHandler):
                                 #   512 × 100K × 16 × 4 = 3.3 GB/layer (safe on 24 GB)
                                 # Previously hardcoded at 40K which forced catastrophic cold starts
                                 # (128s + OOM risk) even when only 397 tokens needed washing.
+                                #
+                                # CRITICAL: Hybrid wash does NOT fix ArraysCache (GatedDeltaNet)
+                                # contamination. Recurrent state accumulates ALL prior tokens —
+                                # washing a suffix just adds on top of the wrong state.
+                                # When DPC loaded a cache from a DIFFERENT session, the recurrent
+                                # layers contain context from the old conversation, causing
+                                # cross-session hallucinations. Force cold start in this case.
+                                _has_recurrent = not can_trim_prompt_cache(prompt_cache)
                                 _HYBRID_WASH_KV_LIMIT = 100_000
-                                if _kv_off is not None and _kv_off > _HYBRID_WASH_KV_LIMIT:
+                                # _kv_off > _m_len means the physical KV holds tokens beyond
+                                # the current request — definitive cross-session contamination.
+                                if _has_recurrent and _kv_off is not None and _kv_off > _m_len:
+                                    # Recurrent state is session-specific and can't be washed.
                                     prompt_cache = None
                                     PROMPT_CACHE.evict_unpinned()
-                                    gc.collect()
+                                    import gc; gc.collect()
+                                    rest_tokens = model_tokens
+                                    _terminal_status("⚠️",
+                                        f"FIX-31 v10: ArraysCache contaminated by DPC "
+                                        f"(kv_off={_kv_off} > request_len={_m_len}) — cold start")
+                                elif _kv_off is not None and _kv_off > _HYBRID_WASH_KV_LIMIT:
+                                    prompt_cache = None
+                                    PROMPT_CACHE.evict_unpinned()
+                                    import gc; gc.collect()
                                     rest_tokens = model_tokens
                                     _terminal_status("⚠️",
                                         f"FIX-31 v9: KV too large for hybrid wash "
@@ -4509,6 +4684,15 @@ class APIHandler(BaseHTTPRequestHandler):
                     tokenizer, prompt_tokens, cache_session_tokens, context_window=8
                 )
             # -----------------------
+
+            # ── CAPTURE TOOLS + SYSTEM for post-compact pre-warmup ────────
+            if not _is_embedded_agent and tools:
+                global _LAST_MAIN_TOOLS, _LAST_MAIN_SYSTEM_BODY
+                _LAST_MAIN_TOOLS = tools
+                for _m in messages:
+                    if (_m.get("role") or "").lower() == "system":
+                        _LAST_MAIN_SYSTEM_BODY = _m.get("content", "")
+                        break
 
             # ── MEMORY GUARD: check before prefill ──────────────────────────
             # If external processes have pushed Metal memory above threshold,
@@ -4847,13 +5031,15 @@ class APIHandler(BaseHTTPRequestHandler):
                     self.send_header("X-Pipeline-Heal-Ms", f"{_pipeline_timings.get('heal', 0):.1f}")
                 self.end_headers()
 
-                _pre_prefill_memory_relief(request_id, rest_count)
+                _pre_prefill_memory_relief(request_id, rest_count, is_embedded_agent=_is_embedded_agent)
+
+
                 _prefill_done, _prefill_thread = _start_prefill_progress(request_id, rest_count)
 
                 generated_parts = []
                 _thinking_token_count_ns = 0
                 _in_think_ns = False
-                _max_thinking_ns = SETTINGS.max_thinking_tokens
+                _max_thinking_ns = 128 if _is_embedded_agent else SETTINGS.max_thinking_tokens
                 progress_last_at = time.time()
                 for response in _stream_generate_unified(
                     rest_tokens,
@@ -4901,6 +5087,10 @@ class APIHandler(BaseHTTPRequestHandler):
                 response_text = _normalize_assistant_text(
                     response_text, enable_thinking, SETTINGS.model_family
                 )
+                # DEBUG: raw model output before tool extraction
+                if FEATURE_FULL_LOGGING:
+                    _pipeline_log("RAW_OUT", request_id,
+                        f"raw_response ({len(response_text)} chars): {repr(response_text[:1000])}")
                 message_text, tool_calls = _extract_openai_tool_calls(
                     response_text, SETTINGS.model_family
                 )
@@ -4940,6 +5130,31 @@ class APIHandler(BaseHTTPRequestHandler):
                         session_id_for_turn=_session_id_for_turn,
                         is_embedded_agent=_is_embedded_agent,
                     )
+
+                # POST-COMPACT PRE-WARMUP: after compact finishes, pre-warm MAIN
+                # with the summary so the next request doesn't cold-start 50K tokens.
+                if _is_embedded_agent and message_text and len(message_text) > 100:
+                    try:
+                        _prewarm_post_compact(
+                            summary_text=message_text,
+                            messages=messages,
+                            request_id=request_id,
+                        )
+                    except Exception as _pw_err:
+                        _terminal_status("⚠️",
+                            f"POST-COMPACT PRE-WARMUP failed: {_pw_err} | req={request_id[:8]}")
+
+
+                # Expert Breathing: restore full capacity after generation
+                global _breathing_active
+                if _breathing_active:
+                    try:
+                        from .expert_cache import breathe_up
+                        breathe_up(model, log_fn=_terminal_status)
+                    except Exception as _bu_err:
+                        _terminal_status("⚠️", f"BREATHE UP failed: {_bu_err} | req={request_id[:8]}")
+                    finally:
+                        _breathing_active = False
 
                 if self._is_anthropic:
                     full_response = openai_to_anthropic_response(
@@ -5071,12 +5286,14 @@ class APIHandler(BaseHTTPRequestHandler):
                 )
                 _keepalive_thread.start()
 
-                _pre_prefill_memory_relief(request_id, rest_count)
+                _pre_prefill_memory_relief(request_id, rest_count, is_embedded_agent=_is_embedded_agent)
+
+
                 _prefill_done_s, _ = _start_prefill_progress(request_id, rest_count)
 
                 raw_parts = []
                 _thinking_token_count = 0
-                _max_thinking = SETTINGS.max_thinking_tokens  # 0=unlimited
+                _max_thinking = 128 if _is_embedded_agent else SETTINGS.max_thinking_tokens  # 0=unlimited
 
                 progress_last_at = time.time()
                 try:
@@ -5179,6 +5396,10 @@ class APIHandler(BaseHTTPRequestHandler):
                 full_text = _normalize_assistant_text(
                     full_text, enable_thinking, SETTINGS.model_family
                 )
+                # DEBUG: raw model output before tool extraction (streaming path)
+                if FEATURE_FULL_LOGGING:
+                    _pipeline_log("RAW_OUT", request_id,
+                        f"raw_response ({len(full_text)} chars): {repr(full_text[:2000])}")
                 message_text, tool_calls = _extract_openai_tool_calls(
                     full_text, SETTINGS.model_family
                 )
@@ -5203,6 +5424,29 @@ class APIHandler(BaseHTTPRequestHandler):
                         session_id_for_turn=_session_id_for_turn,
                         is_embedded_agent=_is_embedded_agent,
                     )
+
+                # POST-COMPACT PRE-WARMUP: after compact finishes, pre-warm MAIN
+                # with the summary so the next request doesn't cold-start 50K tokens.
+                if _is_embedded_agent and message_text and len(message_text) > 100:
+                    try:
+                        _prewarm_post_compact(
+                            summary_text=message_text,
+                            messages=messages,
+                            request_id=request_id,
+                        )
+                    except Exception as _pw_err:
+                        _terminal_status("⚠️",
+                            f"POST-COMPACT PRE-WARMUP failed: {_pw_err} | req={request_id[:8]}")
+
+                # Expert Breathing: restore full capacity after generation
+                if _breathing_active:
+                    try:
+                        from .expert_cache import breathe_up
+                        breathe_up(model, log_fn=_terminal_status)
+                    except Exception as _bu_err:
+                        _terminal_status("⚠️", f"BREATHE UP failed: {_bu_err} | req={request_id[:8]}")
+                    finally:
+                        _breathing_active = False
 
                 finish_reason = "tool_calls" if tool_calls else "stop"
                 # LOOP BREAK ESCALATION: if LOOP_BREAK fired but model still
@@ -5512,32 +5756,6 @@ class APIHandler(BaseHTTPRequestHandler):
                 # (not released). No need to null-out prompt_cache here — the LRU manages it.
                 # MAIN cache is always untouched.
 
-                # ── ANTHROPIC SAFETY EVICTION ──────────────────────────────
-                # After large Anthropic requests, the KV cache can hold 128K+
-                # token positions. Evict only if Metal active memory is too
-                # close to device limit — data-driven, not hardcoded threshold.
-                # Profiling shows 33K-token requests peak at ~12 GiB on 24 GB.
-                if self._is_anthropic and rest_count is not None and rest_count > 10000:
-                    try:
-                        _post_active = mx.get_active_memory()
-                        _device_total = mx.device_info()["memory_size"]
-                        _pressure = _post_active / _device_total if _device_total > 0 else 1.0
-                        if _pressure > 0.80:
-                            with prompt_cache_lock:
-                                _evicted = PROMPT_CACHE.evict_unpinned()
-                            if _evicted > 0:
-                                _terminal_status("🧹",
-                                    f"ANTHROPIC SAFETY: evicted {_evicted} cache entries | "
-                                    f"pressure={_pressure:.0%} ({_post_active / (1024**3):.1f}/{_device_total / (1024**3):.1f} GiB)",
-                                    indent=1)
-                        elif FEATURE_FULL_LOGGING:
-                            _terminal_status("💾",
-                                f"ANTHROPIC SAFETY: cache RETAINED | "
-                                f"pressure={_pressure:.0%} ({_post_active / (1024**3):.1f}/{_device_total / (1024**3):.1f} GiB) < 80%",
-                                indent=1)
-                    except Exception:
-                        pass  # mx API unavailable — skip eviction decision
-
                 _mem_profiler.snapshot(request_id, "POST_GENERATION", is_anthropic=self._is_anthropic, rest_tokens=rest_count if 'rest_count' in dir() else None, output_tokens=output_tokens if 'output_tokens' in dir() else None, kv_cache_offset=_kv_off if '_kv_off' in dir() else None)
                 mx.clear_cache()
                 import gc; gc.collect()
@@ -5632,6 +5850,13 @@ def run():
     except KeyboardInterrupt:
         pass
     finally:
+        # Persist expert frequency stats for cross-session learning
+        try:
+            from .expert_cache import save_frequency_stats
+            _stats_path = os.path.join("logs", "expert_stats.json")
+            save_frequency_stats(model, _stats_path)
+        except Exception:
+            pass  # Best-effort on shutdown
         if sidecar_httpd:
             sidecar_httpd.shutdown()
 

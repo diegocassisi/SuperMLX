@@ -221,9 +221,66 @@ def _coerce_arg_value(raw_value):
         return value
 
 
+
+# Pattern matching markdown code blocks: ```lang\ncontent\n```
+_MARKDOWN_CODE_BLOCK = re.compile(
+    r"```(\w*)\n(.*?)```", re.DOTALL
+)
+
+
+def _convert_markdown_tool_calls(text: str) -> str:
+    """Convert markdown code blocks into <tool_call> XML format.
+
+    Models conditioned by Claude Code's system prompt sometimes output tool calls
+    as markdown code blocks (```bash\\nls -la\\n```) instead of the structured
+    <tool_call><function=Bash> format. This rewrites those blocks so the main
+    extraction chain picks them up.
+    """
+    # Map markdown language hints to interpreter commands
+    _INTERPRETERS = {
+        "python": "python3", "python3": "python3", "py": "python3",
+        "node": "node", "javascript": "node", "js": "node",
+        "typescript": "npx ts-node", "ts": "npx ts-node",
+        "ruby": "ruby", "rb": "ruby",
+        "perl": "perl",
+    }
+    _SHELL_LANGS = {"bash", "sh", "shell", "zsh", ""}
+
+    def _replace_block(match):
+        lang = match.group(1).strip().lower()
+        content = match.group(2).strip()
+        if not content:
+            return match.group(0)
+        if lang in _SHELL_LANGS:
+            # Only convert if it looks like a command (not a large code snippet)
+            if content.count("\n") > 10 or len(content) > 2000:
+                return match.group(0)
+            cmd = content
+        elif lang in _INTERPRETERS:
+            interp = _INTERPRETERS[lang]
+            cmd = f"{interp} << 'HEREDOC_EOF'\n{content}\nHEREDOC_EOF"
+        else:
+            # Unknown language — still try as a bash command
+            cmd = content
+        return (
+            f"\n<tool_call>\n<function=Bash>\n"
+            f"<parameter=command>\n{cmd}\n</parameter>\n"
+            f"</function>\n</tool_call>\n"
+        )
+
+    return _MARKDOWN_CODE_BLOCK.sub(_replace_block, text)
+
+
 def _extract_openai_tool_calls(text, model_family):
     if not isinstance(text, str):
         return text, []
+
+    # Agents-A1 and similar models conditioned by Claude's system prompt may output
+    # tool calls as markdown code blocks instead of <tool_call> XML. Convert them
+    # so the existing parser chain picks them up.
+    if model_family == "qwen3" and "<tool_call>" not in text and "```" in text:
+        text = _convert_markdown_tool_calls(text)
+
     # Quick-exit: no tool call markers at all
     _has_standard = "<tool_call>" in text
     _has_gemma4 = "<|tool_call|>" in text

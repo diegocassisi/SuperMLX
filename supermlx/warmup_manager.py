@@ -177,7 +177,36 @@ def save_cache(
         # n_kv_layers: count of layers that actually have KV cache state
         # (hybrid models like DeltaNet/Attention have fewer KV layers than total layers)
         saved_layers = 0
+        saved_recurrent = 0
         for i, layer in enumerate(prompt_cache):
+            # # DEBUG: trace each layer to find why KVCache layers are not saved
+            # _has_state = hasattr(layer, "state")
+            # _has_keys = hasattr(layer, "keys")
+            # _keys_none = layer.keys is None if _has_keys else "N/A"
+            # _offset = getattr(layer, "offset", "N/A")
+            # _cls = type(layer).__name__
+            # if i < 5 or (i % 10 == 0):
+            #     _log("DEBUG", f"save layer[{i}] cls={_cls} has_state={_has_state} has_keys={_has_keys} keys_none={_keys_none} offset={_offset}")
+            # --- ArraysCache (GatedDeltaNet recurrent state) ---
+            # Hybrid models (Qwen3.5/Agents-A1) have GatedDeltaNet layers that use
+            # ArraysCache with [conv_state, recurrent_state] instead of KVCache.
+            # Persisting this avoids re-computing 30 layers of recurrent state on prefill.
+            if hasattr(layer, "state") and isinstance(layer.state, (list, tuple)) and not hasattr(layer, "keys"):
+                has_data = any(
+                    s is not None and hasattr(s, "shape")
+                    for s in layer.state
+                )
+                if has_data:
+                    for part_idx, part in enumerate(layer.state):
+                        if part is not None and hasattr(part, "shape"):
+                            arrays[f"rs{i}_{part_idx}"] = part
+                    arrays[f"rs{i}_n"] = mx.array(
+                        [len(layer.state)], dtype=mx.int32
+                    )
+                    saved_recurrent += 1
+                continue
+            
+            # --- KVCache / QuantizedKVCache ---
             if not hasattr(layer, "keys") or layer.keys is None:
                 continue
             offset = int(getattr(layer, "offset", 0))
@@ -205,6 +234,8 @@ def save_cache(
             saved_layers += 1
         # Save actual KV layer count (not total model layers)
         arrays["n_layers"] = mx.array([saved_layers], dtype=mx.int32)
+        if saved_recurrent > 0:
+            arrays["n_recurrent"] = mx.array([saved_recurrent], dtype=mx.int32)
         # Force evaluation before writing to disk
         live = [v for v in arrays.values() if hasattr(v, "shape")]
         if live:
@@ -217,7 +248,7 @@ def save_cache(
 
         _log(
             "💾",
-            f"DPC: cache saved → {path.name} | layers={saved_layers} | tokens={len(tokens)}",
+            f"DPC: cache saved → {path.name} | layers={saved_layers} + {saved_recurrent} recurrent | tokens={len(tokens)}",
         )
         return True
     except Exception as e:
@@ -263,7 +294,25 @@ def load_cache(
         prompt_cache = make_prompt_cache(cache_model, max_kv_size=max_kv_size)
 
         restored_layers = 0
+        restored_recurrent = 0
         for i, layer in enumerate(prompt_cache):
+            # --- ArraysCache (GatedDeltaNet recurrent state) ---
+            rs_n_key = f"rs{i}_n"
+            if rs_n_key in arrays:
+                n_parts = int(arrays[rs_n_key].tolist()[0])
+                state_parts = []
+                for p_idx in range(n_parts):
+                    part_key = f"rs{i}_{p_idx}"
+                    if part_key in arrays:
+                        state_parts.append(arrays[part_key])
+                    else:
+                        state_parts.append(None)
+                if hasattr(layer, "state") and not hasattr(layer, "keys"):
+                    layer.state = state_parts
+                    restored_recurrent += 1
+                continue
+            
+            # --- KVCache / QuantizedKVCache ---
             # Detect format: quantized (k{i}_0) vs plain (k{i})
             is_quantized = f"k{i}_0" in arrays
             if not is_quantized and f"k{i}" not in arrays:
@@ -331,12 +380,18 @@ def load_cache(
             l.keys for l in prompt_cache
             if hasattr(l, "keys") and l.keys is not None
         ]
+        # Also eval restored recurrent states (GatedDeltaNet ArraysCache)
+        for l in prompt_cache:
+            if hasattr(l, "state") and isinstance(l.state, (list, tuple)):
+                for s in l.state:
+                    if s is not None and hasattr(s, "shape"):
+                        live.append(s)
         if live:
             mx.eval(*live)
 
         _log(
             "💾",
-            f"DPC: disk cache loaded | layers={restored_layers} | tokens={len(tokens)}",
+            f"DPC: disk cache loaded | layers={restored_layers} + {restored_recurrent} recurrent | tokens={len(tokens)}",
         )
         # Guard: restored layers must match what was originally saved.
         # Hybrid models (DeltaNet/Attention) save fewer layers than total model layers

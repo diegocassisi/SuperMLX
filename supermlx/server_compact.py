@@ -179,7 +179,7 @@ def compact_conversation(
     Returns None if compaction fails or isn't worth it.
     """
     import mlx.core as mx
-    from mlx_lm.utils import generate_step
+    from mlx_lm.generate import generate_step
 
     t0 = time.time()
     tail_count = _compact_tail_count()

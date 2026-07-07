@@ -279,10 +279,11 @@ class PredictiveExpertCache:
     on GPU — no mx.eval needed. Uncached experts map to slot 0 (fallback).
     """
     __slots__ = (
-        'capacity', 'num_experts', 'lookup', 'hit_mask',
+        'capacity', 'full_capacity', 'num_experts', 'lookup', 'hit_mask',
         'weights', 'scales', 'biases',
         'cached_ids', 'cached_set',
-        'frequency', 'last_active', 'step',
+        'frequency', 'session_frequency', 'historical_frequency',
+        'last_active', 'step',
         '_indices_buffer',
         '_shard_paths', '_key_prefixes', '_shard_map',
         '_st_map',
@@ -292,6 +293,7 @@ class PredictiveExpertCache:
 
     def __init__(self, capacity: int, num_experts: int = 256):
         self.capacity = capacity
+        self.full_capacity = capacity  # Original capacity for breathe_up
         self.num_experts = num_experts
         self.weights: Dict[str, mx.array] = {}
         self.scales: Dict[str, mx.array] = {}
@@ -300,7 +302,9 @@ class PredictiveExpertCache:
         self.hit_mask: Optional[mx.array] = None
         self.cached_ids: List[int] = []
         self.cached_set: set = set()
-        self.frequency: Dict[int, int] = {}
+        self.frequency: Dict[int, int] = {}           # Combined view (session + historical)
+        self.session_frequency: Dict[int, int] = {}    # This session only
+        self.historical_frequency: Dict[int, int] = {} # Loaded from disk
         self.last_active: Dict[int, int] = {}
         self.step: int = 0
         self._indices_buffer: List[mx.array] = []
@@ -311,6 +315,35 @@ class PredictiveExpertCache:
         self.total_requests: int = 0
         self.total_fallbacks: int = 0
         self.pinned_set: set = set()
+
+    def export_frequency(self) -> Dict[int, int]:
+        """Return copy of session-only frequency counts (for persistence)."""
+        return dict(self.session_frequency)
+
+    def breathing_priority(self, eid: int) -> float:
+        """Weighted priority score for breathing eviction decisions.
+
+        Session usage dominates (3x) so current-task experts are protected.
+        Historical baseline provides a floor (1x) for experts not yet used.
+        Never-used-anywhere experts get 0 → evicted first.
+        """
+        return self.session_frequency.get(eid, 0) * 3 + self.historical_frequency.get(eid, 0) * 1
+
+    def get_coverage_ratio(self) -> float:
+        """Fraction of total routing traffic covered by currently cached experts.
+
+        Uses combined frequency: sum(freq for cached) / sum(all freq).
+        Returns 1.0 if no frequency data yet.
+        """
+        if not self.frequency:
+            return 1.0
+        total = sum(self.frequency.values())
+        if total == 0:
+            return 1.0
+        covered = sum(self.frequency.get(eid, 0) for eid in self.cached_set)
+        return covered / total
+
+
 
     def build_lookup(self, cached_ids: List[int]) -> None:
         """Build GPU-resident lookup table and hit mask from cached expert IDs.
@@ -367,6 +400,7 @@ class PredictiveExpertCache:
         self.step += 1
         for eid in all_requested:
             self.frequency[eid] = self.frequency.get(eid, 0) + 1
+            self.session_frequency[eid] = self.session_frequency.get(eid, 0) + 1
             self.last_active[eid] = self.step
 
         misses = all_requested - self.cached_set
@@ -1207,17 +1241,412 @@ def get_cache_stats(model: nn.Module) -> Dict[str, Any]:
     }
 
 
-def evict_experts_for_memory(
+def breathe_down(
     model: nn.Module,
-    target_free_gb: float = 4.0,
-) -> int:
-    """Evict cold experts to free GPU memory.
+    target_count: int,
+    log_fn: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Contract expert cache to target_count per layer, freeing GPU memory.
 
-    For predictive cache, this is a no-op since we can't shrink the
-    stacked tensors without rebuilding. Instead, dynamic_cache_update
-    handles expert rotation. Returns 0.
+    Evicts least-used experts based on frequency stats. Pinned experts are
+    protected. Rebuilds stacked tensors in-place — the old larger tensors
+    are released by mx.clear_cache().
+
+    Must be called under model_lock.
+
+    Args:
+        model: Model with PredictiveCachedSwitchLinear modules.
+        target_count: Target experts per layer (e.g. 100).
+        log_fn: Optional terminal status logger.
+
+    Returns:
+        Dict with before/after counts, freed memory, coverage ratio.
     """
-    # Predictive cache uses fixed-size stacked tensors —
-    # eviction requires full rebuild, not suitable for memory_guard.
-    # The real memory control is via capacity selection at startup.
-    return 0
+    t0 = time.time()
+    before_mem = mx.get_active_memory() / 1e9
+
+    config = getattr(model, "_moe_config", None)
+    if config is None:
+        return {"breathed": False, "reason": "no_moe_config"}
+
+    num_experts = config["num_experts"]
+    old_capacity = config["capacity"]
+    target_count = max(target_count, 1)
+
+    if target_count >= old_capacity:
+        return {"breathed": False, "reason": "target >= current"}
+
+    layers_contracted = 0
+    total_evicted = 0
+    avg_coverage = 0.0
+
+    for i, layer in enumerate(model.layers):
+        switch, _ = _find_switch_mlp(layer, i)
+        if switch is None:
+            continue
+        proj = getattr(switch, "up_proj", None)
+        if not isinstance(proj, PredictiveCachedSwitchLinear):
+            continue
+
+        cache = proj._cache
+
+        if len(cache.cached_ids) <= target_count:
+            avg_coverage += cache.get_coverage_ratio()
+            continue
+
+        # Sort by breathing_priority descending; pinned experts always retained
+        scored = []
+        for slot, eid in enumerate(cache.cached_ids):
+            if eid in cache.pinned_set:
+                scored.append((float('inf'), slot, eid))
+            else:
+                scored.append((cache.breathing_priority(eid), slot, eid))
+        scored.sort(key=lambda x: -x[0])
+
+        # Keep top target_count
+        keep = scored[:target_count]
+        keep_slots = sorted([slot for _, slot, _ in keep])
+        keep_ids = [cache.cached_ids[s] for s in keep_slots]
+        evicted = len(cache.cached_ids) - len(keep_ids)
+
+        # Rebuild stacked tensors with only kept slots
+        keep_indices = mx.array(keep_slots)
+        for proj_name in _PROJ_NAMES:
+            old_w = cache.weights.get(proj_name)
+            old_s = cache.scales.get(proj_name)
+            old_b = cache.biases.get(proj_name)
+            if old_w is None:
+                continue
+
+            cache.weights[proj_name] = old_w[keep_indices]
+            cache.scales[proj_name] = old_s[keep_indices]
+            if old_b is not None:
+                cache.biases[proj_name] = old_b[keep_indices]
+
+        # Eval the sliced tensors to materialize before clearing old ones
+        to_eval = []
+        for proj_name in _PROJ_NAMES:
+            if proj_name in cache.weights:
+                to_eval.extend([cache.weights[proj_name], cache.scales[proj_name]])
+                if cache.biases.get(proj_name) is not None:
+                    to_eval.append(cache.biases[proj_name])
+        if to_eval:
+            mx.eval(*to_eval)
+
+        # Update bookkeeping
+        cache.cached_ids = keep_ids
+        cache.cached_set = set(keep_ids)
+        cache.capacity = len(keep_ids)
+        cache.rebuild_lookup()
+        mx.eval(cache.lookup, cache.hit_mask)
+
+        layers_contracted += 1
+        total_evicted += evicted
+        avg_coverage += cache.get_coverage_ratio()
+
+    mx.clear_cache()
+    import gc; gc.collect()
+
+    after_mem = mx.get_active_memory() / 1e9
+    freed = before_mem - after_mem
+    moe_layers = config["moe_layers"]
+    avg_coverage = avg_coverage / max(moe_layers, 1)
+
+    # Update model config
+    config["capacity"] = target_count
+
+    elapsed = time.time() - t0
+
+    if log_fn:
+        log_fn("🫁",
+            f"BREATHE ↓ experts={old_capacity}→{target_count} "
+            f"(evicted {total_evicted}) | freed={freed:.1f}GB | "
+            f"headroom={_get_headroom_gb():.1f}GB | "
+            f"coverage={avg_coverage:.1%} | {elapsed:.1f}s")
+
+    return {
+        "breathed": True,
+        "direction": "down",
+        "before": old_capacity,
+        "after": target_count,
+        "evicted": total_evicted,
+        "freed_gb": round(freed, 2),
+        "coverage": round(avg_coverage, 4),
+        "elapsed_s": round(elapsed, 1),
+    }
+
+
+def breathe_up(
+    model: nn.Module,
+    log_fn: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Expand expert cache back to full capacity from SSD.
+
+    Reloads evicted experts using SafetensorsMap byte-level mmap.
+    Must be called under model_lock after generation completes.
+
+    Args:
+        model: Model with PredictiveCachedSwitchLinear modules.
+        log_fn: Optional terminal status logger.
+
+    Returns:
+        Dict with reload counts, time, memory.
+    """
+    t0 = time.time()
+
+    config = getattr(model, "_moe_config", None)
+    st_map = getattr(model, "_st_map", None)
+    if config is None or st_map is None:
+        return {"breathed": False, "reason": "no_moe_config"}
+
+    current_capacity = config["capacity"]
+    # Use the full_capacity stored on each cache, fallback to num_experts
+    target_capacity = None  # Will detect from first cache
+
+    total_loaded = 0
+    layers_expanded = 0
+
+    for i, layer in enumerate(model.layers):
+        switch, _ = _find_switch_mlp(layer, i)
+        if switch is None:
+            continue
+        proj = getattr(switch, "up_proj", None)
+        if not isinstance(proj, PredictiveCachedSwitchLinear):
+            continue
+
+        cache = proj._cache
+        if target_capacity is None:
+            target_capacity = cache.full_capacity
+
+        if len(cache.cached_ids) >= target_capacity:
+            continue
+
+        old_ids = list(cache.cached_ids)
+        old_set = set(old_ids)
+
+        # Select experts to reload — use frequency-ordered selection
+        # to prioritize historically useful experts
+        all_candidates = []
+        for eid in range(cache.num_experts):
+            if eid not in old_set:
+                freq = cache.frequency.get(eid, 0)
+                all_candidates.append((freq, eid))
+        all_candidates.sort(key=lambda x: -x[0])
+
+        needed = target_capacity - len(old_ids)
+        new_ids = [eid for _, eid in all_candidates[:needed]]
+
+        if not new_ids:
+            continue
+
+        new_eids_arr = np.array(new_ids, dtype=np.int32)
+
+        # Prefetch byte ranges
+        for proj_name in _PROJ_NAMES:
+            kp = cache._key_prefixes.get(proj_name)
+            if kp:
+                st_map.prefetch_experts(kp, new_ids, (proj_name,))
+
+        # Load and concatenate
+        for proj_name in _PROJ_NAMES:
+            key_prefix = cache._key_prefixes.get(proj_name)
+            if key_prefix is None:
+                continue
+
+            w_key = f"{key_prefix}.weight"
+            s_key = f"{key_prefix}.scales"
+            b_key = f"{key_prefix}.biases"
+
+            new_w = st_map.get_expert_slices(w_key, new_eids_arr)
+            new_s = st_map.get_expert_slices(s_key, new_eids_arr)
+            new_b = st_map.get_expert_slices(b_key, new_eids_arr) if b_key in st_map else None
+
+            if new_b is None:
+                mx.eval(new_w, new_s)
+            else:
+                mx.eval(new_w, new_s, new_b)
+
+            old_w = cache.weights.pop(proj_name)
+            cache.weights[proj_name] = mx.concatenate([old_w, new_w], axis=0)
+
+            old_s = cache.scales.pop(proj_name)
+            cache.scales[proj_name] = mx.concatenate([old_s, new_s], axis=0)
+
+            if cache.biases.get(proj_name) is not None and new_b is not None:
+                old_b = cache.biases.pop(proj_name)
+                cache.biases[proj_name] = mx.concatenate([old_b, new_b], axis=0)
+
+        # Eval concatenated tensors
+        to_eval = []
+        for proj_name in _PROJ_NAMES:
+            if proj_name in cache.weights:
+                to_eval.extend([cache.weights[proj_name], cache.scales[proj_name]])
+                if cache.biases.get(proj_name) is not None:
+                    to_eval.append(cache.biases[proj_name])
+        if to_eval:
+            mx.eval(*to_eval)
+
+        # Update bookkeeping
+        all_ids = old_ids + new_ids
+        cache.capacity = len(all_ids)
+        cache.cached_ids = all_ids
+        cache.cached_set = set(all_ids)
+        for eid in new_ids:
+            cache.frequency.setdefault(eid, 1)
+            cache.last_active.setdefault(eid, 0)
+
+        cache.rebuild_lookup()
+        mx.eval(cache.lookup, cache.hit_mask)
+
+        layers_expanded += 1
+        total_loaded += len(new_ids)
+
+    mx.clear_cache()
+
+    # Re-wire memory
+    if hasattr(mx, "set_wired_limit"):
+        PREFILL_SCRATCH_RESERVE_GB = 4.0
+        active = mx.get_active_memory()
+        metal_total = mx.device_info()["memory_size"]
+        headroom = int(metal_total - PREFILL_SCRATCH_RESERVE_GB * 1e9)
+        wired = min(active, headroom)
+        mx.set_wired_limit(wired)
+
+    elapsed = time.time() - t0
+    active_gb = mx.get_active_memory() / 1e9
+
+    if target_capacity is not None:
+        config["capacity"] = target_capacity
+
+    if log_fn:
+        log_fn("🫁",
+            f"BREATHE ↑ experts={current_capacity}→{target_capacity or current_capacity} "
+            f"(+{total_loaded} reloaded) | {elapsed:.1f}s from SSD | "
+            f"mem={active_gb:.1f}GB | ready=full")
+
+    return {
+        "breathed": True,
+        "direction": "up",
+        "before": current_capacity,
+        "after": target_capacity or current_capacity,
+        "loaded": total_loaded,
+        "elapsed_s": round(elapsed, 1),
+        "active_memory_gb": round(active_gb, 1),
+    }
+
+
+def _get_headroom_gb() -> float:
+    """Current GPU headroom in GB."""
+    try:
+        active = mx.get_active_memory() / 1e9
+        total = mx.device_info()["memory_size"] / 1e9
+        return total - active - 2.0  # 2GB OS reserve
+    except Exception:
+        return 0.0
+
+
+# ── Frequency Stats Persistence ──────────────────────────────────────────────
+
+
+def save_frequency_stats(
+    model: nn.Module,
+    path: str,
+    merge_existing: bool = True,
+) -> None:
+    """Persist per-layer expert session frequency stats to JSON.
+
+    Saves session-only counts merged additively with existing historical file.
+    This way the file accumulates across sessions without double-counting.
+    """
+    from pathlib import Path
+
+    session_stats: Dict[str, Dict[str, int]] = {}
+
+    for i, layer in enumerate(model.layers):
+        switch, _ = _find_switch_mlp(layer, i)
+        if switch is None:
+            continue
+        proj = getattr(switch, "up_proj", None)
+        if not isinstance(proj, PredictiveCachedSwitchLinear):
+            continue
+        cache = proj._cache
+        if cache.session_frequency:
+            session_stats[str(i)] = {str(eid): cnt for eid, cnt in cache.session_frequency.items()}
+
+    if not session_stats:
+        return
+
+    # Merge session counts into existing historical file
+    if merge_existing:
+        existing = load_frequency_stats(path)
+        if existing:
+            for layer_key, freqs in session_stats.items():
+                if layer_key in existing:
+                    for eid, cnt in freqs.items():
+                        existing[layer_key][eid] = existing[layer_key].get(eid, 0) + cnt
+                else:
+                    existing[layer_key] = freqs
+            session_stats = existing
+
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with open(p, "w") as f:
+        json.dump({"version": 1, "layers": session_stats}, f, indent=1)
+
+    logger.info("[MOE] Frequency stats saved: %s (%d layers)", path, len(session_stats))
+
+
+def load_frequency_stats(path: str) -> Optional[Dict[str, Dict[str, int]]]:
+    """Load frequency stats from JSON. Returns None if file doesn't exist."""
+    from pathlib import Path
+    p = Path(path)
+    if not p.exists():
+        return None
+    try:
+        with open(p) as f:
+            data = json.load(f)
+        return data.get("layers", {})
+    except Exception as e:
+        logger.warning("[MOE] Failed to load frequency stats: %s", e)
+        return None
+
+
+def apply_historical_frequency(
+    model: nn.Module,
+    path: str,
+) -> int:
+    """Load historical frequency stats into live caches.
+
+    Populates historical_frequency (baseline) and adds to frequency
+    (combined view). Does NOT touch session_frequency.
+    Call at startup before any generation.
+    Returns number of layers seeded.
+    """
+    historical = load_frequency_stats(path)
+    if not historical:
+        return 0
+
+    seeded = 0
+    for i, layer in enumerate(model.layers):
+        switch, _ = _find_switch_mlp(layer, i)
+        if switch is None:
+            continue
+        proj = getattr(switch, "up_proj", None)
+        if not isinstance(proj, PredictiveCachedSwitchLinear):
+            continue
+
+        cache = proj._cache
+        layer_data = historical.get(str(i))
+        if not layer_data:
+            continue
+
+        for eid_str, cnt in layer_data.items():
+            eid = int(eid_str)
+            cache.historical_frequency[eid] = cnt
+            cache.frequency[eid] = cache.frequency.get(eid, 0) + cnt
+        seeded += 1
+
+    if seeded > 0:
+        logger.info("[MOE] Historical frequency applied: %d layers from %s", seeded, path)
+    return seeded
+

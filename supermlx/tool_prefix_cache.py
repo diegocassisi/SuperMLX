@@ -166,19 +166,36 @@ def compute_and_save(
 
     # Build a minimal messages list: one system message with system_body only,
     # no user/assistant turns. Tools are injected via the tools= kwarg.
-    prefix_messages = [{"role": "system", "content": system_body}]
-
-    # Tokenize: system + tools rendered via chat template, no generation prompt
-    # We use add_generation_prompt=False because we only want the prefix tokens,
-    # not the assistant turn marker (that comes from the real request).
+    # Some chat templates (e.g. Agents-A1) require at least one user message
+    # to render. Try without first; on failure, add a dummy user and strip it
+    # from the rendered text before tokenizing.
     if hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template:
-        prefix_text = tokenizer.apply_chat_template(
-            prefix_messages,
+        _tpl_kwargs = dict(
             tokenize=False,
             add_generation_prompt=False,
             tools=tools,
             enable_thinking=enable_thinking,
         )
+        try:
+            prefix_text = tokenizer.apply_chat_template(
+                [{"role": "system", "content": system_body}],
+                **_tpl_kwargs,
+            )
+        except Exception:
+            # Template requires a user message — render with dummy, strip it
+            full_text = tokenizer.apply_chat_template(
+                [{"role": "system", "content": system_body},
+                 {"role": "user", "content": "."}],
+                **_tpl_kwargs,
+            )
+            _marker = "<|im_start|>user"
+            _pos = full_text.rfind(_marker)
+            if _pos > 0:
+                prefix_text = full_text[:_pos]
+                logger.info("[DATA] dummy user stripped at pos=%d", _pos)
+            else:
+                prefix_text = full_text
+                logger.warning("[DATA] dummy user marker not found — using full text")
         prefix_tokens = tokenizer.encode(prefix_text, add_special_tokens=False)
     else:
         prefix_tokens = tokenizer.encode(system_body, add_special_tokens=True)

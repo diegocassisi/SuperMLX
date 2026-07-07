@@ -148,7 +148,7 @@ class Settings:
 
 def _normalize_model_family(value: Optional[str]) -> str:
     raw = (value or "").strip().lower()
-    if raw in {"qwen", "qwen3", "qen3", "qwopus"}:
+    if raw in {"qwen", "qwen3", "qen3", "qwopus", "agents"}:
         return "qwen3"
     if raw in {"glm", "glm4", "glm-4"}:
         return "glm4"
@@ -163,7 +163,7 @@ def _normalize_model_family(value: Optional[str]) -> str:
 
 def _infer_model_family(model_path: str) -> str:
     normalized = (model_path or "").strip().lower()
-    if "qwen" in normalized or "qwopus" in normalized:
+    if "qwen" in normalized or "qwopus" in normalized or "agents-a1" in normalized:
         return "qwen3"
     if "glm" in normalized:
         return "glm4"
@@ -202,7 +202,7 @@ def build_settings(script_dir: Path = Path(__file__).parent) -> Settings:
             ["PROMPT_CACHE_MAX_ENTRIES_PER_SESSION"],
             2,
         ),
-        prompt_cache_ttl_seconds=_env_int("PROMPT_CACHE_TTL_SECONDS", 30 * 60),
+        prompt_cache_ttl_seconds=_env_int("PROMPT_CACHE_TTL_SECONDS", 0),  # 0 = disabled (no time-based expiry)
         prompt_cache_session_max_idle_seconds=_env_int_any(
             ["PROMPT_CACHE_SESSION_MAX_IDLE_SECONDS"],
             30 * 60,
@@ -219,7 +219,7 @@ def build_settings(script_dir: Path = Path(__file__).parent) -> Settings:
         default_min_p=_env_float("DEFAULT_MIN_P", 0.0),
         default_repetition_penalty=_env_float("DEFAULT_REPETITION_PENALTY", 1.1),
         default_repetition_context_size=_env_int(
-            "DEFAULT_REPETITION_CONTEXT_SIZE", 512
+            "DEFAULT_REPETITION_CONTEXT_SIZE", 2048
         ),
         default_presence_penalty=_env_float("DEFAULT_PRESENCE_PENALTY", 0.0),
         default_presence_context_size=_env_int("DEFAULT_PRESENCE_CONTEXT_SIZE", 20),
