@@ -5240,9 +5240,10 @@ class APIHandler(BaseHTTPRequestHandler):
                 response_id = f"chatcmpl-{int(time.time())}"
                 # ── ANTHROPIC: send message_start + content_block_start immediately ──
                 _anthropic_streaming = self._is_anthropic
-                _anthropic_think_done = False
+                _seen_think_close = False  # True only after </think> is detected in stream
                 _anthropic_streamed_text = []  # chunks already sent via SSE
                 _anthropic_block_idx = 0
+                _anthropic_thinking_streamed = []  # thinking chunks for the thinking block
                 if _anthropic_streaming:
                     _msg_id = f"msg_{uuid.uuid4().hex[:24]}"
                     _msg_start = _sse_event("message_start", {
@@ -5254,14 +5255,23 @@ class APIHandler(BaseHTTPRequestHandler):
                             "usage": {"input_tokens": _est_tok, "output_tokens": 0},
                         },
                     })
-                    _block_start = _sse_event("content_block_start", {
-                        "type": "content_block_start", "index": 0,
-                        "content_block": {"type": "text", "text": ""},
-                    })
+                    # Start with thinking block when thinking is enabled,
+                    # otherwise start with text block directly.
+                    if enable_thinking:
+                        _block_start = _sse_event("content_block_start", {
+                            "type": "content_block_start", "index": 0,
+                            "content_block": {"type": "thinking", "thinking": ""},
+                        })
+                    else:
+                        _block_start = _sse_event("content_block_start", {
+                            "type": "content_block_start", "index": 0,
+                            "content_block": {"type": "text", "text": ""},
+                        })
+                        _seen_think_close = True  # No thinking expected
                     self.wfile.write(_msg_start.encode("utf-8"))
                     self.wfile.write(_block_start.encode("utf-8"))
                     self.wfile.flush()
-                    _pipeline_log("WIRE", request_id, "ANTHROPIC SSE: sent message_start + content_block_start")
+                    _pipeline_log("WIRE", request_id, f"ANTHROPIC SSE: sent message_start + content_block_start (thinking={enable_thinking})")
                 else:
                     role_chunk = {
                         "id": response_id,
@@ -5336,7 +5346,7 @@ class APIHandler(BaseHTTPRequestHandler):
                         # Count tokens while still inside <think> block.
                         # When limit is exceeded, break generation to prevent
                         # circular reasoning loops that produce 0 output.
-                        if not _anthropic_think_done and _max_thinking > 0:
+                        if not _seen_think_close and _max_thinking > 0:
                             _thinking_token_count += 1
                             if _thinking_token_count >= _max_thinking:
                                 _terminal_status(
@@ -5352,38 +5362,64 @@ class APIHandler(BaseHTTPRequestHandler):
                         if response_text:
                             raw_parts.append(response_text)
                             # ── ANTHROPIC LIVE STREAMING ─────────────────────
-                            # Stream output tokens as content_block_delta after
-                            # the </think> block ends. During thinking, the
-                            # keepalive thread keeps the connection alive.
-                            # If model doesn't think at all (no <think> tag),
-                            # start streaming from the first token.
-                            if _anthropic_streaming and not _anthropic_think_done:
+                            # Two-phase streaming: thinking block first, then
+                            # text block. Transition happens when </think> is
+                            # detected or when model doesn't use <think> tags.
+                            if _anthropic_streaming and not _seen_think_close:
                                 _acc = "".join(raw_parts)
                                 if "</think>" in _acc:
-                                    _anthropic_think_done = True
-                                    # Extract text after </think>
+                                    _seen_think_close = True
+                                    # Close thinking block (index 0)
+                                    self.wfile.write(_sse_event("content_block_stop", {
+                                        "type": "content_block_stop", "index": 0,
+                                    }).encode("utf-8"))
+                                    # Open text block (index 1)
+                                    _anthropic_block_idx = 1
+                                    self.wfile.write(_sse_event("content_block_start", {
+                                        "type": "content_block_start", "index": 1,
+                                        "content_block": {"type": "text", "text": ""},
+                                    }).encode("utf-8"))
+                                    # Stream text after </think>
                                     _post_think = _acc.split("</think>", 1)[1].lstrip("\n")
                                     if _post_think:
-                                        _delta_ev = _sse_event("content_block_delta", {
-                                            "type": "content_block_delta", "index": 0,
+                                        self.wfile.write(_sse_event("content_block_delta", {
+                                            "type": "content_block_delta", "index": 1,
                                             "delta": {"type": "text_delta", "text": _post_think},
-                                        })
-                                        self.wfile.write(_delta_ev.encode("utf-8"))
-                                        self.wfile.flush()
+                                        }).encode("utf-8"))
                                         _anthropic_streamed_text.append(_post_think)
-                                elif not _acc.lstrip().startswith("<think"):
-                                    # Model isn't thinking — stream immediately
-                                    _anthropic_think_done = True
-                                    _delta_ev = _sse_event("content_block_delta", {
-                                        "type": "content_block_delta", "index": 0,
+                                    self.wfile.flush()
+                                elif _acc.lstrip().startswith("<think"):
+                                    # Inside <think> — stream as thinking_delta
+                                    _think_content = _acc.split("<think>", 1)[1] if "<think>" in _acc else _acc
+                                    if _think_content and _think_content not in "".join(_anthropic_thinking_streamed):
+                                        _new_think = _think_content[len("".join(_anthropic_thinking_streamed)):]
+                                        if _new_think:
+                                            self.wfile.write(_sse_event("content_block_delta", {
+                                                "type": "content_block_delta", "index": 0,
+                                                "delta": {"type": "thinking_delta", "thinking": _new_think},
+                                            }).encode("utf-8"))
+                                            self.wfile.flush()
+                                            _anthropic_thinking_streamed.append(_new_think)
+                                else:
+                                    # No <think> tag — close empty thinking block, open text
+                                    _seen_think_close = True
+                                    self.wfile.write(_sse_event("content_block_stop", {
+                                        "type": "content_block_stop", "index": 0,
+                                    }).encode("utf-8"))
+                                    _anthropic_block_idx = 1
+                                    self.wfile.write(_sse_event("content_block_start", {
+                                        "type": "content_block_start", "index": 1,
+                                        "content_block": {"type": "text", "text": ""},
+                                    }).encode("utf-8"))
+                                    self.wfile.write(_sse_event("content_block_delta", {
+                                        "type": "content_block_delta", "index": 1,
                                         "delta": {"type": "text_delta", "text": _acc},
-                                    })
-                                    self.wfile.write(_delta_ev.encode("utf-8"))
+                                    }).encode("utf-8"))
                                     self.wfile.flush()
                                     _anthropic_streamed_text.append(_acc)
-                            elif _anthropic_streaming and _anthropic_think_done:
+                            elif _anthropic_streaming and _seen_think_close:
                                 _delta_ev = _sse_event("content_block_delta", {
-                                    "type": "content_block_delta", "index": 0,
+                                    "type": "content_block_delta", "index": _anthropic_block_idx,
                                     "delta": {"type": "text_delta", "text": response_text},
                                 })
                                 try:
@@ -5489,9 +5525,9 @@ class APIHandler(BaseHTTPRequestHandler):
 
                 # ── ANTHROPIC SSE OUTPUT ──────────────────────────────────
                 if self._is_anthropic:
-                    if _anthropic_streaming and _anthropic_think_done:
+                    if _anthropic_streaming and _seen_think_close:
                         # We already streamed content_block_delta events during
-                        # generation. Now close the block and message.
+                        # generation. Now close the current block and message.
                         _stop_reason = "end_turn"
                         if tool_calls:
                             _stop_reason = "tool_use"
@@ -5499,12 +5535,12 @@ class APIHandler(BaseHTTPRequestHandler):
                             _stop_reason = "max_tokens"
                         _closing_events = [
                             _sse_event("content_block_stop", {
-                                "type": "content_block_stop", "index": 0,
+                                "type": "content_block_stop", "index": _anthropic_block_idx,
                             }),
                         ]
                         # If there are tool_calls, add tool_use blocks
                         if tool_calls:
-                            _tc_idx = 1
+                            _tc_idx = _anthropic_block_idx + 1
                             for tc in tool_calls:
                                 func = tc.get("function", {})
                                 try:
