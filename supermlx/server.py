@@ -4619,19 +4619,30 @@ class APIHandler(BaseHTTPRequestHandler):
                                 _has_recurrent = not can_trim_prompt_cache(prompt_cache)
                                 _HYBRID_WASH_KV_LIMIT = 100_000
                                 # _kv_off > _m_len means the physical KV holds tokens beyond
-                                # the current request — definitive cross-session contamination.
-                                if _has_recurrent and _kv_off is not None and _kv_off > _m_len:
+                                # the current request. But normal same-session continuation
+                                # leaves a small overshoot (generated tokens from last turn).
+                                # True DPC contamination diverges by thousands of tokens.
+                                _DPC_CONTAMINATION_THRESHOLD = 2000
+                                if _has_recurrent and _kv_off is not None and _kv_off > _m_len + _DPC_CONTAMINATION_THRESHOLD:
                                     # Recurrent state is session-specific and can't be washed.
                                     prompt_cache = None
-                                    PROMPT_CACHE.evict_unpinned()
+                                    # Evict the correct store: compact runners live in
+                                    # PROMPT_CACHE_COMPACT, not MAIN.
+                                    if _is_embedded_agent:
+                                        PROMPT_CACHE_COMPACT.evict_unpinned()
+                                    else:
+                                        PROMPT_CACHE.evict_unpinned()
                                     import gc; gc.collect()
                                     rest_tokens = model_tokens
                                     _terminal_status("⚠️",
                                         f"FIX-31 v10: ArraysCache contaminated by DPC "
-                                        f"(kv_off={_kv_off} > request_len={_m_len}) — cold start")
+                                        f"(kv_off={_kv_off} > request_len={_m_len}+{_DPC_CONTAMINATION_THRESHOLD}) — cold start")
                                 elif _kv_off is not None and _kv_off > _HYBRID_WASH_KV_LIMIT:
                                     prompt_cache = None
-                                    PROMPT_CACHE.evict_unpinned()
+                                    if _is_embedded_agent:
+                                        PROMPT_CACHE_COMPACT.evict_unpinned()
+                                    else:
+                                        PROMPT_CACHE.evict_unpinned()
                                     import gc; gc.collect()
                                     rest_tokens = model_tokens
                                     _terminal_status("⚠️",
@@ -5133,7 +5144,14 @@ class APIHandler(BaseHTTPRequestHandler):
 
                 # POST-COMPACT PRE-WARMUP: after compact finishes, pre-warm MAIN
                 # with the summary so the next request doesn't cold-start 50K tokens.
-                if _is_embedded_agent and message_text and len(message_text) > 100:
+                # Guard: skip if MAIN already has a warm cache larger than TPC —
+                # title/slug generators are classified as compact runners but don't
+                # invalidate MAIN (they run in PROMPT_CACHE_COMPACT).
+                _main_max_len = max(
+                    (len(e.tokens) for e in PROMPT_CACHE._entries.values()), default=0
+                ) if PROMPT_CACHE._entries else 0
+                _tpc_len = len(_tpc._prefix_tokens) if _tpc.is_initialized() else 0
+                if _is_embedded_agent and message_text and len(message_text) > 100 and _main_max_len <= _tpc_len:
                     try:
                         _prewarm_post_compact(
                             summary_text=message_text,
@@ -5143,6 +5161,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     except Exception as _pw_err:
                         _terminal_status("⚠️",
                             f"POST-COMPACT PRE-WARMUP failed: {_pw_err} | req={request_id[:8]}")
+
 
 
                 # Expert Breathing: restore full capacity after generation
@@ -5427,7 +5446,12 @@ class APIHandler(BaseHTTPRequestHandler):
 
                 # POST-COMPACT PRE-WARMUP: after compact finishes, pre-warm MAIN
                 # with the summary so the next request doesn't cold-start 50K tokens.
-                if _is_embedded_agent and message_text and len(message_text) > 100:
+                # Guard: skip if MAIN already has a warm cache larger than TPC.
+                _main_max_len = max(
+                    (len(e.tokens) for e in PROMPT_CACHE._entries.values()), default=0
+                ) if PROMPT_CACHE._entries else 0
+                _tpc_len = len(_tpc._prefix_tokens) if _tpc.is_initialized() else 0
+                if _is_embedded_agent and message_text and len(message_text) > 100 and _main_max_len <= _tpc_len:
                     try:
                         _prewarm_post_compact(
                             summary_text=message_text,
@@ -5797,7 +5821,7 @@ class APIHandler(BaseHTTPRequestHandler):
 
 
 def run():
-    start_litellm_proxy()
+    #start_litellm_proxy()
     server_address = (SETTINGS.mlx_host, SETTINGS.mlx_port)
     httpd = ThreadingHTTPServer(server_address, APIHandler)
 
@@ -5835,7 +5859,7 @@ def run():
     print("🟢 SYSTEM READY")
     print(f"   • Mode:         {'VLM (vision)' if is_vlm else 'LM (text-only)'}")
     print(f"   • MLX Engine:   http://{SETTINGS.mlx_host}:{SETTINGS.mlx_port}")
-    print(f"   • LiteLLM:      http://0.0.0.0:{SETTINGS.proxy_port}")
+    #print(f"   • LiteLLM:      http://0.0.0.0:{SETTINGS.proxy_port}")
     if sidecar_httpd:
         rag_tag = " + RAG" if (SETTINGS.sidecar_enable_rag and _rag_available) else ""
         print(f"   • Sidecar:      http://{SETTINGS.mlx_host}:{SETTINGS.sidecar_port}{rag_tag}")
