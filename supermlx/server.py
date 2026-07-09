@@ -5362,9 +5362,10 @@ class APIHandler(BaseHTTPRequestHandler):
                         if response_text:
                             raw_parts.append(response_text)
                             # ── ANTHROPIC LIVE STREAMING ─────────────────────
-                            # Two-phase streaming: thinking block first, then
-                            # text block. Transition happens when </think> is
-                            # detected or when model doesn't use <think> tags.
+                            # The chat template puts <think>\n in the PROMPT when
+                            # enable_thinking=True. Model output is the continuation
+                            # AFTER that tag — so output never starts with <think>.
+                            # All output is thinking until </think> appears.
                             if _anthropic_streaming and not _seen_think_close:
                                 _acc = "".join(raw_parts)
                                 if "</think>" in _acc:
@@ -5388,35 +5389,16 @@ class APIHandler(BaseHTTPRequestHandler):
                                         }).encode("utf-8"))
                                         _anthropic_streamed_text.append(_post_think)
                                     self.wfile.flush()
-                                elif _acc.lstrip().startswith("<think"):
-                                    # Inside <think> — stream as thinking_delta
-                                    _think_content = _acc.split("<think>", 1)[1] if "<think>" in _acc else _acc
-                                    if _think_content and _think_content not in "".join(_anthropic_thinking_streamed):
-                                        _new_think = _think_content[len("".join(_anthropic_thinking_streamed)):]
-                                        if _new_think:
-                                            self.wfile.write(_sse_event("content_block_delta", {
-                                                "type": "content_block_delta", "index": 0,
-                                                "delta": {"type": "thinking_delta", "thinking": _new_think},
-                                            }).encode("utf-8"))
-                                            self.wfile.flush()
-                                            _anthropic_thinking_streamed.append(_new_think)
                                 else:
-                                    # No <think> tag — close empty thinking block, open text
-                                    _seen_think_close = True
-                                    self.wfile.write(_sse_event("content_block_stop", {
-                                        "type": "content_block_stop", "index": 0,
-                                    }).encode("utf-8"))
-                                    _anthropic_block_idx = 1
-                                    self.wfile.write(_sse_event("content_block_start", {
-                                        "type": "content_block_start", "index": 1,
-                                        "content_block": {"type": "text", "text": ""},
-                                    }).encode("utf-8"))
-                                    self.wfile.write(_sse_event("content_block_delta", {
-                                        "type": "content_block_delta", "index": 1,
-                                        "delta": {"type": "text_delta", "text": _acc},
-                                    }).encode("utf-8"))
-                                    self.wfile.flush()
-                                    _anthropic_streamed_text.append(_acc)
+                                    # Still in thinking — stream as thinking_delta
+                                    _new_think = response_text
+                                    if _new_think:
+                                        self.wfile.write(_sse_event("content_block_delta", {
+                                            "type": "content_block_delta", "index": 0,
+                                            "delta": {"type": "thinking_delta", "thinking": _new_think},
+                                        }).encode("utf-8"))
+                                        self.wfile.flush()
+                                        _anthropic_thinking_streamed.append(_new_think)
                             elif _anthropic_streaming and _seen_think_close:
                                 _delta_ev = _sse_event("content_block_delta", {
                                     "type": "content_block_delta", "index": _anthropic_block_idx,
