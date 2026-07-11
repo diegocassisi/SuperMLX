@@ -5454,6 +5454,44 @@ class APIHandler(BaseHTTPRequestHandler):
                                     f"THINKING_LIMIT_HIT: {_thinking_token_count} thinking tokens, "
                                     f"limit={_max_thinking}. Breaking generation loop.")
                                 break
+
+                        # ── N-GRAM LOOP DETECTION ────────────────────────
+                        # Detect verbatim phrase repetition in generated output.
+                        # Every _NGRAM_CHECK_INTERVAL tokens, check if the last
+                        # _NGRAM_SIZE tokens appeared earlier in the output.
+                        # If the same n-gram repeats _NGRAM_MAX_REPEATS times,
+                        # force stop to prevent infinite loops like:
+                        #   "I need to use the correct tool. I already wrote..."
+                        #   repeating 20+ times.
+                        _NGRAM_SIZE = 20         # tokens per n-gram
+                        _NGRAM_MAX_REPEATS = 3   # max allowed repeats before break
+                        _NGRAM_CHECK_INTERVAL = 32  # check every N tokens
+                        _n_gen = len(generated_tokens)
+                        if (
+                            _n_gen >= _NGRAM_SIZE * 2
+                            and _n_gen % _NGRAM_CHECK_INTERVAL == 0
+                        ):
+                            _tail = tuple(generated_tokens[-_NGRAM_SIZE:])
+                            _search_region = generated_tokens[:-_NGRAM_SIZE]
+                            _repeat_count = 0
+                            for _si in range(len(_search_region) - _NGRAM_SIZE + 1):
+                                if tuple(_search_region[_si:_si + _NGRAM_SIZE]) == _tail:
+                                    _repeat_count += 1
+                                    if _repeat_count >= _NGRAM_MAX_REPEATS:
+                                        break
+                            if _repeat_count >= _NGRAM_MAX_REPEATS:
+                                _terminal_status(
+                                    "🛑",
+                                    f"NGRAM LOOP: {_NGRAM_SIZE}-token sequence repeated "
+                                    f"{_repeat_count + 1}x after {_n_gen} tokens. "
+                                    f"Forcing generation stop.",
+                                    indent=1,
+                                )
+                                _pipeline_log("GEN", request_id,
+                                    f"NGRAM_LOOP_BREAK: {_NGRAM_SIZE}-gram repeated "
+                                    f"{_repeat_count + 1}x at token {_n_gen}. "
+                                    f"Breaking generation loop.")
+                                break
                         if response_text:
                             raw_parts.append(response_text)
                             # ── ANTHROPIC LIVE STREAMING ─────────────────────
