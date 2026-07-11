@@ -4044,26 +4044,27 @@ class APIHandler(BaseHTTPRequestHandler):
         _pipeline_timings = {}  # stage -> ms
         raw_messages_inbound = body.get("messages", [])
 
-        # ── TOOL RESULT TRUNCATION (temporary measure until plan §11 is implemented) ──
-        # Prevents web_fetch/pdf of large documents from blowing GPU memory.
-        # When §11 is implemented (ephemeral workspace + embeddings), this block
-        # can be removed because the model will never receive the full document.
-        _MAX_TOOL_RESULT_CHARS = int(os.environ.get("MAX_TOOL_RESULT_CHARS", "20000"))
-        _tool_truncations = 0
+        # ── TOOL RESULT SIZE LOGGING (pass-through, no truncation) ─────────
+        # Previously truncated tool results > MAX_TOOL_RESULT_CHARS (20K chars),
+        # silently mutilating skills (up to 80% loss) and data. Removed because:
+        # 1. A model cannot truncate its own skills — it degrades silently
+        # 2. The COMPACT GUARD (line ~4978) already handles oversized prompts
+        #    by returning a standard 400 error that Hermes handles via compaction
+        # 3. Per Gabriel Pinto: "the model isn't lying, it's answering from
+        #    incomplete data because nothing in the input flagged the cut"
+        # Ref: wiki/MLXServer/challenges/tool_result_truncation.md
+        _large_tool_results = 0
+        _largest_tool_chars = 0
         for _msg in raw_messages_inbound:
             if (_msg.get("role") or "").lower() == "tool":
                 _tc = _msg.get("content", "")
-                if isinstance(_tc, str) and len(_tc) > _MAX_TOOL_RESULT_CHARS:
-                    _msg["content"] = (
-                        _tc[:_MAX_TOOL_RESULT_CHARS]
-                        + f"\n\n[TRUNCATED: tool result exceeded {_MAX_TOOL_RESULT_CHARS} characters. "
-                        f"Implement plan §11 (ephemeral workspace + embeddings) to remove this limit.]"
-                    )
-                    _tool_truncations += 1
-        if _tool_truncations > 0:
+                if isinstance(_tc, str) and len(_tc) > 20000:
+                    _large_tool_results += 1
+                    _largest_tool_chars = max(_largest_tool_chars, len(_tc))
+        if _large_tool_results > 0:
             _pipeline_log("INBOUND", request_id,
-                f"tool_result_truncation={_tool_truncations} | limit={_MAX_TOOL_RESULT_CHARS} chars "
-                f"| TEMP measure until plan §11 (ephemeral workspace)")
+                f"large_tool_results={_large_tool_results} | largest={_largest_tool_chars} chars "
+                f"| pass-through (no truncation)")
 
 
         # Always estimate prompt tokens — needed for Anthropic usage reporting
