@@ -92,13 +92,20 @@ def generate_title_nl(user_message: str, max_words: int = 5) -> Optional[str]:
     if not user_message or not user_message.strip():
         return "New Session"
 
-    # The title_generator sends: "User: <snippet>\n\nAssistant: <snippet>"
-    # Extract just the user part for better keyword extraction
+    # Extract the actual user text from either format:
+    #   Hermes:     "User: <snippet>\n\nAssistant: <snippet>"
+    #   Claude Code: "<session>\n<user text>\n</session>\n\nWrite the title..."
     text = user_message
     if text.startswith("User: "):
-        # Split at "Assistant: " and take user part
+        # Hermes format — split at "Assistant: " and take user part
         parts = text.split("\n\nAssistant: ", 1)
         text = parts[0][6:]  # Remove "User: " prefix
+    elif "<session>" in text:
+        # Claude Code format — extract content between <session> tags
+        import re
+        match = re.search(r"<session>\s*(.*?)\s*</session>", text, re.DOTALL)
+        if match:
+            text = match.group(1)
 
     # Cap input length
     text = text[:300]
