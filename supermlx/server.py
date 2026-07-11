@@ -230,6 +230,11 @@ FEATURE_COMPRESSOR            = _env_str("FEATURE_COMPRESSOR", "false").lower() 
 # Only needs LLMLingua (CPU BERT), not the full reranker+compression pipeline.
 FEATURE_EMERGENCY_COMPRESS    = _env_str("EMERGENCY_CONTENT_COMPRESS", "true").lower() in ("1", "true", "yes")
 
+# Hermes compact prompt swap: when Hermes sends a compaction request,
+# replace its generic summarization prompt with Claude Code's structured
+# COMPACT_PROMPT (9 sections, analysis+summary tags). Default off.
+FEATURE_HERMES_COMPACT_SWAP   = _env_str("HERMES_COMPACT_SWAP", "false").lower() in ("1", "true", "yes")
+
 # Prefill step size: tokens processed per chunk during prompt prefill.
 # Smaller = less Metal scratch memory (score matrix = chunk × kv_length per attn layer).
 # Default 512 keeps peak under ~14 GB for 47K-token cold-starts on 24 GB machines.
@@ -3853,8 +3858,15 @@ class APIHandler(BaseHTTPRequestHandler):
             # Stripping them cuts prefill from ~37K to ~5K model_tokens,
             # eliminating OOM and reducing compact time from ~130s to ~17s.
             _compact_stripped_tools = 0
-            if raw.get("tools"):
+            _hermes_compact_swapped = False
+            if raw.get("tools") or raw.get("messages"):
                 _last_user = ""
+                _system_text = ""
+                for _m in raw.get("messages", []):
+                    if _m.get("role") == "system":
+                        _sc = _m.get("content", "")
+                        if isinstance(_sc, str):
+                            _system_text = _sc
                 for _m in reversed(raw.get("messages", [])):
                     if _m.get("role") == "user":
                         _c = _m.get("content", "")
@@ -3866,11 +3878,31 @@ class APIHandler(BaseHTTPRequestHandler):
                                 if isinstance(b, dict) and b.get("type") == "text"
                             )
                         break
-                if "CRITICAL: Respond with TEXT ONLY" in _last_user[:200]:
+
+                # Claude Code compact: detect by user message phrase
+                if raw.get("tools") and "CRITICAL: Respond with TEXT ONLY" in _last_user[:200]:
                     _compact_stripped_tools = len(raw["tools"])
                     raw["tools"] = []
                     _terminal_status("🪶",
                         f"COMPACT TOOL STRIP: removed {_compact_stripped_tools} tool definitions from compact request")
+
+                # Hermes compact: detect by system prompt phrase, swap prompt
+                elif (FEATURE_HERMES_COMPACT_SWAP
+                      and "summarization agent" in _system_text[:200]
+                      and "context checkpoint" in _system_text[:200]):
+                    # Strip tools if present
+                    if raw.get("tools"):
+                        _compact_stripped_tools = len(raw["tools"])
+                        raw["tools"] = []
+                    # Replace system prompt with Claude Code's structured COMPACT_PROMPT
+                    from .server_compact import COMPACT_PROMPT as _CC_COMPACT_PROMPT
+                    for _m in raw.get("messages", []):
+                        if _m.get("role") == "system":
+                            _m["content"] = _CC_COMPACT_PROMPT
+                            break
+                    _hermes_compact_swapped = True
+                    _terminal_status("🪶",
+                        f"HERMES COMPACT SWAP: replaced prompt + stripped {_compact_stripped_tools} tools")
 
             body = anthropic_to_openai_body(raw, SETTINGS.proxy_model_id)
             # Jump past the body-parse block that follows.
