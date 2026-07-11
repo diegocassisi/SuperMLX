@@ -3886,19 +3886,30 @@ class APIHandler(BaseHTTPRequestHandler):
                     _terminal_status("🪶",
                         f"COMPACT TOOL STRIP: removed {_compact_stripped_tools} tool definitions from compact request")
 
-                # Hermes compact: detect by system prompt phrase, swap prompt
+                # Hermes compact: detect by user message OR system prompt phrase
+                # Hermes sends compact as a single user message (no system msg).
                 elif (FEATURE_HERMES_COMPACT_SWAP
-                      and "summarization agent" in _system_text[:200]
-                      and "context checkpoint" in _system_text[:200]):
+                      and (("summarization agent" in _last_user[:200]
+                            and "context checkpoint" in _last_user[:200])
+                           or ("summarization agent" in _system_text[:200]
+                               and "context checkpoint" in _system_text[:200]))):
                     # Strip tools if present
                     if raw.get("tools"):
                         _compact_stripped_tools = len(raw["tools"])
                         raw["tools"] = []
-                    # Replace system prompt with Claude Code's structured COMPACT_PROMPT
+                    # Prepend Claude Code's structured COMPACT_PROMPT to the user message
+                    # Hermes already serialized the conversation as user content — keep it,
+                    # just replace the generic instruction with the structured one.
                     from .server_compact import COMPACT_PROMPT as _CC_COMPACT_PROMPT
-                    for _m in raw.get("messages", []):
-                        if _m.get("role") == "system":
-                            _m["content"] = _CC_COMPACT_PROMPT
+                    for _m in reversed(raw.get("messages", [])):
+                        if _m.get("role") == "user":
+                            _original = _m.get("content", "")
+                            if isinstance(_original, str):
+                                # Strip Hermes's generic instruction, keep conversation data
+                                # The conversation data typically starts after the first newline block
+                                _conv_start = _original.find("\n\n")
+                                _conv_data = _original[_conv_start:] if _conv_start > 0 else "\n\n" + _original
+                                _m["content"] = _CC_COMPACT_PROMPT + _conv_data
                             break
                     _hermes_compact_swapped = True
                     _terminal_status("🪶",
