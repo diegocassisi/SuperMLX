@@ -58,9 +58,13 @@ def _strip_thinking_from_content(text: str) -> str:
     out = THINK_TAG_STRIP_PATTERN.sub("", text)
     # Then remove Gemma 4 pipe-style think blocks.
     out = GEMMA4_THINK_STRIP_PATTERN.sub("", out)
-    # Remove orphan close tags (both styles).
-    out = THINK_ORPHAN_CLOSE_PATTERN.sub("", out, count=1)
-    out = GEMMA4_THINK_ORPHAN_PATTERN.sub("", out, count=1)
+    # Remove orphan close tags (both styles), but only if content remains after.
+    candidate = THINK_ORPHAN_CLOSE_PATTERN.sub("", out, count=1)
+    if candidate.strip():
+        out = candidate
+    candidate = GEMMA4_THINK_ORPHAN_PATTERN.sub("", out, count=1)
+    if candidate.strip():
+        out = candidate
     return out.strip()
 
 
@@ -233,7 +237,7 @@ def _convert_markdown_tool_calls(text: str) -> str:
 
     Models conditioned by Claude Code's system prompt sometimes output tool calls
     as markdown code blocks (```bash\\nls -la\\n```) instead of the structured
-    <tool_call><function=Bash> format. This rewrites those blocks so the main
+    <tool_call><function=terminal> format. This rewrites those blocks so the main
     extraction chain picks them up.
     """
     # Map markdown language hints to interpreter commands
@@ -244,7 +248,7 @@ def _convert_markdown_tool_calls(text: str) -> str:
         "ruby": "ruby", "rb": "ruby",
         "perl": "perl",
     }
-    _SHELL_LANGS = {"bash", "sh", "shell", "zsh", ""}
+    _SHELL_LANGS = {"bash", "sh", "shell", "zsh"}
 
     def _replace_block(match):
         lang = match.group(1).strip().lower()
@@ -252,18 +256,15 @@ def _convert_markdown_tool_calls(text: str) -> str:
         if not content:
             return match.group(0)
         if lang in _SHELL_LANGS:
-            # Only convert if it looks like a command (not a large code snippet)
-            if content.count("\n") > 10 or len(content) > 2000:
-                return match.group(0)
             cmd = content
         elif lang in _INTERPRETERS:
             interp = _INTERPRETERS[lang]
             cmd = f"{interp} << 'HEREDOC_EOF'\n{content}\nHEREDOC_EOF"
         else:
-            # Unknown language — still try as a bash command
-            cmd = content
+            # Unknown language — leave as-is (display code, not a command)
+            return match.group(0)
         return (
-            f"\n<tool_call>\n<function=Bash>\n"
+            f"\n<tool_call>\n<function=terminal>\n"
             f"<parameter=command>\n{cmd}\n</parameter>\n"
             f"</function>\n</tool_call>\n"
         )
@@ -337,8 +338,17 @@ def _extract_openai_tool_calls(text, model_family):
         Expects body to be raw JSON: {"name": "func", "arguments": {...}}
         or {"function": {"name": ..., "arguments": ...}} (OpenAI-compat variant).
         """
+        body_clean = body.strip()
+        if body_clean.startswith("```"):
+            lines = body_clean.split("\n")
+            if lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].startswith("```"):
+                lines = lines[:-1]
+            body_clean = "\n".join(lines).strip()
+
         try:
-            data = json.loads(body)
+            data = json.loads(body_clean)
         except (json.JSONDecodeError, ValueError):
             return None
         if not isinstance(data, dict):
@@ -421,6 +431,7 @@ def _extract_openai_tool_calls(text, model_family):
     cursor = 0
     for start, end in remove_spans:
         if start < cursor:
+            cursor = max(cursor, end)
             continue  # Skip overlapping span
         if start > cursor:
             cleaned_parts.append(text[cursor:start])
