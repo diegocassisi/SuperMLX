@@ -708,7 +708,10 @@ def run_startup(
                 _log("ℹ️", "DPC: no prefix hash on disk — first request will cold-start")
 
         # ── 2. Load EMBEDDED cache (PROMPT_CACHE_COMPACT) ────────────────────
-        if embedded_persist_path and embedded_persist_path.exists():
+        # DISABLED: OpenClaw compact runner is no longer in use.
+        # PROMPT_CACHE_COMPACT is never populated at runtime, so skip loading
+        # the disk cache to save ~9K tokens of GPU memory at startup.
+        if False and embedded_persist_path and embedded_persist_path.exists():
             emb_tokens, emb_cache = load_cache(
                 embedded_persist_path, model, max_kv_size, is_vlm, log_fn=_log,
             )

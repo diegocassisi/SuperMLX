@@ -46,6 +46,10 @@ GEMMA4_THINK_ORPHAN_PATTERN = re.compile(
 # Orphan </think>: content from start up to and including </think> so we hide reasoning when model
 # outputs "reasoning text</think>\n\nanswer" without a leading <think> tag.
 THINK_ORPHAN_CLOSE_PATTERN = re.compile(r"^.*?</think>\s*", re.DOTALL | re.IGNORECASE)
+# Orphan <think> without </think>: generation was cut mid-thinking (e.g. THINKING_LIMIT,
+# NGRAM_LOOP). Strip everything from <think> to end-of-string.
+THINK_ORPHAN_OPEN_PATTERN = re.compile(r"<think>.*$", re.DOTALL | re.IGNORECASE)
+GEMMA4_THINK_ORPHAN_OPEN_PATTERN = re.compile(r"<\|think\|>.*$", re.DOTALL | re.IGNORECASE)
 
 
 # ── Functions ─────────────────────────────────────────────────────────────────
@@ -63,6 +67,13 @@ def _strip_thinking_from_content(text: str) -> str:
     if candidate.strip():
         out = candidate
     candidate = GEMMA4_THINK_ORPHAN_PATTERN.sub("", out, count=1)
+    if candidate.strip():
+        out = candidate
+    # Remove orphan open tags (generation cut mid-thinking without </think>).
+    candidate = THINK_ORPHAN_OPEN_PATTERN.sub("", out)
+    if candidate.strip():
+        out = candidate
+    candidate = GEMMA4_THINK_ORPHAN_OPEN_PATTERN.sub("", out)
     if candidate.strip():
         out = candidate
     return out.strip()

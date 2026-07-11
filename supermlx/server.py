@@ -5221,6 +5221,15 @@ class APIHandler(BaseHTTPRequestHandler):
                             f"Request {request_id} in progress | generated_tokens={len(generated_tokens)} | {_decode_tps:.1f} tok/s | {_metal_mem_str()}",
                             indent=1,
                         )
+                # ── THINKING CLEANUP (non-stream) ─────────────────────────
+                # If generation ended while still inside <think> (e.g. THINKING_LIMIT
+                # or NGRAM_LOOP broke mid-thinking), inject synthetic </think> so
+                # downstream _strip_thinking_from_content can properly strip it.
+                if enable_thinking and _in_think_ns and generated_parts:
+                    generated_parts.append("</think>\n")
+                    _pipeline_log("GEN", request_id,
+                        "THINK_CLEANUP: injected synthetic </think> after forced break (non-stream)")
+
                 response_text = "".join(generated_parts)
                 raw_response_text = response_text
                 response_text = _normalize_assistant_text(
@@ -5593,6 +5602,28 @@ class APIHandler(BaseHTTPRequestHandler):
                     # Stop keepalive thread BEFORE writing actual content chunks
                     _keepalive_stop.set()
                     _keepalive_thread.join(timeout=2)
+
+                # ── THINKING CLEANUP (stream) ──────────────────────────────
+                # If generation ended while still inside <think> (e.g. THINKING_LIMIT
+                # or NGRAM_LOOP broke mid-thinking), inject synthetic </think> and
+                # properly transition Anthropic SSE blocks.
+                if enable_thinking and not _seen_think_close and raw_parts:
+                    raw_parts.append("</think>\n")
+                    _seen_think_close = True
+                    if _anthropic_streaming:
+                        # Close the open thinking block (index 0)
+                        self.wfile.write(_sse_event("content_block_stop", {
+                            "type": "content_block_stop", "index": 0,
+                        }).encode("utf-8"))
+                        # Open text block (index 1) for any post-think content
+                        _anthropic_block_idx = 1
+                        self.wfile.write(_sse_event("content_block_start", {
+                            "type": "content_block_start", "index": 1,
+                            "content_block": {"type": "text", "text": ""},
+                        }).encode("utf-8"))
+                        self.wfile.flush()
+                    _pipeline_log("GEN", request_id,
+                        "THINK_CLEANUP: injected synthetic </think> after forced break (stream)")
 
                 full_text = "".join(raw_parts)
                 raw_full_text = full_text

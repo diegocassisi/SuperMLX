@@ -387,40 +387,13 @@ def _is_rag_bypass_request(messages: List[Dict[str, Any]]) -> bool:
 
 
 def _detect_compact_runner(messages: List[Dict[str, Any]], tools: Any) -> bool:
-    """Detects if the incoming request is from OpenClaw's compact runner."""
-    has_tools = tools is not None and len(tools) > 0
-    if has_tools:
-        return False
-    for msg in messages:
-        if (msg.get("role") or "").lower() == "system":
-            content = msg.get("content", "")
-            if isinstance(content, str):
-                content_lower = content.lower()
-                if any(sig in content_lower for sig in _COMPACT_RUNNER_SIGNALS):
-                    return True
-            elif isinstance(content, list):
-                for part in content:
-                    if isinstance(part, dict):
-                        text = (part.get("text") or part.get("content") or "").lower()
-                        if any(sig in text for sig in _COMPACT_RUNNER_SIGNALS):
-                            return True
-    _MAIN_AGENT_INDICATORS = ["<tools>", "function", "you are", "tool_choice", "<environment"]
-    est_tokens = _estimate_token_count(messages)
-    if est_tokens > 8000:
-        for msg in messages:
-            if (msg.get("role") or "").lower() == "system":
-                content = msg.get("content", "")
-                if isinstance(content, str):
-                    content_lower = content.lower()
-                    if any(ind in content_lower for ind in _MAIN_AGENT_INDICATORS):
-                        return False
-                elif isinstance(content, list):
-                    for part in content:
-                        if isinstance(part, dict):
-                            text = (part.get("text") or part.get("content") or "").lower()
-                            if any(ind in text for ind in _MAIN_AGENT_INDICATORS):
-                                return False
-        return True
+    """Detects if the incoming request is from OpenClaw's compact runner.
+
+    DISABLED: OpenClaw is no longer in use. Hermes and Claude Code handle their
+    own compaction and don't need the embedded agent treatment (separate cache,
+    128-token thinking limit, RAG skip, etc.). All requests now go through the
+    normal MAIN pipeline.
+    """
     return False
 
 
