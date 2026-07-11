@@ -4433,8 +4433,9 @@ class APIHandler(BaseHTTPRequestHandler):
         # Always use server DEFAULT_MAX_TOKENS — Claude Code sends max_tokens=8192
         # which truncates long code generation. We override it entirely.
         max_tokens = SETTINGS.default_max_tokens
-        # Compact runner (title generation) needs ~20 output tokens.
-        # Cap total budget to avoid wasting 35s on thinking for a JSON title.
+        # Compact runner (context compaction) needs short output.
+        # Cap total budget to avoid wasting 35s on thinking for a summary.
+        # Note: title generation is intercepted earlier by the NL fast path.
         if _is_embedded_agent:
             max_tokens = 256
         is_streaming = body.get("stream", False)
