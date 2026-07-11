@@ -4619,7 +4619,7 @@ class APIHandler(BaseHTTPRequestHandler):
                         
                         if _cache_extended:
                             # For hybrid models, we need a min-suffix to wash out the recurrent state.
-                            _MIN_POLLUTION_SUFFIX = 256
+                            _MIN_POLLUTION_SUFFIX = 512
                             _suffix_len = max(_MIN_POLLUTION_SUFFIX, _canonical_suffix)
                             _terminal_status("DEBUG",
                                 f"FIX-31 v9: Cache polluted. canonical_suffix={_canonical_suffix} | effective={_suffix_len}")
