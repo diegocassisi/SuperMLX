@@ -4720,19 +4720,51 @@ class APIHandler(BaseHTTPRequestHandler):
                                 # True DPC contamination diverges by thousands of tokens.
                                 _DPC_CONTAMINATION_THRESHOLD = 2000
                                 if _has_recurrent and _kv_off is not None and _kv_off > _m_len + _DPC_CONTAMINATION_THRESHOLD:
-                                    # Recurrent state is session-specific and can't be washed.
-                                    prompt_cache = None
-                                    # Evict the correct store: compact runners live in
-                                    # PROMPT_CACHE_COMPACT, not MAIN.
-                                    if _is_embedded_agent:
-                                        PROMPT_CACHE_COMPACT.evict_unpinned()
+                                    # FIX-31 v11: Before cold-starting, check SESSION_TURN_STORE to
+                                    # distinguish same-session shrink (Hermes compacted, Hermes varies
+                                    # msg count) from genuine cross-session DPC contamination.
+                                    #
+                                    # SESSION_TURN_STORE is keyed by real session_id — NOT a content
+                                    # hash. stable_prefix_token_len_computed (computed at line ~4539)
+                                    # tells us how many tokens from the start of this prompt were
+                                    # stable across the prior turn of THIS session.
+                                    #
+                                    # If ≥90% of the current prompt is stable from the same session,
+                                    # the recurrent state accumulated so far is coherent — hybrid wash
+                                    # of the delta is safe and avoids the 57s cold-start penalty.
+                                    # Threshold 90% (not 98%) absorbs canonicalization variance.
+                                    #
+                                    # If no session_id, no prior turn, or low stability → genuine
+                                    # contamination → cold start as before (v10 path).
+                                    _is_same_session_shrink = (
+                                        bool(_session_id_for_turn)
+                                        and stable_prefix_token_len_computed > 0
+                                        and stable_prefix_token_len_computed >= int(_m_len * 0.90)
+                                    )
+                                    if _is_same_session_shrink:
+                                        _v11_delta = _m_len - stable_prefix_token_len_computed
+                                        _v11_wash = max(512, _v11_delta)
+                                        rest_tokens = model_tokens[-_v11_wash:]
+                                        _terminal_status("🔧",
+                                            f"FIX-31 v11: Same-session shrink "
+                                            f"(stable={stable_prefix_token_len_computed}/{_m_len}"
+                                            f"={stable_prefix_token_len_computed/_m_len:.1%}) "
+                                            f"kv_off={_kv_off} — hybrid wash {_v11_wash} tok "
+                                            f"(avoided cold start)")
                                     else:
-                                        PROMPT_CACHE.evict_unpinned()
-                                    import gc; gc.collect()
-                                    rest_tokens = model_tokens
-                                    _terminal_status("⚠️",
-                                        f"FIX-31 v10: ArraysCache contaminated by DPC "
-                                        f"(kv_off={_kv_off} > request_len={_m_len}+{_DPC_CONTAMINATION_THRESHOLD}) — cold start")
+                                        # Recurrent state is session-specific and can't be washed.
+                                        prompt_cache = None
+                                        # Evict the correct store: compact runners live in
+                                        # PROMPT_CACHE_COMPACT, not MAIN.
+                                        if _is_embedded_agent:
+                                            PROMPT_CACHE_COMPACT.evict_unpinned()
+                                        else:
+                                            PROMPT_CACHE.evict_unpinned()
+                                        import gc; gc.collect()
+                                        rest_tokens = model_tokens
+                                        _terminal_status("⚠️",
+                                            f"FIX-31 v10: ArraysCache contaminated by DPC "
+                                            f"(kv_off={_kv_off} > request_len={_m_len}+{_DPC_CONTAMINATION_THRESHOLD}) — cold start")
                                 elif _kv_off is not None and _kv_off > _HYBRID_WASH_KV_LIMIT:
                                     prompt_cache = None
                                     if _is_embedded_agent:
