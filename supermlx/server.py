@@ -3941,7 +3941,12 @@ class APIHandler(BaseHTTPRequestHandler):
                     _title_user_msg = str(_tm.get("content") or "")
                     break
             _t0_title = time.time()
-            _nl_title = generate_title_nl(_title_user_msg)
+            try:
+                _nl_title = generate_title_nl(_title_user_msg)
+            except Exception as _nl_err:
+                _pipeline_log("NL_TITLE", request_id,
+                    f"NL.framework crashed: {_nl_err!r} — falling through to LLM")
+                _nl_title = None
             _title_ms = (time.time() - _t0_title) * 1000
             if _nl_title:
                 _pipeline_log("NL_TITLE", request_id,

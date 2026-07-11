@@ -128,8 +128,29 @@ def generate_title_nl(user_message: str, max_words: int = 5) -> Optional[str]:
     if results and len(results) == 2:
         tags, ranges = results
         for tag, rng in zip(tags, ranges):
-            loc = rng.rangeValue().location
-            length = rng.rangeValue().length
+            # pyobjc versions return ranges in different forms:
+            #  - NSValue wrapping NSRange → rng.rangeValue()
+            #  - tuple (location, length) → rng[0], rng[1]
+            #  - string "{loc, len}" → parse manually
+            try:
+                if hasattr(rng, 'rangeValue'):
+                    _rv = rng.rangeValue()
+                    loc, length = _rv.location, _rv.length
+                elif isinstance(rng, (tuple, list)):
+                    loc, length = int(rng[0]), int(rng[1])
+                elif isinstance(rng, str):
+                    # Format: "{123, 4}" or "NSRange(123, 4)"
+                    import re
+                    _m = re.search(r'(\d+)\D+(\d+)', rng)
+                    if not _m:
+                        continue
+                    loc, length = int(_m.group(1)), int(_m.group(2))
+                else:
+                    # Unknown type — try direct attribute access
+                    loc, length = int(rng.location), int(rng.length)
+            except Exception:
+                continue
+
             word = text[loc:loc + length]
             word_lower = word.lower()
 
