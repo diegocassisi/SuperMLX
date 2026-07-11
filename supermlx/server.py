@@ -3955,9 +3955,43 @@ class APIHandler(BaseHTTPRequestHandler):
                 _terminal_status("🏷️", f"NL Title: \"{_nl_title}\" ({_title_ms:.1f}ms)", indent=1)
                 resp = build_title_response(_nl_title, request_id, SETTINGS.proxy_model_id)
                 _is_streaming_title = body.get("stream", False)
-                if _is_streaming_title:
-                    # Return SSE (OpenAI chat.completion.chunk format) so
-                    # streaming clients (Hermes/OpenAI SDK) don't choke.
+                if _is_streaming_title and self._is_anthropic:
+                    # Anthropic SSE format (for Hermes via /v1/messages)
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.send_header("Cache-Control", "no-cache")
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    _msg_id = f"msg_{uuid.uuid4().hex[:24]}"
+                    self.wfile.write(_sse_event("message_start", {
+                        "type": "message_start",
+                        "message": {
+                            "id": _msg_id, "type": "message", "role": "assistant",
+                            "model": self._anthropic_model, "content": [],
+                            "stop_reason": None, "stop_sequence": None,
+                            "usage": {"input_tokens": 50, "output_tokens": 0},
+                        },
+                    }).encode("utf-8"))
+                    self.wfile.write(_sse_event("content_block_start", {
+                        "type": "content_block_start", "index": 0,
+                        "content_block": {"type": "text", "text": ""},
+                    }).encode("utf-8"))
+                    self.wfile.write(_sse_event("content_block_delta", {
+                        "type": "content_block_delta", "index": 0,
+                        "delta": {"type": "text_delta", "text": _nl_title},
+                    }).encode("utf-8"))
+                    self.wfile.write(_sse_event("content_block_stop", {
+                        "type": "content_block_stop", "index": 0,
+                    }).encode("utf-8"))
+                    self.wfile.write(_sse_event("message_delta", {
+                        "type": "message_delta",
+                        "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                        "usage": {"output_tokens": len(_nl_title.split())},
+                    }).encode("utf-8"))
+                    self.wfile.write(_sse_event("message_stop", {"type": "message_stop"}).encode("utf-8"))
+                    self.wfile.flush()
+                elif _is_streaming_title:
+                    # OpenAI SSE format (for Claude Code / OpenClaw)
                     self.send_response(200)
                     self.send_header("Content-Type", "text/event-stream")
                     self.send_header("Cache-Control", "no-cache")
@@ -3968,13 +4002,10 @@ class APIHandler(BaseHTTPRequestHandler):
                         "created": resp["created"],
                         "model": resp["model"],
                     }
-                    # Role chunk
                     _role_chunk = {**_chunk_base, "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]}
                     self.wfile.write(f"data: {json.dumps(_role_chunk)}\n\n".encode("utf-8"))
-                    # Content chunk
                     _content_chunk = {**_chunk_base, "choices": [{"index": 0, "delta": {"content": _nl_title}, "finish_reason": None}]}
                     self.wfile.write(f"data: {json.dumps(_content_chunk)}\n\n".encode("utf-8"))
-                    # Stop chunk
                     _stop_chunk = {**_chunk_base, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
                     self.wfile.write(f"data: {json.dumps(_stop_chunk)}\n\n".encode("utf-8"))
                     self.wfile.write(b"data: [DONE]\n\n")
