@@ -3948,11 +3948,37 @@ class APIHandler(BaseHTTPRequestHandler):
                     f"Title generated via NaturalLanguage.framework | "
                     f'"{_nl_title}" | {_title_ms:.1f}ms')
                 _terminal_status("🏷️", f"NL Title: \"{_nl_title}\" ({_title_ms:.1f}ms)", indent=1)
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
                 resp = build_title_response(_nl_title, request_id, SETTINGS.proxy_model_id)
-                self.wfile.write(json.dumps(resp).encode("utf-8"))
+                _is_streaming_title = body.get("stream", False)
+                if _is_streaming_title:
+                    # Return SSE (OpenAI chat.completion.chunk format) so
+                    # streaming clients (Hermes/OpenAI SDK) don't choke.
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.send_header("Cache-Control", "no-cache")
+                    self.end_headers()
+                    _chunk_base = {
+                        "id": resp["id"],
+                        "object": "chat.completion.chunk",
+                        "created": resp["created"],
+                        "model": resp["model"],
+                    }
+                    # Role chunk
+                    _role_chunk = {**_chunk_base, "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]}
+                    self.wfile.write(f"data: {json.dumps(_role_chunk)}\n\n".encode("utf-8"))
+                    # Content chunk
+                    _content_chunk = {**_chunk_base, "choices": [{"index": 0, "delta": {"content": _nl_title}, "finish_reason": None}]}
+                    self.wfile.write(f"data: {json.dumps(_content_chunk)}\n\n".encode("utf-8"))
+                    # Stop chunk
+                    _stop_chunk = {**_chunk_base, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+                    self.wfile.write(f"data: {json.dumps(_stop_chunk)}\n\n".encode("utf-8"))
+                    self.wfile.write(b"data: [DONE]\n\n")
+                    self.wfile.flush()
+                else:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps(resp).encode("utf-8"))
                 return
             else:
                 _pipeline_log("NL_TITLE", request_id,
