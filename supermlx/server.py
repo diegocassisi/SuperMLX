@@ -2376,37 +2376,13 @@ def _insert_cache_entries(
     tool_calls: Optional[List[Dict[str, Any]]] = None,
     cache_hit_ratio: float = 1.0,
     prompt_cache_store_override: Optional["LRUPromptCache"] = None,
-    is_warmup_candidate: bool = False,  # True solo para el startup /new (messages==2, MAIN runner)
+    is_warmup_candidate: bool = False,
 ) -> None:
-    """
-    Insert the standard full-turn cache entry and, for tool-call or VLM turns,
-    also insert a prompt-only checkpoint. The checkpoint helps next-turn prefix
-    reuse when provider-side tool-call serialisation differs between turns, or
-    when VLM vision tokens change the effective prompt boundary.
-
-    For plain LM turns without tool calls the full-key entry alone is sufficient:
-    the next request will get a 'shorter' hit via _cull_redundant_prefixes or
-    trim, without requiring a second deepcopy here. Gating the deepcopy prevents
-    two full KV tensors (~2–3 GB each at 20k tokens) from living simultaneously
-    in GPU memory on every non-tool turn.
-
-    Cache eviction protection: when running with a single cache entry
-    (PROMPT_CACHE_MAX_ENTRIES_GLOBAL=1), skip insertion if the current request
-    had a very low cache hit ratio (<30%), which indicates a cross-session
-    request that would destroy the primary session's warm cache.
-
-    KRIPPER DUAL-SLOT: prompt_cache_store_override allows routing to a
-    dedicated LRU (e.g. PROMPT_CACHE_COMPACT) without touching PROMPT_CACHE.
-    """
-    # Cross-session eviction guard (single-slot protection):
-    # When max_entries=1, a subagent request (short prompt, ~12K tokens) can
-    # evict the MAIN session's warm cache (~38K tokens), causing catastrophic
-    # cold starts. Block insertion if the existing entry is significantly larger.
     _store = prompt_cache_store_override if prompt_cache_store_override is not None else PROMPT_CACHE
     if (
-        prompt_cache_store_override is None  # only guard MAIN store
+        prompt_cache_store_override is None
         and SETTINGS.prompt_cache_max_entries_global <= 1
-        and _store._entries  # there's already something cached
+        and _store._entries
     ):
         _existing_len = max(
             (len(e.tokens) for e in _store._entries.values()), default=0
@@ -2416,30 +2392,72 @@ def _insert_cache_entries(
             # Existing entry is >50% larger — don't evict it.
             return
 
-    # Only insert a prompt-only checkpoint for turns where it actually helps:
-    # - tool_calls: next turn's prompt differs from cache key due to serialisation
-    # - is_vlm: VLM requests need an explicit prefix entry for vision-token reuse
-    # Plain LM turns get 'shorter' cache hits from the full-key entry alone.
-    # MEMORY GUARD: Skip the expensive deepcopy when running with very limited cache
-    # entries (<2). The deepcopy temporarily doubles GPU memory (~3 GB at 25K tokens)
-    # and is the primary source of OOM crashes. The eviction guard already protects
-    # the primary session's cache, so the checkpoint is not strictly necessary.
-    # NOTE: >= 2 (was > 2) — with max_entries=4, the deepcopy is safe. (PEND-04 fix 2026-04-07)
-    if (
-        SETTINGS.prompt_cache_max_entries_global >= 2
-        and (tool_calls or is_vlm)
-        and generated_tokens
-        and can_trim_prompt_cache(prompt_cache)
-        and len(cache_key) > len(generated_tokens)
-    ):
-        try:
-            prompt_only_cache = copy.deepcopy(prompt_cache)
-            trim_prompt_cache(prompt_only_cache, len(generated_tokens))
-            prompt_only_key = cache_key[: -len(generated_tokens)]
-            _store.insert_cache(model_name, prompt_only_key, prompt_only_cache)
-            SESSION_INDEX.register_cache_key(session_ctx, prompt_only_key)
-        except Exception:
-            pass
+    # ── CLEAN CACHE BEFORE INSERTION ────────────────────────────────────────
+    # After generation, prompt_cache contains KV states for prompt + response.
+    # The next request will include the response as TEXT in its prompt, so the
+    # response KV states in the cache are stale/wrong. Saving them causes
+    # FIX-31 v10 to detect "contamination" and force a full cold start.
+    #
+    # Strategy depends on available cache slots:
+    # - max_entries >= 2: deepcopy + trim → save BOTH clean and full versions
+    # - max_entries == 1: trim IN-PLACE → save ONLY the clean version
+    #
+    # For hybrid caches (Qwen3 MoE: ArraysCache + KVCache), can_trim_prompt_cache
+    # returns False because it requires ALL layers trimmable. In that case, we
+    # trim only the trimmable KVCache layers per-layer (matching disk-save logic).
+    if generated_tokens and len(cache_key) > len(generated_tokens):
+        if can_trim_prompt_cache(prompt_cache):
+            # All layers trimmable (pure KVCache model)
+            if SETTINGS.prompt_cache_max_entries_global >= 2 and (tool_calls or is_vlm):
+                # Multi-slot: deepcopy for a prompt-only checkpoint
+                try:
+                    prompt_only_cache = copy.deepcopy(prompt_cache)
+                    trim_prompt_cache(prompt_only_cache, len(generated_tokens))
+                    prompt_only_key = cache_key[: -len(generated_tokens)]
+                    _store.insert_cache(model_name, prompt_only_key, prompt_only_cache)
+                    SESSION_INDEX.register_cache_key(session_ctx, prompt_only_key)
+                except Exception:
+                    pass
+            else:
+                # Single-slot: trim in-place
+                try:
+                    _pre_off = _kv_cache_offset(prompt_cache)
+                    trim_prompt_cache(prompt_cache, len(generated_tokens))
+                    cache_key = cache_key[: -len(generated_tokens)]
+                    _post_off = _kv_cache_offset(prompt_cache)
+                    _terminal_status("🧹",
+                        f"Cache trim in-place (full): {_pre_off} → {_post_off} | "
+                        f"stripped {len(generated_tokens)} response tokens")
+                except Exception as _trim_err:
+                    _terminal_status("⚠️",
+                        f"Cache trim in-place FAILED ({_trim_err}) — saving as-is")
+        else:
+            # Hybrid cache (e.g., Qwen3 MoE: ArraysCache + KVCache).
+            # can_trim_prompt_cache requires ALL layers trimmable, but ArraysCache
+            # is never trimmable. Trim only KVCache layers per-layer.
+            _pre_off = _kv_cache_offset(prompt_cache)
+            _n_trimmed = 0
+            _n_total = 0
+            try:
+                for layer in prompt_cache:
+                    _n_total += 1
+                    if hasattr(layer, 'is_trimmable') and layer.is_trimmable() and hasattr(layer, 'trim'):
+                        layer.trim(len(generated_tokens))
+                        _n_trimmed += 1
+                if _n_trimmed > 0:
+                    cache_key = cache_key[: -len(generated_tokens)]
+                    _post_off = _kv_cache_offset(prompt_cache)
+                    _terminal_status("🧹",
+                        f"Cache trim in-place (hybrid): {_pre_off} → {_post_off} | "
+                        f"trimmed {_n_trimmed}/{_n_total} layers | "
+                        f"stripped {len(generated_tokens)} response tokens")
+                else:
+                    _terminal_status("⚠️",
+                        f"Cache trim SKIPPED: no trimmable layers "
+                        f"({type(prompt_cache[0]).__name__ if prompt_cache else 'empty'})")
+            except Exception as _trim_err:
+                _terminal_status("⚠️",
+                    f"Cache trim in-place (hybrid) FAILED ({_trim_err}) — saving as-is")
 
     _store.insert_cache(model_name, cache_key, prompt_cache)
     SESSION_INDEX.register_cache_key(session_ctx, cache_key)
@@ -4752,19 +4770,43 @@ class APIHandler(BaseHTTPRequestHandler):
                                             f"kv_off={_kv_off} — hybrid wash {_v11_wash} tok "
                                             f"(avoided cold start)")
                                     else:
-                                        # Recurrent state is session-specific and can't be washed.
-                                        prompt_cache = None
-                                        # Evict the correct store: compact runners live in
-                                        # PROMPT_CACHE_COMPACT, not MAIN.
-                                        if _is_embedded_agent:
-                                            PROMPT_CACHE_COMPACT.evict_unpinned()
+                                        # FIX-31 v10 revised: Before cold-starting, try per-layer
+                                        # KVCache trim to bring offset within range. ArraysCache
+                                        # retains its recurrent state (same as hybrid wash for
+                                        # smaller overshoots). Only cold-start if trim fails.
+                                        _trim_excess = _kv_off - _m_len
+                                        _n_trimmed_v10 = 0
+                                        try:
+                                            for layer in prompt_cache:
+                                                if hasattr(layer, 'is_trimmable') and layer.is_trimmable() and hasattr(layer, 'trim'):
+                                                    layer.trim(_trim_excess)
+                                                    _n_trimmed_v10 += 1
+                                        except Exception as _trim_err:
+                                            _terminal_status("⚠️",
+                                                f"FIX-31 v10: per-layer trim failed ({_trim_err})")
+                                            _n_trimmed_v10 = 0
+
+                                        if _n_trimmed_v10 > 0:
+                                            # Trim succeeded — hybrid wash the suffix
+                                            _post_trim_off = _kv_cache_offset(prompt_cache)
+                                            _v10_wash = max(512, _canonical_suffix)
+                                            rest_tokens = model_tokens[-_v10_wash:]
+                                            _terminal_status("🧹",
+                                                f"FIX-31 v10: KVCache trimmed {_kv_off} → {_post_trim_off} | "
+                                                f"excess={_trim_excess} | trimmed {_n_trimmed_v10} layers | "
+                                                f"hybrid wash {_v10_wash} tok (avoided cold start)")
                                         else:
-                                            PROMPT_CACHE.evict_unpinned()
-                                        import gc; gc.collect()
-                                        rest_tokens = model_tokens
-                                        _terminal_status("⚠️",
-                                            f"FIX-31 v10: ArraysCache contaminated by DPC "
-                                            f"(kv_off={_kv_off} > request_len={_m_len}+{_DPC_CONTAMINATION_THRESHOLD}) — cold start")
+                                            # No trimmable layers — genuine cold start
+                                            prompt_cache = None
+                                            if _is_embedded_agent:
+                                                PROMPT_CACHE_COMPACT.evict_unpinned()
+                                            else:
+                                                PROMPT_CACHE.evict_unpinned()
+                                            import gc; gc.collect()
+                                            rest_tokens = model_tokens
+                                            _terminal_status("⚠️",
+                                                f"FIX-31 v10: ArraysCache contaminated by DPC "
+                                                f"(kv_off={_kv_off} > request_len={_m_len}+{_DPC_CONTAMINATION_THRESHOLD}) — cold start")
                                 elif _kv_off is not None and _kv_off > _HYBRID_WASH_KV_LIMIT:
                                     prompt_cache = None
                                     if _is_embedded_agent:
