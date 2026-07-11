@@ -324,6 +324,35 @@ def _is_slug_gen_request(messages: List[Dict[str, Any]]) -> bool:
     return "filename slug" in last_msg.lower() and "short 1-2 word" in last_msg.lower()
 
 
+def _is_title_gen_request(messages: List[Dict[str, Any]]) -> bool:
+    """Detects Hermes title_generation auxiliary requests.
+
+    Signature (from agent/title_generator.py):
+      - 2 messages: system + user
+      - System contains "descriptive title" and "3-7 words"
+      - User starts with "User: " and contains "Assistant: "
+    """
+    if not messages or len(messages) != 2:
+        return False
+    sys_msg = ""
+    user_msg = ""
+    for m in messages:
+        role = (m.get("role") or "").lower()
+        content = str(m.get("content") or "")
+        if role == "system":
+            sys_msg = content.lower()
+        elif role == "user":
+            user_msg = content
+    if not sys_msg or not user_msg:
+        return False
+    return (
+        "descriptive title" in sys_msg
+        and "3-7 words" in sys_msg
+        and user_msg.startswith("User: ")
+        and "Assistant: " in user_msg
+    )
+
+
 def _is_rag_bypass_request(messages: List[Dict[str, Any]]) -> bool:
     """Detects requests that should bypass RAG enrichment."""
     if not messages:

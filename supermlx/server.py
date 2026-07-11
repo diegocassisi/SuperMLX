@@ -621,7 +621,7 @@ from .message_pipeline import (
     _get_healing_hash, _heal_messages, _extract_tool_call_signature,
     _break_tool_call_loop, _inject_loop_stop,
     _count_roles, _summarize_tool_results, _estimate_token_count,
-    _is_slug_gen_request, _is_rag_bypass_request, _detect_compact_runner,
+    _is_slug_gen_request, _is_title_gen_request, _is_rag_bypass_request, _detect_compact_runner,
     _flatten_content, _prepare_messages_for_template,
     _scrub_cache_key, _canonicalize_inbound_context_block,
     _canonicalize_messages, _extract_session_context,
@@ -3926,6 +3926,38 @@ class APIHandler(BaseHTTPRequestHandler):
             }
             self.wfile.write(json.dumps(resp).encode("utf-8"))
             return
+
+        # ── NL TITLE FAST PATH ──────────────────────────────────────────────────
+        # Hermes title_generation auxiliary requests are intercepted here and
+        # answered with Apple NaturalLanguage.framework keyword extraction
+        # instead of burning a full LLM prefill cycle (~10-40s) for a trivial
+        # side-task. Typical response time: <1ms.
+        if _is_title_gen_request(raw_messages_inbound):
+            from .nl_title import generate_title_nl, build_title_response
+            # Extract the user message (contains "User: <text>\n\nAssistant: <text>")
+            _title_user_msg = ""
+            for _tm in raw_messages_inbound:
+                if (_tm.get("role") or "").lower() == "user":
+                    _title_user_msg = str(_tm.get("content") or "")
+                    break
+            _t0_title = time.time()
+            _nl_title = generate_title_nl(_title_user_msg)
+            _title_ms = (time.time() - _t0_title) * 1000
+            if _nl_title:
+                _pipeline_log("NL_TITLE", request_id,
+                    f"Title generated via NaturalLanguage.framework | "
+                    f'"{_nl_title}" | {_title_ms:.1f}ms')
+                _terminal_status("🏷️", f"NL Title: \"{_nl_title}\" ({_title_ms:.1f}ms)", indent=1)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                resp = build_title_response(_nl_title, request_id, SETTINGS.proxy_model_id)
+                self.wfile.write(json.dumps(resp).encode("utf-8"))
+                return
+            else:
+                _pipeline_log("NL_TITLE", request_id,
+                    "NL.framework unavailable — falling through to LLM")
+
         tools = body.get("tools")
 
         # KRIPPER DUAL-SLOT: Detect OpenClaw's compact runner.
