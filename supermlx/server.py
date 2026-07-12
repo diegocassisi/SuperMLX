@@ -5263,7 +5263,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 generated_parts = []
                 _thinking_token_count_ns = 0
                 _in_think_ns = False
-                _max_thinking_ns = 128 if _is_embedded_agent else SETTINGS.max_thinking_tokens
+                _max_thinking_ns = 128 if _is_embedded_agent else body.get("max_thinking_tokens", SETTINGS.max_thinking_tokens)
                 progress_last_at = time.time()
                 for response in _stream_generate_unified(
                     rest_tokens,
@@ -5548,7 +5548,7 @@ class APIHandler(BaseHTTPRequestHandler):
 
                 raw_parts = []
                 _thinking_token_count = 0
-                _max_thinking = 128 if _is_embedded_agent else SETTINGS.max_thinking_tokens  # 0=unlimited
+                _max_thinking = 128 if _is_embedded_agent else body.get("max_thinking_tokens", SETTINGS.max_thinking_tokens)  # 0=unlimited
 
                 progress_last_at = time.time()
                 try:
