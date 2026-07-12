@@ -612,7 +612,7 @@ from .tool_parsing import (
     QWEN_FUNCTION_PATTERN, QWEN_PARAMETER_PATTERN,
     THINK_TAG_STRIP_PATTERN, GEMMA4_THINK_STRIP_PATTERN,
     GEMMA4_THINK_ORPHAN_PATTERN, THINK_ORPHAN_CLOSE_PATTERN,
-    _strip_thinking_from_content, _should_enable_thinking,
+    _strip_thinking_from_content, _extract_thinking_text, _should_enable_thinking,
     _reasoning_level_to_enable_thinking, _extract_enable_thinking,
     _normalize_assistant_text, _coerce_arg_value, _extract_openai_tool_calls,
 )
@@ -5429,11 +5429,15 @@ class APIHandler(BaseHTTPRequestHandler):
                     self.wfile.write(json.dumps(full_response).encode("utf-8"))
                 timing = _build_timing_dict(first_token_at, generation_started_at, rest_count, generated_tokens)
                 if request_logger:
+                    _think_log = _extract_thinking_text(raw_response_text)
                     request_logger.log(
                         "generation",
                         {
                             "mode": "non-stream",
                             "timing": timing,
+                            "thinking_text": _think_log,
+                            "thinking_tokens": len(_think_log) // 4 if _think_log else 0,
+                            "response_text": message_text,
                             "raw_response_text": raw_response_text,
                             "normalized_response_text": response_text,
                             "assistant_message_text": message_text,
@@ -5940,11 +5944,15 @@ class APIHandler(BaseHTTPRequestHandler):
                         raise
                 timing = _build_timing_dict(first_token_at, generation_started_at, rest_count, generated_tokens)
                 if request_logger:
+                    _think_log = _extract_thinking_text(raw_full_text)
                     request_logger.log(
                         "generation",
                         {
                             "mode": "stream",
                             "timing": timing,
+                            "thinking_text": _think_log,
+                            "thinking_tokens": len(_think_log) // 4 if _think_log else 0,
+                            "response_text": message_text,
                             "raw_response_text": raw_full_text,
                             "normalized_response_text": full_text,
                             "assistant_message_text": message_text,

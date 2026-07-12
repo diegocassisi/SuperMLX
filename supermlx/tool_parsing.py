@@ -54,6 +54,29 @@ GEMMA4_THINK_ORPHAN_OPEN_PATTERN = re.compile(r"<\|think\|>.*$", re.DOTALL | re.
 
 # ── Functions ─────────────────────────────────────────────────────────────────
 
+def _extract_thinking_text(raw: str) -> str:
+    """Extract the content of <think>...</think> block for logging.
+
+    Returns the raw thinking text (stripped), or "" if no thinking block found.
+    Handles Qwen3-style <think>...</think> and orphan </think> (GLM-style).
+    """
+    if not isinstance(raw, str):
+        return ""
+    # Full <think>...</think> block
+    m = re.search(r"<think>([\s\S]*?)</think>", raw, re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    # Gemma4 <|think|>...<|/think|>
+    m = re.search(r"<\|think\|>([\s\S]*?)<\|/think\|>", raw, re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    # Orphan </think>: reasoning from start to </think> (GLM-style)
+    m = re.match(r"^([\s\S]*?)</think>", raw, re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    return ""
+
+
 def _strip_thinking_from_content(text: str) -> str:
     """Remove <think>...</think> and <|think|>...<|/think|> blocks so reasoning is hidden."""
     if not isinstance(text, str):
