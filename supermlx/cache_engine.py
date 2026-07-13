@@ -1,24 +1,66 @@
 """
 cache_engine.py — Hybrid-aware prompt cache for SuperMLX.
 
-Extends mlx-lm's LRUPromptCache with two additions:
+Extends mlx-lm's LRUPromptCache with:
 
 1. fetch_nearest_cache: handles "longer" matches on hybrid models
    (ArraysCache + KVCache) by doing per-layer KVCache trim when
-   can_trim_prompt_cache returns False.
+   can_trim_prompt_cache returns False. Returns FetchResult diagnostics.
 
 2. strip_response_tokens: trims generated response tokens from a
    cache before re-insertion, preventing contamination.
+
+3. snapshot_arrays_cache / rollback_arrays_cache: snapshot/rollback
+   of ArraysCache layers for ephemeral large content (PDF, tool-result).
+   KVCache layers are trimmed; ArraysCache layers are restored from snapshot.
+
+   TRIGGER CONTRACT: caller (server.py) is responsible for calling
+   snapshot_arrays_cache BEFORE prefilling tokens > SNAPSHOT_THRESHOLD,
+   and rollback_arrays_cache if next request's matched_prefix <
+   snapshot_position. Decision logic lives in server.py (same layer
+   as Memory Guard), NOT in this module.
 """
 
 import copy
-from typing import Any, List, Optional, Tuple
+from dataclasses import dataclass
+from enum import Enum
+from typing import Any, Dict, List, Optional, Tuple
 
+import mlx.core as mx
 from mlx_lm.models.cache import (
     LRUPromptCache,
     can_trim_prompt_cache,
     trim_prompt_cache,
 )
+
+
+# ── Diagnostics ──────────────────────────────────────────────────────────────
+
+class HitType(Enum):
+    EXACT = "exact"
+    SHORTER = "shorter"
+    LONGER_TRIMMED = "longer_trimmed"
+    MISS = "miss"
+
+
+@dataclass
+class FetchResult:
+    """Diagnostics from fetch_nearest_cache."""
+    hit_type: HitType
+    matched_prefix_len: int = 0
+    trimmed_tokens: int = 0
+
+
+# ── Hybrid trim helpers ──────────────────────────────────────────────────────
+
+def _is_arrays_cache(layer: Any) -> bool:
+    """Check if a cache layer is an ArraysCache (not trimmable, has .cache list)."""
+    return (
+        hasattr(layer, "is_trimmable")
+        and not layer.is_trimmable()
+        and hasattr(layer, "cache")
+        and isinstance(layer.cache, list)
+    )
 
 
 def _trim_hybrid(cache: list, n: int) -> bool:
@@ -54,12 +96,116 @@ def strip_response_tokens(
     return _trim_hybrid(cache, n)
 
 
+# ── ArraysCache Snapshot/Rollback ────────────────────────────────────────────
+
+def snapshot_arrays_cache(cache: list) -> Dict[str, Any]:
+    """Snapshot the state of all ArraysCache layers for later rollback.
+
+    Creates a REAL copy of each mx.array in ArraysCache layers using
+    mx.array() + mx.eval() to force materialization. This prevents
+    the lazy-reference problem where in-place forward pass updates
+    would modify the snapshot.
+
+    KVCache layers are NOT snapshotted (they are trimmable and don't
+    need rollback — use _trim_hybrid instead).
+
+    Returns an opaque dict with:
+        - "layers": {layer_idx: [mx.array copies]}
+        - "kv_offsets": {layer_idx: offset} for KVCache layers (for trim)
+        - "nbytes": total bytes of the snapshot
+
+    TRIGGER CONTRACT: caller (server.py) MUST call this BEFORE
+    prefilling tokens > SNAPSHOT_THRESHOLD.
+    """
+    snapshot = {"layers": {}, "kv_offsets": {}, "nbytes": 0}
+
+    for i, layer in enumerate(cache):
+        if _is_arrays_cache(layer):
+            copied = []
+            for c in layer.cache:
+                if c is not None:
+                    arr = mx.array(c)
+                    copied.append(arr)
+                    snapshot["nbytes"] += arr.nbytes
+                else:
+                    copied.append(None)
+            snapshot["layers"][i] = copied
+        elif hasattr(layer, "offset"):
+            # Record KVCache offset for trim on rollback
+            snapshot["kv_offsets"][i] = int(layer.offset)
+
+    # Force materialization — without this, mx.array() may hold lazy refs
+    if snapshot["layers"]:
+        all_arrays = [
+            a for arrays in snapshot["layers"].values()
+            for a in arrays if a is not None
+        ]
+        if all_arrays:
+            mx.eval(*all_arrays)
+
+    return snapshot
+
+
+def rollback_arrays_cache(cache: list, snapshot: Dict[str, Any]) -> bool:
+    """Restore ArraysCache layers from a snapshot and trim KVCache layers.
+
+    - ArraysCache layers: in-place replace of .cache arrays from snapshot
+    - KVCache layers: trimmed back to the offset recorded in snapshot
+
+    Returns True if rollback succeeded (at least one layer restored).
+    """
+    if not snapshot.get("layers") and not snapshot.get("kv_offsets"):
+        return False
+
+    restored = 0
+
+    # Restore ArraysCache layers
+    for idx_str, arrays in snapshot.get("layers", {}).items():
+        idx = int(idx_str) if isinstance(idx_str, str) else idx_str
+        if idx < len(cache) and _is_arrays_cache(cache[idx]):
+            # Deep copy again to keep the snapshot reusable
+            cache[idx].cache = [
+                mx.array(a) if a is not None else None
+                for a in arrays
+            ]
+            restored += 1
+
+    # Trim KVCache layers back to snapshot position
+    for idx_str, old_offset in snapshot.get("kv_offsets", {}).items():
+        idx = int(idx_str) if isinstance(idx_str, str) else idx_str
+        if idx < len(cache) and hasattr(cache[idx], "offset"):
+            current_offset = int(cache[idx].offset)
+            if current_offset > old_offset:
+                trim_n = current_offset - old_offset
+                if hasattr(cache[idx], "trim"):
+                    cache[idx].trim(trim_n)
+                    restored += 1
+
+    # Materialize restored arrays
+    if restored > 0:
+        to_eval = []
+        for idx_str in snapshot.get("layers", {}):
+            idx = int(idx_str) if isinstance(idx_str, str) else idx_str
+            if idx < len(cache) and _is_arrays_cache(cache[idx]):
+                to_eval.extend(
+                    a for a in cache[idx].cache if a is not None
+                )
+        if to_eval:
+            mx.eval(*to_eval)
+
+    return restored > 0
+
+
+# ── HybridPromptCache ────────────────────────────────────────────────────────
+
 class HybridPromptCache(LRUPromptCache):
     """LRUPromptCache with hybrid model support for longer matches.
 
     mlx-lm's fetch_nearest_cache skips "longer" matches when
     can_trim_prompt_cache is False (hybrid models like Qwen3 MoE).
     This subclass handles them via per-layer KVCache trim.
+
+    Returns (cache, rest_tokens, FetchResult) with diagnostics.
     """
 
     def fetch_nearest_cache(self, model: Any, tokens: List[int]):
@@ -67,7 +213,14 @@ class HybridPromptCache(LRUPromptCache):
 
         if result.exact is not None:
             cache_entry = self._trie.get(result.model, result.exact)
-            return copy.deepcopy(cache_entry.prompt_cache), []
+            return (
+                copy.deepcopy(cache_entry.prompt_cache),
+                [],
+                FetchResult(
+                    hit_type=HitType.EXACT,
+                    matched_prefix_len=len(result.exact),
+                ),
+            )
 
         short_length = len(result.shorter) if result.shorter is not None else 0
 
@@ -80,16 +233,43 @@ class HybridPromptCache(LRUPromptCache):
             # Pure KVCache: use mlx-lm's trim
             if can_trim_prompt_cache(cache):
                 trim_prompt_cache(cache, num_to_trim)
-                return cache, tokens[prefix:]
+                return (
+                    cache,
+                    tokens[prefix:],
+                    FetchResult(
+                        hit_type=HitType.LONGER_TRIMMED,
+                        matched_prefix_len=prefix,
+                        trimmed_tokens=num_to_trim,
+                    ),
+                )
 
             # Hybrid: per-layer KVCache trim
             if _trim_hybrid(cache, num_to_trim):
-                return cache, tokens[prefix:]
+                return (
+                    cache,
+                    tokens[prefix:],
+                    FetchResult(
+                        hit_type=HitType.LONGER_TRIMMED,
+                        matched_prefix_len=prefix,
+                        trimmed_tokens=num_to_trim,
+                    ),
+                )
 
             # Trim failed entirely — fall through to shorter
 
         if short_length > 0:
             cache_entry = self._trie.get(result.model, result.shorter)
-            return copy.deepcopy(cache_entry.prompt_cache), tokens[short_length:]
+            return (
+                copy.deepcopy(cache_entry.prompt_cache),
+                tokens[short_length:],
+                FetchResult(
+                    hit_type=HitType.SHORTER,
+                    matched_prefix_len=short_length,
+                ),
+            )
 
-        return None, tokens
+        return (
+            None,
+            tokens,
+            FetchResult(hit_type=HitType.MISS),
+        )
