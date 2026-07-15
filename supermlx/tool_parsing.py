@@ -28,6 +28,12 @@ QWEN_FUNCTION_PATTERN = re.compile(
 QWEN_PARAMETER_PATTERN = re.compile(
     r"<parameter=([^>\s]+)>\s*(.*?)\s*</parameter>", re.DOTALL | re.IGNORECASE
 )
+# Fallback: model emits bare tag instead of <function=NAME>, e.g. <write_file>...</write_file>.
+# Backreference \1 ensures closing tag matches opening tag.
+QWEN_BARE_TOOL_PATTERN = re.compile(
+    r"<([a-zA-Z_][\w.-]*)>\s*((?:<parameter=[^>\s]+>[\s\S]*?</parameter>\s*)+)\s*</\1>",
+    re.DOTALL | re.IGNORECASE,
+)
 
 # ── Thinking/reasoning patterns ───────────────────────────────────────────────
 
@@ -346,10 +352,16 @@ def _extract_openai_tool_calls(text, model_family):
 
     def _parse_qwen_block(body):
         function_match = QWEN_FUNCTION_PATTERN.search(body)
-        if not function_match:
-            return None
-        tool_name = function_match.group(1).strip()
-        fn_body = function_match.group(2)
+        if function_match:
+            tool_name = function_match.group(1).strip()
+            fn_body = function_match.group(2)
+        else:
+            # Fallback: bare tag like <write_file><parameter=...>...</parameter></write_file>
+            bare_match = QWEN_BARE_TOOL_PATTERN.search(body)
+            if not bare_match:
+                return None
+            tool_name = bare_match.group(1).strip()
+            fn_body = bare_match.group(2)
         if not tool_name:
             return None
         args = {}
