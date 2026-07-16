@@ -260,9 +260,17 @@ def _coerce_arg_value(raw_value):
     if value in ("True", "False"):
         return value == "True"
     try:
-        return json.loads(value)
+        parsed = json.loads(value)
+        # Only coerce primitives (int, float, bool, None).
+        # Dicts/lists stay as raw strings — the model writes JSON file
+        # content (package.json, config) inside <parameter=content> which
+        # json.loads happily parses to dict. But the tool expects a string.
+        if isinstance(parsed, (dict, list)):
+            return value
+        return parsed
     except Exception:
         return value
+
 
 
 
