@@ -236,9 +236,12 @@ FEATURE_EMERGENCY_COMPRESS    = _env_str("EMERGENCY_CONTENT_COMPRESS", "true").l
 FEATURE_HERMES_COMPACT_SWAP   = _env_str("HERMES_COMPACT_SWAP", "false").lower() in ("1", "true", "yes")
 
 # Prefill step size: tokens processed per chunk during prompt prefill.
-# Smaller = less Metal scratch memory (score matrix = chunk × kv_length per attn layer).
-# Default 512 keeps peak under ~14 GB for 47K-token cold-starts on 24 GB machines.
-PREFILL_STEP_SIZE             = int(_env_str("PREFILL_STEP_SIZE", "512"))
+# Smaller = less Metal scratch memory (flash attention scratch ≈ 0.065 × chunk × kv_len × n_heads × 4).
+# Benchmark (mlx 0.31.1, Qwen3.5-35B-A3B-3bit, 31K tokens):
+#   chunk=512 → 0.66GB scratch, 516 tok/s
+#   chunk=256 → 0.32GB scratch, 520 tok/s  ← same speed, half scratch
+#   chunk=128 → 0.16GB scratch, 429 tok/s  ← 17% slower
+PREFILL_STEP_SIZE             = int(_env_str("PREFILL_STEP_SIZE", "256"))
 
 # RAG codebase enrichment: inyecta chunks relevantes del codebase en el context.
 # Requiere rag_enricher.py + lancedb + sentence-transformers.
@@ -3022,6 +3025,18 @@ try:
             f"loaded={_moe_stats.get('expert_tensors_loaded', 0)}, "
             f"mem={_moe_stats.get('active_memory_gb', 0):.1f}GB",
         )
+        # ── Qwen3.6 full-residency guard ─────────────────────────────────
+        # Qwen3.6-35B-A3B MUST run with all 256 experts resident.
+        # Partial capacity causes severe quality degradation and hallucinations.
+        _moe_cap = _moe_stats.get("capacity", 0)
+        _moe_ne = _moe_stats.get("num_experts", 0)
+        if _moe_cap < _moe_ne and "A3B" in SETTINGS.model_path:
+            raise RuntimeError(
+                f"Qwen3.6-35B-A3B requires ALL {_moe_ne} experts but only "
+                f"{_moe_cap} are loaded. Set MOE_EXPERT_CAPACITY={_moe_ne} "
+                f"and MOE_TARGET_CAPACITY={_moe_ne}. Refusing to start with "
+                f"partial experts — quality degradation and hallucinations."
+            )
         # Load historical expert frequency stats for breathing decisions
         try:
             from .expert_cache import apply_historical_frequency
@@ -3215,6 +3230,10 @@ def _run_startup_warmup() -> None:
 
     First real request handles validation + cold start if needed.
     """
+    _t0 = time.perf_counter()
+    _mem_before = mx.get_active_memory() / 1e9
+    _terminal_status("⏱️", f"DPC warmup: iniciando | active_mem={_mem_before:.3f}GB")
+
     _wm.run_startup(
         state=_DPC,
         cache_persist_path=SETTINGS.cache_persist_path,
@@ -3233,6 +3252,15 @@ def _run_startup_warmup() -> None:
     if SETTINGS.cache_persist_path:
         _tpc.init(SETTINGS.cache_persist_path)
         _tpc.load_from_disk(model, SETTINGS.max_kv_size)
+
+    _elapsed = time.perf_counter() - _t0
+    _mem_after = mx.get_active_memory() / 1e9
+    _mem_delta = _mem_after - _mem_before
+    _terminal_status(
+        "⏱️",
+        f"DPC warmup: completo | elapsed={_elapsed:.1f}s | "
+        f"active_mem={_mem_after:.3f}GB | delta={_mem_delta:+.3f}GB"
+    )
 
 
 # ── Launch DPC daemon thread ────────────────────────────────────────────────
@@ -3268,6 +3296,141 @@ except Exception:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# ADAPTIVE PREFILL — dynamic chunk sizing based on available Metal memory
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Calibrated against empirical benchmark (mlx 0.31.1, Qwen3.5-35B-A3B-3bit):
+#   theoretical_scratch = N_LAYERS_SDPA × chunk × kv_len × N_HEADS × 4
+#   measured_scratch    ≈ 0.065 × theoretical_scratch  (flash attention tiling)
+#
+# The function pre-prefills rest_tokens[:-1] with adaptive chunks, then returns
+# only the last token. stream_generate sees 1 token → skips its own prefill loop
+# (generate_step line 430: `while total - processed > 1` is False) → goes
+# straight to decoding.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Scratch model constants (from config.json + benchmark calibration) ──────
+# These are extracted once at import time from _config (module-level dict).
+_text_cfg = (_config or {}).get("text_config", _config or {})
+_N_HEADS = _text_cfg.get("num_attention_heads", 16)
+_FULL_ATTN_INTERVAL = _text_cfg.get("full_attention_interval", 4)
+_N_LAYERS = _text_cfg.get("num_hidden_layers", 40)
+_N_LAYERS_SDPA = _N_LAYERS // _FULL_ATTN_INTERVAL  # layers with full SDPA attention
+_SCRATCH_COEFFICIENT = 0.065  # calibrated: measured/predicted ratio from benchmark
+_SCRATCH_BYTES_PER_ELEMENT = 4  # fp32 for QK^T score matrix
+_ADAPTIVE_PREFILL_MIN_CHUNK = 32  # never go below this
+_ADAPTIVE_PREFILL_SAFETY_MARGIN = 0.85  # use only 85% of available memory for scratch
+
+_terminal_status(
+    "📐",
+    f"Adaptive prefill params: n_heads={_N_HEADS} sdpa_layers={_N_LAYERS_SDPA} "
+    f"coeff={_SCRATCH_COEFFICIENT} min_chunk={_ADAPTIVE_PREFILL_MIN_CHUNK}",
+)
+
+
+def _adaptive_prefill_chunk(base_chunk: int, kv_length: int, available_bytes: float) -> int:
+    """Compute the largest safe chunk size given available Metal memory.
+
+    Uses the empirically calibrated scratch formula:
+        scratch = COEFF × N_LAYERS_SDPA × chunk × kv_length × N_HEADS × 4
+
+    Solves for max chunk:
+        chunk_max = available_bytes / (COEFF × N_LAYERS_SDPA × kv_length × N_HEADS × 4)
+
+    Returns min(base_chunk, chunk_max), clamped to [_ADAPTIVE_PREFILL_MIN_CHUNK, base_chunk].
+    """
+    if kv_length <= 0:
+        return base_chunk
+
+    denominator = (
+        _SCRATCH_COEFFICIENT
+        * _N_LAYERS_SDPA
+        * kv_length
+        * _N_HEADS
+        * _SCRATCH_BYTES_PER_ELEMENT
+    )
+    if denominator <= 0:
+        return base_chunk
+
+    chunk_max = int(available_bytes / denominator)
+    chunk = max(_ADAPTIVE_PREFILL_MIN_CHUNK, min(base_chunk, chunk_max))
+    return chunk
+
+
+def _adaptive_prefill(
+    rest_tokens: list,
+    prompt_cache: list,
+    request_id: str = "",
+) -> list:
+    """Pre-prefill rest_tokens[:-1] with adaptive chunk sizing.
+
+    Returns the remaining tokens (just the last one) to pass to stream_generate.
+    The cache is updated in-place.
+
+    If rest_tokens has <= 1 token, returns rest_tokens unchanged (no prefill needed).
+    """
+    if len(rest_tokens) <= 1:
+        return rest_tokens
+
+    tokens_to_prefill = rest_tokens[:-1]
+    last_token = rest_tokens[-1:]  # keep as list for stream_generate
+
+    total = len(tokens_to_prefill)
+    processed = 0
+    prompt_array = mx.array(tokens_to_prefill)
+    base_chunk = PREFILL_STEP_SIZE
+    chunk_reductions = 0
+
+    while processed < total:
+        # Compute available memory
+        budget_bytes = _get_metal_budget_gb() * 1e9
+        active_bytes = mx.get_active_memory()
+        available = (budget_bytes - active_bytes) * _ADAPTIVE_PREFILL_SAFETY_MARGIN
+
+        # Compute adaptive chunk size based on current kv_length
+        # kv_length = tokens already in cache + tokens we've processed
+        # Use the first KVCache's offset if available, else track manually
+        kv_length = processed  # conservative: our contribution so far
+        for c in prompt_cache:
+            if hasattr(c, "offset"):
+                kv_length = c.offset
+                break
+
+        chunk_size = _adaptive_prefill_chunk(base_chunk, kv_length, available)
+        n = min(chunk_size, total - processed)
+
+        if chunk_size < base_chunk and chunk_reductions == 0:
+            _terminal_status(
+                "📐",
+                f"Adaptive prefill: chunk reduced {base_chunk}→{chunk_size} "
+                f"at kv={kv_length} | avail={available / 1e9:.2f}GB | "
+                f"req={request_id[:12] if request_id else '?'}",
+            )
+        if chunk_size < base_chunk:
+            chunk_reductions += 1
+
+        # Forward pass
+        chunk = prompt_array[processed : processed + n][None]  # (1, n)
+        model(chunk, cache=prompt_cache)
+
+        # Materialize cache + free scratch
+        for c in prompt_cache:
+            if hasattr(c, "state"):
+                mx.eval(c.state)
+            else:
+                mx.eval(c)
+        mx.clear_cache()
+
+        processed += n
+
+    if chunk_reductions > 0:
+        _terminal_status(
+            "📐",
+            f"Adaptive prefill complete: {total} tokens | "
+            f"chunk reductions={chunk_reductions} | req={request_id[:12] if request_id else '?'}",
+        )
+
+    return last_token
 
 
 def _stream_generate_kwargs(prompt_tokens, max_tokens, sampler, prompt_cache):
@@ -3353,16 +3516,26 @@ def _stream_generate_unified(
         _dcu_no_swap_streak = 0
         _dcu_low_fb_streak = 0
         _dcu_last_fb_rate = 1.0
-        _dcu_enabled = hasattr(model, "_moe_config") and model._moe_config.get("moe_layers", 0) > 0
-        _dcu_func = None
-        _dcu_policy = None
-        if _dcu_enabled:
-            try:
-                from .expert_cache import dynamic_cache_update, dynamic_update_policy
-                _dcu_func = dynamic_cache_update
-                _dcu_policy = dynamic_update_policy
-            except ImportError:
-                _dcu_enabled = False
+        try:
+            from .expert_cache import (
+                dynamic_cache_needed,
+                dynamic_cache_update,
+                dynamic_update_policy,
+            )
+            _dcu_enabled = dynamic_cache_needed(model)
+            _dcu_func = dynamic_cache_update if _dcu_enabled else None
+            _dcu_policy = dynamic_update_policy if _dcu_enabled else None
+            if not _dcu_enabled and hasattr(model, "_moe_config") and model._moe_config.get("moe_layers", 0) > 0:
+                _cfg = model._moe_config
+                _terminal_status(
+                    "⚡",
+                    f"MOE dynamic updates disabled: full expert residency "
+                    f"{_cfg.get('capacity', 0)}/{_cfg.get('num_experts', 0)}",
+                )
+        except ImportError:
+            _dcu_enabled = False
+            _dcu_func = None
+            _dcu_policy = None
 
         for resp in stream_generate(
             **_stream_generate_kwargs(rest_tokens, max_tokens, sampler, prompt_cache)
@@ -5257,6 +5430,10 @@ class APIHandler(BaseHTTPRequestHandler):
 
                 _pre_prefill_memory_relief(request_id, rest_count, is_embedded_agent=_is_embedded_agent)
 
+                # Adaptive pre-prefill: process rest_tokens[:-1] with dynamic chunks,
+                # pass only the last token to stream_generate (skips its fixed-step loop).
+                if not is_vlm and len(rest_tokens) > 1:
+                    rest_tokens = _adaptive_prefill(rest_tokens, prompt_cache, request_id)
 
                 _prefill_done, _prefill_thread = _start_prefill_progress(request_id, rest_count)
 
@@ -5543,6 +5720,10 @@ class APIHandler(BaseHTTPRequestHandler):
 
                 _pre_prefill_memory_relief(request_id, rest_count, is_embedded_agent=_is_embedded_agent)
 
+                # Adaptive pre-prefill: process rest_tokens[:-1] with dynamic chunks,
+                # pass only the last token to stream_generate (skips its fixed-step loop).
+                if not is_vlm and len(rest_tokens) > 1:
+                    rest_tokens = _adaptive_prefill(rest_tokens, prompt_cache, request_id)
 
                 _prefill_done_s, _ = _start_prefill_progress(request_id, rest_count)
 
@@ -5589,14 +5770,16 @@ class APIHandler(BaseHTTPRequestHandler):
                         # ── N-GRAM LOOP DETECTION ────────────────────────
                         # Detect verbatim phrase repetition in generated output.
                         # Every _NGRAM_CHECK_INTERVAL tokens, check if the last
-                        # _NGRAM_SIZE tokens appeared earlier in the output.
-                        # If the same n-gram repeats _NGRAM_MAX_REPEATS times,
-                        # force stop to prevent infinite loops like:
-                        #   "I need to use the correct tool. I already wrote..."
-                        #   repeating 20+ times.
+                        # _NGRAM_SIZE tokens appeared earlier in RECENT output.
+                        # Uses a proximity window to avoid false positives on
+                        # code generation where identical patterns (HTML tags,
+                        # repeated function signatures) appear far apart.
+                        # Real infinite loops repeat every ~20-40 tokens;
+                        # a 300-token window catches those easily.
                         _NGRAM_SIZE = 20         # tokens per n-gram
                         _NGRAM_MAX_REPEATS = 3   # max allowed repeats before break
                         _NGRAM_CHECK_INTERVAL = 32  # check every N tokens
+                        _NGRAM_WINDOW = 300      # only search this far back for repeats
                         _n_gen = len(generated_tokens)
                         if (
                             _n_gen >= _NGRAM_SIZE * 2
@@ -5604,6 +5787,9 @@ class APIHandler(BaseHTTPRequestHandler):
                         ):
                             _tail = tuple(generated_tokens[-_NGRAM_SIZE:])
                             _search_region = generated_tokens[:-_NGRAM_SIZE]
+                            # Limit search to recent window — real loops are nearby
+                            _window_start = max(0, len(_search_region) - _NGRAM_WINDOW)
+                            _search_region = _search_region[_window_start:]
                             _repeat_count = 0
                             for _si in range(len(_search_region) - _NGRAM_SIZE + 1):
                                 if tuple(_search_region[_si:_si + _NGRAM_SIZE]) == _tail:
@@ -5664,18 +5850,31 @@ class APIHandler(BaseHTTPRequestHandler):
                                         self.wfile.flush()
                                         _anthropic_thinking_streamed.append(_new_think)
                             elif _anthropic_streaming and _seen_think_close:
-                                _delta_ev = _sse_event("content_block_delta", {
-                                    "type": "content_block_delta", "index": _anthropic_block_idx,
-                                    "delta": {"type": "text_delta", "text": response_text},
-                                })
-                                try:
-                                    self.wfile.write(_delta_ev.encode("utf-8"))
-                                    self.wfile.flush()
-                                    _anthropic_streamed_text.append(response_text)
-                                except BrokenPipeError:
-                                    _pipeline_log("WIRE", request_id,
-                                        "❌ BROKEN PIPE during Anthropic SSE streaming")
-                                    raise
+                                # Suppress raw <tool_call> XML from being streamed as text.
+                                # The post-generation code extracts tool_calls and sends
+                                # proper Anthropic tool_use blocks. Track open/close tags
+                                # so text AFTER a closed </tool_call> resumes streaming.
+                                _acc_text = "".join(raw_parts)
+                                _acc_lower = _acc_text.lower()
+                                _in_tool_block = (
+                                    _acc_lower.count("<tool_call") > _acc_lower.count("</tool_call>")
+                                )
+                                if _in_tool_block:
+                                    # Inside an unclosed tool_call — suppress text streaming.
+                                    pass
+                                else:
+                                    _delta_ev = _sse_event("content_block_delta", {
+                                        "type": "content_block_delta", "index": _anthropic_block_idx,
+                                        "delta": {"type": "text_delta", "text": response_text},
+                                    })
+                                    try:
+                                        self.wfile.write(_delta_ev.encode("utf-8"))
+                                        self.wfile.flush()
+                                        _anthropic_streamed_text.append(response_text)
+                                    except BrokenPipeError:
+                                        _pipeline_log("WIRE", request_id,
+                                            "❌ BROKEN PIPE during Anthropic SSE streaming")
+                                        raise
                         if (
                             len(generated_tokens) % 64 == 0
                             and (time.time() - progress_last_at) >= 1.0
