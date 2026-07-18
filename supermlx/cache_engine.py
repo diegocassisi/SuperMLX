@@ -203,15 +203,25 @@ class HybridGenerationCheckpoint:
     ``cache_key_len`` is the canonical-key prefix represented by the physical
     cache.  SuperMLX intentionally checkpoints with the final prompt token
     still pending, so exact retries can safely reprocess that one token.
+
+    ``model_offset`` and ``model_prefix_hash`` enable defense-in-depth
+    verification: on cache lookup the caller can confirm that
+    model_tokens[:model_offset] in the new request hashes identically to what
+    was checkpointed, preventing silent divergence from healing or
+    canonicalization changes.
     """
 
     snapshot: Dict[str, Any]
     cache_key_len: int
+    model_offset: int = 0
+    model_prefix_hash: int = 0
 
 
 def capture_hybrid_generation_checkpoint(
     cache: list,
     cache_key_len: int,
+    model_offset: int = 0,
+    model_prefix_hash: int = 0,
 ) -> Optional[HybridGenerationCheckpoint]:
     """Capture recurrent state and KV offsets for a hybrid prompt cache.
 
@@ -227,6 +237,8 @@ def capture_hybrid_generation_checkpoint(
     return HybridGenerationCheckpoint(
         snapshot=snapshot,
         cache_key_len=cache_key_len,
+        model_offset=model_offset,
+        model_prefix_hash=model_prefix_hash,
     )
 
 

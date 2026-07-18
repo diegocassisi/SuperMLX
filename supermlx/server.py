@@ -2280,6 +2280,15 @@ def _post_generation_cache_update(
             f"key={len(cache_key)} | kv_offset={_kv_cache_offset(prompt_cache)} | "
             "all recurrent layers rolled back",
         )
+        # Attach verification metadata to the cache list so it survives
+        # the trie store.  On the next lookup, Normal continuation can
+        # verify that model_tokens[:_kv_off] hashes identically.
+        try:
+            prompt_cache.__model_prefix_hash__ = hybrid_checkpoint.model_prefix_hash
+            prompt_cache.__model_offset__ = hybrid_checkpoint.model_offset
+        except (TypeError, AttributeError):
+            pass  # list subclasses or frozen objects — skip silently
+
 
     if not is_embedded_agent:
         # MAIN: any first-turn request with enough tokens qualifies for warmup save.
@@ -2700,6 +2709,8 @@ def _capture_hybrid_checkpoint_before_generation(
         checkpoint = capture_hybrid_generation_checkpoint(
             prompt_cache,
             canonical_key_len,
+            model_offset=actual_model_offset,
+            model_prefix_hash=hash(tuple(model_tokens[:actual_model_offset])),
         )
         if checkpoint is None:
             _pipeline_log(
@@ -5104,11 +5115,56 @@ class APIHandler(BaseHTTPRequestHandler):
                                         f"FIX-31 v9: KV too large for hybrid wash "
                                         f"({_kv_off} > {_HYBRID_WASH_KV_LIMIT}) — cold start")
                                 else:
-                                    rest_tokens = model_tokens[-_suffix_len:]
-                                    _terminal_status("DEBUG", f"FIX-31 v9: Hybrid wash with {_suffix_len} tokens")
+                                    # FIX-31 v13: ArraysCache divergent — fail-closed cold start.
+                                    # Hybrid wash cannot fix recurrent state contamination:
+                                    # ArraysCache accumulates ALL prior tokens; washing a suffix
+                                    # just adds on top of wrong state.  Additionally, the wash
+                                    # produces offset = _kv_off + (_suffix_len - 1) which does
+                                    # NOT equal len(model_tokens) - 1 when _kv_off ≠
+                                    # len(model_tokens) - _suffix_len (Bug 4: healing shifts
+                                    # matched_prefix by 1 relative to the previous checkpoint's
+                                    # canonical_key, breaking the checkpoint invariant).
+                                    # Cold start produces a clean cache with correct checkpoints.
+                                    prompt_cache = None
+                                    if _is_embedded_agent:
+                                        PROMPT_CACHE_COMPACT.evict_unpinned()
+                                    else:
+                                        PROMPT_CACHE.evict_unpinned()
+                                    import gc; gc.collect()
+                                    rest_tokens = model_tokens
+                                    _terminal_status("⚠️",
+                                        f"FIX-31 v13: ArraysCache divergent "
+                                        f"(kv_off={_kv_off} > trim_to={_trim_to}, "
+                                        f"suffix={_suffix_len}) — cold start (fail-closed)")
+
                         else:
-                            rest_tokens = model_tokens[_kv_off:]
-                            _terminal_status("DEBUG", f"FIX-31 v9: Normal continuation from {_kv_off}")
+                            # Normal continuation — _kv_off ≤ _trim_to.
+                            # Defense-in-depth: verify model prefix hash if metadata
+                            # was attached by a previous checkpoint.
+                            _stored_hash = getattr(prompt_cache, '__model_prefix_hash__', None)
+                            _stored_off = getattr(prompt_cache, '__model_offset__', None)
+                            if (_stored_hash is not None
+                                    and _stored_off is not None
+                                    and _stored_off == _kv_off):
+                                _current_hash = hash(tuple(model_tokens[:_kv_off]))
+                                if _current_hash != _stored_hash:
+                                    # Model prefix diverged despite canonical match — cold start.
+                                    prompt_cache = None
+                                    if _is_embedded_agent:
+                                        PROMPT_CACHE_COMPACT.evict_unpinned()
+                                    else:
+                                        PROMPT_CACHE.evict_unpinned()
+                                    import gc; gc.collect()
+                                    rest_tokens = model_tokens
+                                    _terminal_status("⚠️",
+                                        f"FIX-31 v13: model prefix hash mismatch at offset {_kv_off} "
+                                        f"— cold start (fail-closed)")
+                                else:
+                                    rest_tokens = model_tokens[_kv_off:]
+                                    _terminal_status("DEBUG", f"FIX-31 v9: Normal continuation from {_kv_off} (hash verified)")
+                            else:
+                                rest_tokens = model_tokens[_kv_off:]
+                                _terminal_status("DEBUG", f"FIX-31 v9: Normal continuation from {_kv_off}")
                 else:
                     # No KV offset available — full prefill.
                     rest_tokens = model_tokens
