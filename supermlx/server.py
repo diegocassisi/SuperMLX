@@ -2123,7 +2123,6 @@ def _prewarm_post_compact(
     Must be called while model_lock is held (MLX is not thread-safe).
     """
     import copy
-    from mlx_lm.generate import generate_step
 
     if not _tpc.is_initialized():
         _terminal_status("⚠️",
@@ -2193,28 +2192,24 @@ def _prewarm_post_compact(
     new_cache = copy.deepcopy(_tpc._prefix_cache)
     delta_model_tokens = model_tokens[tpc_len:]
 
-    delta_prompt_array = mx.array(delta_model_tokens)
     try:
-        gen = generate_step(
-            delta_prompt_array,
+        ok = _tpc.prefill_cache_only(
+            delta_model_tokens,
             model,
-            max_tokens=1,
-            prompt_cache=new_cache,
+            new_cache,
             prefill_step_size=PREFILL_STEP_SIZE,
             kv_bits=SETTINGS.kv_bits,
             kv_group_size=64,
             quantized_kv_start=0,
         )
-        _tok, _lp = next(gen)
-        mx.eval(_tok)
+        if not ok:
+            _terminal_status("⚠️",
+                f"POST-COMPACT: prefill postcondition failed, skipping | req={request_id[:8]}")
+            return
     except Exception as e:
         _terminal_status("⚠️",
             f"POST-COMPACT: delta prefill failed ({e}), skipping | req={request_id[:8]}")
         return
-
-    # Trim the 1 generated token so cache represents only the prefix
-    if can_trim_prompt_cache(new_cache):
-        trim_prompt_cache(new_cache, 1)
 
     # 5. Evict dead MAIN + COMPACT caches, insert with canonical key
     with prompt_cache_lock:

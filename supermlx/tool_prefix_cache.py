@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import mlx.core as mx
-from mlx_lm.generate import generate_step
+from mlx_lm.generate import maybe_quantize_kv_cache
 from mlx_lm.models.cache import make_prompt_cache
 
 from supermlx.warmup_manager import load_cache, save_cache
@@ -33,6 +33,8 @@ logger = logging.getLogger(__name__)
 _HASH_FILENAME = "tool_prefix.hash"
 _KV_FILENAME = "tool_prefix_kv.safetensors"
 _TOKENS_FILENAME = "tool_prefix_tokens.json"
+# Bump to invalidate disk caches produced with the ghost-token generate_step.
+_TPC_CACHE_VERSION = 2
 
 # ── Module state (singleton) ───────────────────────────────────────────────────
 _prefix_cache: Optional[List[Any]] = None   # The base KV cache — NEVER mutate
@@ -71,7 +73,8 @@ def compute_tools_hash(system_body: str, tools: List[Dict], kv_bits: Optional[in
     payload = (
         system_body + "\x00"
         + json.dumps(tools, sort_keys=True, ensure_ascii=False) + "\x00"
-        + str(kv_bits)
+        + str(kv_bits) + "\x00"
+        + str(_TPC_CACHE_VERSION)
     )
     return hashlib.md5(payload.encode("utf-8")).hexdigest()
 
@@ -127,6 +130,75 @@ def load_from_disk(model: Any, max_kv_size: Optional[int]) -> bool:
     logger.info("[DATA] ✓ tool_prefix_cache loaded | tokens=%d | hash=%s", len(tokens), stored_hash[:8])
     return True
 
+
+def prefill_cache_only(
+    tokens: List[int],
+    model: Any,
+    cache: List[Any],
+    *,
+    prefill_step_size: int = 512,
+    kv_bits: Optional[int] = None,
+    kv_group_size: int = 64,
+    quantized_kv_start: int = 0,
+) -> bool:
+    """
+    Populate KV cache with tokens via chunked forward passes, WITHOUT
+    generating any output tokens.
+
+    Unlike generate_step(max_tokens=1), this does NOT produce a ghost token,
+    so the cache offset after completion equals exactly initial_offset + len(tokens).
+    Critical for hybrid caches (ArraysCache + KVCache) where
+    can_trim_prompt_cache() returns False and ghost tokens cannot be removed.
+
+    Includes KV quantization per chunk (same as generate_step) and a
+    postcondition check on the final offset.
+
+    Returns True if offset postcondition holds, False otherwise.
+    Callers MUST NOT save/insert the cache when False is returned.
+    """
+    # Record initial offset for postcondition
+    initial_offset = 0
+    for c in cache:
+        if hasattr(c, "offset"):
+            initial_offset = int(c.offset)
+            break
+
+    prompt_array = mx.array(tokens)
+    total = len(tokens)
+    processed = 0
+
+    while processed < total:
+        n = min(prefill_step_size, total - processed)
+        chunk = prompt_array[processed : processed + n][None]  # (1, n)
+        model(chunk, cache=cache)
+        if kv_bits is not None:
+            maybe_quantize_kv_cache(
+                cache,
+                quantized_kv_start=quantized_kv_start,
+                kv_group_size=kv_group_size,
+                kv_bits=kv_bits,
+            )
+        mx.eval([c.state if hasattr(c, "state") else c for c in cache])
+        mx.clear_cache()
+        processed += n
+
+    # ── Postcondition: offset integrity ──────────────────────────────────
+    final_offset = None
+    for c in cache:
+        if hasattr(c, "offset"):
+            final_offset = int(c.offset)
+            break
+
+    expected_offset = initial_offset + total
+    if final_offset is not None and final_offset != expected_offset:
+        logger.error(
+            "[POSTCONDITION] prefill_cache_only: offset mismatch | "
+            f"expected={expected_offset} actual={final_offset} "
+            f"(initial={initial_offset} + tokens={total})"
+        )
+        return False
+
+    return True
 
 def compute_and_save(
     system_body: str,
@@ -206,32 +278,23 @@ def compute_and_save(
     prefix_prompt = mx.array(prefix_tokens)
     cache = make_prompt_cache(model, max_kv_size=max_kv_size)
 
-    # Run one step of generate_step to trigger prefill.
-    # max_tokens=1 so it generates exactly 1 token (we discard it).
-    # The KV cache is populated with the prefix after this call.
-    gen = generate_step(
-        prefix_prompt,
+    # Chunked prefill: populate KV cache without generating output tokens.
+    # generate_step(max_tokens=1) leaves a ghost token (+1 offset) that
+    # cannot be trimmed in hybrid caches (ArraysCache.is_trimmable() = False),
+    # breaking the checkpoint offset check and killing all cache reuse.
+    ok = prefill_cache_only(
+        prefix_tokens,
         model,
-        max_tokens=1,
-        prompt_cache=cache,
+        cache,
         prefill_step_size=prefill_step_size,
         kv_bits=kv_bits,
         kv_group_size=64,
         quantized_kv_start=0,
     )
-    # Consume the first (and only) generated token to trigger prefill
-    try:
-        _tok, _lp = next(gen)
-        mx.eval(_tok)
-    except StopIteration:
-        pass
-
-    # Trim the 1 generated token from the cache so it represents ONLY the prefix
-    from mlx_lm.models.cache import can_trim_prompt_cache, trim_prompt_cache
-    if can_trim_prompt_cache(cache):
-        trim_prompt_cache(cache, 1)
-    # else: the generated token stays in cache but offset is 1 beyond prefix —
-    # acceptable, the attention mask will handle it.
+    if not ok:
+        raise RuntimeError(
+            "tool_prefix_cache: prefill postcondition failed — offset mismatch"
+        )
 
     elapsed_prefill = int((time.time() - t0) * 1000)
     logger.info("[CALC] prefill done | elapsed=%dms", elapsed_prefill)
