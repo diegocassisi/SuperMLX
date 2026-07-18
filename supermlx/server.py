@@ -399,6 +399,11 @@ TOOL_LOOP_MAX_RETRIES         = _env_int("TOOL_LOOP_MAX_RETRIES", 3)
 # Dynamic Prefix Capture (DPC): replaces warmup_seed.txt with auto-capture + hash validation.
 # Managed by warmup_manager.py. No manual seed files needed.
 from . import warmup_manager as _wm
+from .cache_engine import (
+    HybridGenerationCheckpoint,
+    capture_hybrid_generation_checkpoint,
+    prepare_cache_for_insertion,
+)
 
 # ── CASCADE ROUTING ──────────────────────────────────────────────────────────
 # Forward a frontier API cuando RAG confidence es baja (no hay knowledge local).
@@ -2242,6 +2247,7 @@ def _post_generation_cache_update(
     session_ctx: Any,
     session_id_for_turn: str,
     is_embedded_agent: bool,
+    hybrid_checkpoint: Optional[HybridGenerationCheckpoint] = None,
 ) -> None:
     """
     Shared post-generation logic: insert cache entries (MAIN or COMPACT),
@@ -2249,6 +2255,36 @@ def _post_generation_cache_update(
     Must be called while holding prompt_cache_lock.
     """
     _cache_hit_ratio = matched_prefix_len / max(len(prompt_tokens), 1) if prompt_tokens else 1.0
+
+    prepared = (
+        prepare_cache_for_insertion(
+            prompt_cache,
+            cache_key,
+            generated_tokens,
+            hybrid_checkpoint,
+        )
+        if prompt_cache is not None
+        else None
+    )
+    if prepared is None:
+        _pipeline_log(
+            "CACHE",
+            request_id,
+            "post-generation cache discarded: hybrid checkpoint missing or rollback failed",
+        )
+        if session_id_for_turn:
+            _update_session_turn_store(session_id_for_turn, messages, prompt_tokens)
+        return
+
+    cache_key, generated_tokens = prepared
+    if hybrid_checkpoint is not None:
+        _pipeline_log(
+            "CACHE",
+            request_id,
+            "HYBRID_CHECKPOINT restored | "
+            f"key={len(cache_key)} | kv_offset={_kv_cache_offset(prompt_cache)} | "
+            "all recurrent layers rolled back",
+        )
 
     if not is_embedded_agent:
         # MAIN: any first-turn request with enough tokens qualifies for warmup save.
@@ -2440,32 +2476,15 @@ def _insert_cache_entries(
                     _terminal_status("⚠️",
                         f"Cache trim in-place FAILED ({_trim_err}) — saving as-is")
         else:
-            # Hybrid cache (e.g., Qwen3 MoE: ArraysCache + KVCache).
-            # can_trim_prompt_cache requires ALL layers trimmable, but ArraysCache
-            # is never trimmable. Trim only KVCache layers per-layer.
-            _pre_off = _kv_cache_offset(prompt_cache)
-            _n_trimmed = 0
-            _n_total = 0
-            try:
-                for layer in prompt_cache:
-                    _n_total += 1
-                    if hasattr(layer, 'is_trimmable') and layer.is_trimmable() and hasattr(layer, 'trim'):
-                        layer.trim(len(generated_tokens))
-                        _n_trimmed += 1
-                if _n_trimmed > 0:
-                    cache_key = cache_key[: -len(generated_tokens)]
-                    _post_off = _kv_cache_offset(prompt_cache)
-                    _terminal_status("🧹",
-                        f"Cache trim in-place (hybrid): {_pre_off} → {_post_off} | "
-                        f"trimmed {_n_trimmed}/{_n_total} layers | "
-                        f"stripped {len(generated_tokens)} response tokens")
-                else:
-                    _terminal_status("⚠️",
-                        f"Cache trim SKIPPED: no trimmable layers "
-                        f"({type(prompt_cache[0]).__name__ if prompt_cache else 'empty'})")
-            except Exception as _trim_err:
-                _terminal_status("⚠️",
-                    f"Cache trim in-place (hybrid) FAILED ({_trim_err}) — saving as-is")
+            # A hybrid cache can only be reused after restoring its pre-generation
+            # ArraysCache checkpoint.  Partial KV-only trim publishes a false clean
+            # key while recurrent layers still contain the response.
+            _terminal_status(
+                "⚠️",
+                "Hybrid cache discarded: generated response reached insertion "
+                "without a complete recurrent-state rollback",
+            )
+            return
 
     _store.insert_cache(model_name, cache_key, prompt_cache)
     SESSION_INDEX.register_cache_key(session_ctx, cache_key)
@@ -2655,6 +2674,60 @@ def _kv_cache_offset(cache: Any) -> Optional[int]:
     except (IndexError, TypeError, AttributeError):
         pass
     return None
+
+
+def _capture_hybrid_checkpoint_before_generation(
+    *,
+    request_id: str,
+    prompt_cache: Any,
+    prompt_tokens: List[int],
+    model_tokens: List[int],
+    rest_tokens: List[int],
+) -> Optional[HybridGenerationCheckpoint]:
+    """Capture a clean hybrid checkpoint with the last prompt token pending."""
+    if not prompt_cache or can_trim_prompt_cache(prompt_cache):
+        return None
+
+    remaining = len(rest_tokens)
+    expected_model_offset = len(model_tokens) - remaining
+    actual_model_offset = _kv_cache_offset(prompt_cache)
+    if actual_model_offset != expected_model_offset:
+        _pipeline_log(
+            "CACHE",
+            request_id,
+            "HYBRID_CHECKPOINT skipped: physical/model offset mismatch | "
+            f"physical={actual_model_offset} expected={expected_model_offset}",
+        )
+        return None
+
+    canonical_key_len = len(prompt_tokens) - remaining
+    try:
+        checkpoint = capture_hybrid_generation_checkpoint(
+            prompt_cache,
+            canonical_key_len,
+        )
+        if checkpoint is None:
+            _pipeline_log(
+                "CACHE",
+                request_id,
+                "HYBRID_CHECKPOINT unavailable: no recurrent layers captured",
+            )
+            return None
+        _pipeline_log(
+            "CACHE",
+            request_id,
+            "HYBRID_CHECKPOINT captured | "
+            f"key={canonical_key_len} | kv_offset={actual_model_offset} | "
+            f"arrays={len(checkpoint.snapshot.get('layers', {}))} | "
+            f"size={checkpoint.snapshot.get('nbytes', 0) / (1024**2):.1f}MB",
+        )
+        return checkpoint
+    except Exception as checkpoint_err:
+        _terminal_status(
+            "⚠️",
+            f"Hybrid checkpoint failed ({checkpoint_err}) — cache will not be reused",
+        )
+        return None
 
 
 
@@ -4743,6 +4816,7 @@ class APIHandler(BaseHTTPRequestHandler):
         generation_started_at = None
         first_token_at = None
         queue_started_at = time.time()
+        hybrid_generation_checkpoint: Optional[HybridGenerationCheckpoint] = None
 
         # --- STABLE-PREFIX TELEMETRY DEFAULTS ---
         stable_prefix_token_len_computed = 0
@@ -5435,6 +5509,15 @@ class APIHandler(BaseHTTPRequestHandler):
                 if not is_vlm and len(rest_tokens) > 1:
                     rest_tokens = _adaptive_prefill(rest_tokens, prompt_cache, request_id)
 
+                if not is_vlm:
+                    hybrid_generation_checkpoint = _capture_hybrid_checkpoint_before_generation(
+                        request_id=request_id,
+                        prompt_cache=prompt_cache,
+                        prompt_tokens=prompt_tokens,
+                        model_tokens=model_tokens,
+                        rest_tokens=rest_tokens,
+                    )
+
                 _prefill_done, _prefill_thread = _start_prefill_progress(request_id, rest_count)
 
                 generated_parts = []
@@ -5502,7 +5585,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     _pipeline_log("RAW_OUT", request_id,
                         f"raw_response ({len(response_text)} chars): {repr(response_text[:1000])}")
                 message_text, tool_calls = _extract_openai_tool_calls(
-                    response_text, SETTINGS.model_family
+                    response_text, SETTINGS.model_family, allowed_tools=tools or []
                 )
                 # Hide <think> blocks from the client whenever reasoning was requested.
                 if enable_thinking:
@@ -5539,6 +5622,7 @@ class APIHandler(BaseHTTPRequestHandler):
                         session_ctx=session_ctx,
                         session_id_for_turn=_session_id_for_turn,
                         is_embedded_agent=_is_embedded_agent,
+                        hybrid_checkpoint=hybrid_generation_checkpoint,
                     )
 
                 # POST-COMPACT PRE-WARMUP: after compact finishes, pre-warm MAIN
@@ -5727,6 +5811,15 @@ class APIHandler(BaseHTTPRequestHandler):
                 if not is_vlm and len(rest_tokens) > 1:
                     rest_tokens = _adaptive_prefill(rest_tokens, prompt_cache, request_id)
 
+                if not is_vlm:
+                    hybrid_generation_checkpoint = _capture_hybrid_checkpoint_before_generation(
+                        request_id=request_id,
+                        prompt_cache=prompt_cache,
+                        prompt_tokens=prompt_tokens,
+                        model_tokens=model_tokens,
+                        rest_tokens=rest_tokens,
+                    )
+
                 _prefill_done_s, _ = _start_prefill_progress(request_id, rest_count)
 
                 raw_parts = []
@@ -5861,7 +5954,8 @@ class APIHandler(BaseHTTPRequestHandler):
                                 _acc_text = "".join(raw_parts)
                                 _acc_lower = _acc_text.lower()
                                 _in_tool_block = (
-                                    _acc_lower.count("<tool_call") > _acc_lower.count("</tool_call>")
+                                    bool(tools)
+                                    and _acc_lower.count("<tool_call") > _acc_lower.count("</tool_call>")
                                 )
                                 if _in_tool_block:
                                     # Inside an unclosed tool_call — suppress text streaming.
@@ -5928,7 +6022,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     _pipeline_log("RAW_OUT", request_id,
                         f"raw_response ({len(full_text)} chars): {repr(full_text[:2000])}")
                 message_text, tool_calls = _extract_openai_tool_calls(
-                    full_text, SETTINGS.model_family
+                    full_text, SETTINGS.model_family, allowed_tools=tools or []
                 )
                 # Hide <think> blocks from the client whenever reasoning was requested.
                 if enable_thinking:
@@ -6151,6 +6245,7 @@ class APIHandler(BaseHTTPRequestHandler):
                         session_ctx=session_ctx,
                         session_id_for_turn=_session_id_for_turn,
                         is_embedded_agent=_is_embedded_agent,
+                        hybrid_checkpoint=hybrid_generation_checkpoint,
                     )
 
                 # POST-COMPACT PRE-WARMUP: after compact finishes, pre-warm MAIN

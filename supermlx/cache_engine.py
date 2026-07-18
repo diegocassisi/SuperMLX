@@ -196,6 +196,89 @@ def rollback_arrays_cache(cache: list, snapshot: Dict[str, Any]) -> bool:
     return restored > 0
 
 
+@dataclass
+class HybridGenerationCheckpoint:
+    """Prompt-only checkpoint captured immediately before hybrid generation.
+
+    ``cache_key_len`` is the canonical-key prefix represented by the physical
+    cache.  SuperMLX intentionally checkpoints with the final prompt token
+    still pending, so exact retries can safely reprocess that one token.
+    """
+
+    snapshot: Dict[str, Any]
+    cache_key_len: int
+
+
+def capture_hybrid_generation_checkpoint(
+    cache: list,
+    cache_key_len: int,
+) -> Optional[HybridGenerationCheckpoint]:
+    """Capture recurrent state and KV offsets for a hybrid prompt cache.
+
+    Returns ``None`` for pure KV caches, invalid key lengths, or cache types
+    without ArraysCache state.  Callers must treat ``None`` as non-reusable
+    after generation; partially trimming only the KV layers is unsafe.
+    """
+    if not cache or cache_key_len <= 0 or can_trim_prompt_cache(cache):
+        return None
+    snapshot = snapshot_arrays_cache(cache)
+    if not snapshot.get("layers"):
+        return None
+    return HybridGenerationCheckpoint(
+        snapshot=snapshot,
+        cache_key_len=cache_key_len,
+    )
+
+
+def restore_hybrid_generation_checkpoint(
+    cache: list,
+    checkpoint: HybridGenerationCheckpoint,
+) -> bool:
+    """Restore every recurrent layer and verify every recorded KV offset."""
+    if checkpoint is None or not cache:
+        return False
+
+    snapshot = checkpoint.snapshot
+    for idx in snapshot.get("layers", {}):
+        idx = int(idx) if isinstance(idx, str) else idx
+        if idx >= len(cache) or not _is_arrays_cache(cache[idx]):
+            return False
+
+    if not rollback_arrays_cache(cache, snapshot):
+        return False
+
+    for idx, expected_offset in snapshot.get("kv_offsets", {}).items():
+        idx = int(idx) if isinstance(idx, str) else idx
+        if idx >= len(cache) or not hasattr(cache[idx], "offset"):
+            return False
+        if int(cache[idx].offset) != int(expected_offset):
+            return False
+    return True
+
+
+def prepare_cache_for_insertion(
+    cache: list,
+    cache_key: List[int],
+    generated_tokens: List[int],
+    checkpoint: Optional[HybridGenerationCheckpoint],
+) -> Optional[Tuple[List[int], List[int]]]:
+    """Return safe insertion inputs, or ``None`` when cache reuse is unsafe.
+
+    Pure KV caches retain the existing trim-on-insert behavior.  Hybrid caches
+    with generated tokens are reusable only after a complete checkpoint
+    restore; failure is deliberately fail-closed.
+    """
+    if not generated_tokens or can_trim_prompt_cache(cache):
+        return list(cache_key), list(generated_tokens)
+    if checkpoint is None:
+        return None
+    if not restore_hybrid_generation_checkpoint(cache, checkpoint):
+        return None
+    if checkpoint.cache_key_len > len(cache_key):
+        return None
+    return list(cache_key[: checkpoint.cache_key_len]), []
+
+
 # ── HybridPromptCache ────────────────────────────────────────────────────────
 
 class HybridPromptCache(LRUPromptCache):

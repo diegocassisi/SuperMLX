@@ -320,19 +320,54 @@ def _convert_markdown_tool_calls(text: str) -> str:
     return _MARKDOWN_CODE_BLOCK.sub(_replace_block, text)
 
 
-def _extract_openai_tool_calls(text, model_family):
+def _allowed_tool_name_set(allowed_tools) -> Optional[set]:
+    """Normalize OpenAI/Anthropic tool declarations or explicit names."""
+    if allowed_tools is None:
+        return None
+    names = set()
+    for tool in allowed_tools:
+        if isinstance(tool, str):
+            if tool:
+                names.add(tool)
+            continue
+        if not isinstance(tool, dict):
+            continue
+        function = tool.get("function")
+        if isinstance(function, dict):
+            name = function.get("name")
+        else:
+            name = tool.get("name")
+        if isinstance(name, str) and name:
+            names.add(name)
+    return names
+
+
+def _extract_openai_tool_calls(text, model_family, allowed_tools=None):
     if not isinstance(text, str):
+        return text, []
+
+    allowed_names = _allowed_tool_name_set(allowed_tools)
+    if allowed_names is not None and not allowed_names:
+        # No tools were declared for this request. Preserve code examples and
+        # any model-emitted markup as text; never manufacture executable calls.
         return text, []
 
     # Agents-A1 and similar models conditioned by Claude's system prompt may output
     # tool calls as markdown code blocks instead of <tool_call> XML. Convert them
     # so the existing parser chain picks them up.
-    if model_family == "qwen3" and "<tool_call>" not in text and "```" in text:
+    text_lower = text.lower()
+    if (
+        model_family == "qwen3"
+        and "<tool_call>" not in text_lower
+        and "```" in text
+        and (allowed_names is None or "terminal" in allowed_names)
+    ):
         text = _convert_markdown_tool_calls(text)
+        text_lower = text.lower()
 
     # Quick-exit: no tool call markers at all
-    _has_standard = "<tool_call>" in text
-    _has_gemma4 = "<|tool_call|>" in text
+    _has_standard = "<tool_call>" in text_lower
+    _has_gemma4 = "<|tool_call|>" in text_lower
     if not _has_standard and not _has_gemma4:
         return text, []
 
@@ -472,6 +507,11 @@ def _extract_openai_tool_calls(text, model_family):
                 if parsed is None:
                     parsed = _parse_qwen_block(body)
             if parsed is None:
+                continue
+            tool_name = parsed.get("function", {}).get("name")
+            if allowed_names is not None and tool_name not in allowed_names:
+                # Undeclared tools are never executable and their source span is
+                # left untouched so content is not silently deleted.
                 continue
             tool_calls.append(parsed)
             remove_spans.append(match.span())

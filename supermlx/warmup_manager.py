@@ -148,6 +148,8 @@ def detect_boundary(prompt_text: str, tokens: List[int], tokenizer) -> int:
 # CACHE PERSISTENCE (save/load KV state to/from disk)
 # ═══════════════════════════════════════════════════════════════════════════════
 
+CACHE_FORMAT_VERSION = 2
+
 def save_cache(
     tokens: List[int],
     prompt_cache: Any,
@@ -174,6 +176,9 @@ def save_cache(
         path.parent.mkdir(parents=True, exist_ok=True)
         arrays: Dict[str, Any] = {}
         arrays["tokens"] = mx.array(tokens, dtype=mx.int32)
+        arrays["cache_format_version"] = mx.array(
+            [CACHE_FORMAT_VERSION], dtype=mx.int32
+        )
         # n_kv_layers: count of layers that actually have KV cache state
         # (hybrid models like DeltaNet/Attention have fewer KV layers than total layers)
         saved_layers = 0
@@ -248,7 +253,8 @@ def save_cache(
 
         _log(
             "💾",
-            f"DPC: cache saved → {path.name} | layers={saved_layers} + {saved_recurrent} recurrent | tokens={len(tokens)}",
+            f"DPC: cache saved → {path.name} | format=v{CACHE_FORMAT_VERSION} | "
+            f"layers={saved_layers} + {saved_recurrent} recurrent | tokens={len(tokens)}",
         )
         return True
     except Exception as e:
@@ -281,6 +287,20 @@ def load_cache(
         return None, None
     try:
         arrays = mx.load(str(path))
+        version_array = arrays.get("cache_format_version")
+        version = (
+            int(version_array.tolist()[0])
+            if version_array is not None
+            else None
+        )
+        if version != CACHE_FORMAT_VERSION:
+            _log(
+                "⚠️",
+                "DPC: incompatible cache format "
+                f"({version if version is not None else 'legacy'} != "
+                f"v{CACHE_FORMAT_VERSION}) — ignoring and cold-starting",
+            )
+            return None, None
         tokens = arrays["tokens"].tolist()
         if not tokens:
             _log("⚠️", "DPC: disk cache has empty token list — ignoring")
@@ -773,6 +793,7 @@ def run_startup(
                     f"hash={'✓' if state.prefix_hash else '?'} | LRU (evictable)",
                 )
             else:
+                state.prefix_hash = None
                 _log("⚠️", "DPC: disk cache invalid or empty — first request will cold-start")
 
     except Exception as e:
