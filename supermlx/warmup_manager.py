@@ -731,14 +731,38 @@ def run_startup(
         # We load it into PROMPT_CACHE now. On the first real request, we'll
         # validate the prefix hash. If it doesn't match, we evict and cold-start.
         if persist_path and persist_path.exists():
+            _t_load_start = time.perf_counter()
+            _mem_pre_load = mx.get_active_memory() / 1e9
+
             disk_tokens, disk_cache = load_cache(
                 persist_path, model, max_kv_size, is_vlm, log_fn=_log,
             )
+
+            _load_elapsed = time.perf_counter() - _t_load_start
+            _mem_post_load = mx.get_active_memory() / 1e9
+            _log(
+                "⏱️",
+                f"DPC: load_cache() tomó {_load_elapsed:.1f}s | "
+                f"mem {_mem_pre_load:.3f}GB → {_mem_post_load:.3f}GB "
+                f"(delta={_mem_post_load - _mem_pre_load:+.3f}GB)"
+            )
+
             if disk_tokens and disk_cache and len(disk_tokens) > 5000:
+                _t_insert_start = time.perf_counter()
                 with prompt_cache_lock:
                     prompt_cache_main.insert_cache(
                         model_path, disk_tokens, disk_cache, pinned=False
                     )
+                _insert_elapsed = time.perf_counter() - _t_insert_start
+                _mem_post_insert = mx.get_active_memory() / 1e9
+                _log(
+                    "⏱️",
+                    f"DPC: insert_cache() tomó {_insert_elapsed:.2f}s | "
+                    f"tokens={len(disk_tokens)} | "
+                    f"mem_final={_mem_post_insert:.3f}GB "
+                    f"(delta insert={_mem_post_insert - _mem_post_load:+.3f}GB)"
+                )
+
                 # Create frozen snapshot from disk cache
                 state.frozen_cache, state.frozen_tokens = create_frozen_snapshot(
                     disk_cache, disk_tokens, log_fn=_log,

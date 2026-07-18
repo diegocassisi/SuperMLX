@@ -521,8 +521,13 @@ class PredictiveCachedSwitchLinear(nn.Module):
         self.freeze()
 
     def __call__(self, x, indices, sorted_indices=False):
-        # Only up_proj captures indices (avoid triple-buffering)
-        if self._proj_name == "up_proj":
+        # Only up_proj captures indices (avoid triple-buffering).
+        # Skip entirely when all experts are resident — no cache misses possible,
+        # so _indices_buffer would grow unbounded with no benefit.
+        if (
+            self._proj_name == "up_proj"
+            and len(self._cache.cached_ids) < self._cache.num_experts
+        ):
             self._cache._indices_buffer.append(indices)
 
         local_indices = self._cache.remap(indices)
@@ -638,9 +643,14 @@ def _patch_moe_block(moe_block, cache: PredictiveExpertCache):
             if getattr(self, "norm_topk_prob", False):
                 scores = scores / scores.sum(axis=-1, keepdims=True)
 
-        # Zero out scores for uncached experts
-        mask = cache.hit_mask[inds]
-        scores = scores * mask
+        # Zero out scores for uncached experts.
+        # Fast path: skip hit_mask multiplication when all experts are resident
+        # (no cache misses possible). The normalization always runs to preserve
+        # exact router math regardless of norm_topk_prob setting.
+        # This check is pure Python — no MLX array access, zero GPU overhead.
+        if len(cache.cached_ids) < cache.num_experts:
+            scores = scores * cache.hit_mask[inds]
+
         score_sum = scores.sum(axis=-1, keepdims=True)
         # Guard against div-by-zero when ALL top-K experts are uncached
         scores = mx.where(score_sum > 0, scores / score_sum, scores)
@@ -661,6 +671,24 @@ def _patch_moe_block(moe_block, cache: PredictiveExpertCache):
 
 
 # ── Dynamic Cache Update ─────────────────────────────────────────────────────
+
+
+def dynamic_cache_needed(model: nn.Module) -> bool:
+    """Return True only when dynamic expert swapping is actually needed.
+
+    Returns False (safe default) when:
+    - model has no _moe_config attribute
+    - moe_layers == 0 (dense model)
+    - capacity >= num_experts (all experts resident — no cache misses possible)
+
+    This is evaluated once per generation, not per token.
+    """
+    config = getattr(model, "_moe_config", None)
+    if config is None:
+        return False
+    if config.get("moe_layers", 0) == 0:
+        return False
+    return config.get("capacity", 0) < config.get("num_experts", 1)
 
 
 def dynamic_cache_update(
@@ -1105,6 +1133,11 @@ def expand_expert_capacity(
         cache.rebuild_lookup()
         mx.eval(cache.lookup, cache.hit_mask)
 
+        # Clear stale indices buffer if now fully resident — avoids retaining
+        # MLX array references captured before the expansion.
+        if len(cache.cached_ids) >= cache.num_experts:
+            cache._indices_buffer.clear()
+
         # Re-pin from profile
         if profile:
             _pin_from_profile(cache, i, profile)
@@ -1497,6 +1530,11 @@ def breathe_up(
 
         cache.rebuild_lookup()
         mx.eval(cache.lookup, cache.hit_mask)
+
+        # Clear stale indices buffer if now fully resident — avoids retaining
+        # MLX array references captured before the reload.
+        if len(cache.cached_ids) >= cache.num_experts:
+            cache._indices_buffer.clear()
 
         layers_expanded += 1
         total_loaded += len(new_ids)

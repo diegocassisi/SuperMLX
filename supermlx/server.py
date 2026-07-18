@@ -5704,12 +5704,14 @@ class APIHandler(BaseHTTPRequestHandler):
                 _keepalive_stop = threading.Event()
                 _keepalive_wfile = self.wfile  # capture for thread
                 _keepalive_interval = 5  # seconds
+                _wfile_lock = threading.Lock()  # protect concurrent writes
 
                 def _sse_keepalive_sender():
                     while not _keepalive_stop.wait(_keepalive_interval):
                         try:
-                            _keepalive_wfile.write(b": keepalive\n\n")
-                            _keepalive_wfile.flush()
+                            with _wfile_lock:
+                                _keepalive_wfile.write(b": keepalive\n\n")
+                                _keepalive_wfile.flush()
                         except Exception:
                             break  # client disconnected
 
@@ -5821,33 +5823,35 @@ class APIHandler(BaseHTTPRequestHandler):
                                 if "</think>" in _acc:
                                     _seen_think_close = True
                                     # Close thinking block (index 0)
-                                    self.wfile.write(_sse_event("content_block_stop", {
-                                        "type": "content_block_stop", "index": 0,
-                                    }).encode("utf-8"))
-                                    # Open text block (index 1)
-                                    _anthropic_block_idx = 1
-                                    self.wfile.write(_sse_event("content_block_start", {
-                                        "type": "content_block_start", "index": 1,
-                                        "content_block": {"type": "text", "text": ""},
-                                    }).encode("utf-8"))
-                                    # Stream text after </think>
-                                    _post_think = _acc.split("</think>", 1)[1].lstrip("\n")
-                                    if _post_think:
-                                        self.wfile.write(_sse_event("content_block_delta", {
-                                            "type": "content_block_delta", "index": 1,
-                                            "delta": {"type": "text_delta", "text": _post_think},
+                                    with _wfile_lock:
+                                        self.wfile.write(_sse_event("content_block_stop", {
+                                            "type": "content_block_stop", "index": 0,
                                         }).encode("utf-8"))
-                                        _anthropic_streamed_text.append(_post_think)
-                                    self.wfile.flush()
+                                        # Open text block (index 1)
+                                        _anthropic_block_idx = 1
+                                        self.wfile.write(_sse_event("content_block_start", {
+                                            "type": "content_block_start", "index": 1,
+                                            "content_block": {"type": "text", "text": ""},
+                                        }).encode("utf-8"))
+                                        # Stream text after </think>
+                                        _post_think = _acc.split("</think>", 1)[1].lstrip("\n")
+                                        if _post_think:
+                                            self.wfile.write(_sse_event("content_block_delta", {
+                                                "type": "content_block_delta", "index": 1,
+                                                "delta": {"type": "text_delta", "text": _post_think},
+                                            }).encode("utf-8"))
+                                            _anthropic_streamed_text.append(_post_think)
+                                        self.wfile.flush()
                                 else:
                                     # Still in thinking — stream as thinking_delta
                                     _new_think = response_text
                                     if _new_think:
-                                        self.wfile.write(_sse_event("content_block_delta", {
-                                            "type": "content_block_delta", "index": 0,
-                                            "delta": {"type": "thinking_delta", "thinking": _new_think},
-                                        }).encode("utf-8"))
-                                        self.wfile.flush()
+                                        with _wfile_lock:
+                                            self.wfile.write(_sse_event("content_block_delta", {
+                                                "type": "content_block_delta", "index": 0,
+                                                "delta": {"type": "thinking_delta", "thinking": _new_think},
+                                            }).encode("utf-8"))
+                                            self.wfile.flush()
                                         _anthropic_thinking_streamed.append(_new_think)
                             elif _anthropic_streaming and _seen_think_close:
                                 # Suppress raw <tool_call> XML from being streamed as text.
@@ -5868,8 +5872,9 @@ class APIHandler(BaseHTTPRequestHandler):
                                         "delta": {"type": "text_delta", "text": response_text},
                                     })
                                     try:
-                                        self.wfile.write(_delta_ev.encode("utf-8"))
-                                        self.wfile.flush()
+                                        with _wfile_lock:
+                                            self.wfile.write(_delta_ev.encode("utf-8"))
+                                            self.wfile.flush()
                                         _anthropic_streamed_text.append(response_text)
                                     except BrokenPipeError:
                                         _pipeline_log("WIRE", request_id,
@@ -5929,52 +5934,6 @@ class APIHandler(BaseHTTPRequestHandler):
                 if enable_thinking:
                     message_text = _strip_thinking_from_content(message_text)
 
-                    _update_healing_store(raw_full_text, message_text, tool_calls)
-
-                cache_key.extend(generated_tokens)
-                with prompt_cache_lock:
-                    _post_generation_cache_update(
-                        request_id=request_id,
-                        messages=messages,
-                        prompt_tokens=prompt_tokens,
-                        cache_key=cache_key,
-                        prompt_cache=prompt_cache,
-                        generated_tokens=generated_tokens,
-                        tool_calls=tool_calls,
-                        matched_prefix_len=matched_prefix_len,
-                        session_ctx=session_ctx,
-                        session_id_for_turn=_session_id_for_turn,
-                        is_embedded_agent=_is_embedded_agent,
-                    )
-
-                # POST-COMPACT PRE-WARMUP: after compact finishes, pre-warm MAIN
-                # with the summary so the next request doesn't cold-start 50K tokens.
-                # Guard: skip if MAIN already has a warm cache larger than TPC.
-                _main_max_len = max(
-                    (len(e.tokens) for e in PROMPT_CACHE._entries.values()), default=0
-                ) if PROMPT_CACHE._entries else 0
-                _tpc_len = len(_tpc._prefix_tokens) if _tpc.is_initialized() else 0
-                if _is_embedded_agent and message_text and len(message_text) > 100 and _main_max_len <= _tpc_len:
-                    try:
-                        _prewarm_post_compact(
-                            summary_text=message_text,
-                            messages=messages,
-                            request_id=request_id,
-                        )
-                    except Exception as _pw_err:
-                        _terminal_status("⚠️",
-                            f"POST-COMPACT PRE-WARMUP failed: {_pw_err} | req={request_id[:8]}")
-
-                # Expert Breathing: restore full capacity after generation
-                if _breathing_active:
-                    try:
-                        from .expert_cache import breathe_up
-                        breathe_up(model, log_fn=_terminal_status)
-                    except Exception as _bu_err:
-                        _terminal_status("⚠️", f"BREATHE UP failed: {_bu_err} | req={request_id[:8]}")
-                    finally:
-                        _breathing_active = False
-
                 finish_reason = "tool_calls" if tool_calls else "stop"
                 # LOOP BREAK ESCALATION: if LOOP_BREAK fired but model still
                 # generated tool_calls, strip them and force stop.
@@ -5989,6 +5948,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     )
                     tool_calls = []
                     finish_reason = "stop"
+
 
                 # ── ANTHROPIC SSE OUTPUT ──────────────────────────────────
                 if self._is_anthropic:
@@ -6167,6 +6127,59 @@ class APIHandler(BaseHTTPRequestHandler):
                         message_text, tool_calls, enable_thinking, finish_reason,
                         _is_embedded_agent, timing,
                     )
+
+                # ── DEFERRED POST-PROCESSING ──────────────────────────────
+                # These operations are heavy (cache trim with mx.eval, healing
+                # store, pre-warmup) and were previously run BEFORE sending
+                # closing events, causing a 2+ second SSE gap that could make
+                # the client time out. Now they run AFTER the response is
+                # fully delivered to the client.
+                if enable_thinking:
+                    _update_healing_store(raw_full_text, message_text, tool_calls)
+
+                cache_key.extend(generated_tokens)
+                with prompt_cache_lock:
+                    _post_generation_cache_update(
+                        request_id=request_id,
+                        messages=messages,
+                        prompt_tokens=prompt_tokens,
+                        cache_key=cache_key,
+                        prompt_cache=prompt_cache,
+                        generated_tokens=generated_tokens,
+                        tool_calls=tool_calls,
+                        matched_prefix_len=matched_prefix_len,
+                        session_ctx=session_ctx,
+                        session_id_for_turn=_session_id_for_turn,
+                        is_embedded_agent=_is_embedded_agent,
+                    )
+
+                # POST-COMPACT PRE-WARMUP: after compact finishes, pre-warm MAIN
+                # with the summary so the next request doesn't cold-start 50K tokens.
+                # Guard: skip if MAIN already has a warm cache larger than TPC.
+                _main_max_len = max(
+                    (len(e.tokens) for e in PROMPT_CACHE._entries.values()), default=0
+                ) if PROMPT_CACHE._entries else 0
+                _tpc_len = len(_tpc._prefix_tokens) if _tpc.is_initialized() else 0
+                if _is_embedded_agent and message_text and len(message_text) > 100 and _main_max_len <= _tpc_len:
+                    try:
+                        _prewarm_post_compact(
+                            summary_text=message_text,
+                            messages=messages,
+                            request_id=request_id,
+                        )
+                    except Exception as _pw_err:
+                        _terminal_status("⚠️",
+                            f"POST-COMPACT PRE-WARMUP failed: {_pw_err} | req={request_id[:8]}")
+
+                # Expert Breathing: restore full capacity after generation
+                if _breathing_active:
+                    try:
+                        from .expert_cache import breathe_up
+                        breathe_up(model, log_fn=_terminal_status)
+                    except Exception as _bu_err:
+                        _terminal_status("⚠️", f"BREATHE UP failed: {_bu_err} | req={request_id[:8]}")
+                    finally:
+                        _breathing_active = False
 
         except BrokenPipeError:
             _terminal_status(
