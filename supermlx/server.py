@@ -664,10 +664,69 @@ _PIPELINE_LOG_DIR = SETTINGS.log_root / "requests"
 
 # ANSI color codes for terminal log highlighting
 _ANSI_YELLOW = "\033[33m"
-
+_ANSI_RED = "\033[31m"
+_ANSI_DIM = "\033[2m"
 _ANSI_RESET = "\033[0m"
 # Stages that get yellow highlighting (compression/compaction events)
 _HIGHLIGHT_STAGES = {"COMPRESS", "COMPACT_RUNNER"}
+
+
+# ── Auto-Delta Tracker ───────────────────────────────────────────────────────
+# Tracks timestamps per request to compute inter-stage deltas automatically.
+# Maintains rolling stats per transition type for adaptive slow-detection.
+# Thread-safe: always called under console_lock.
+
+class _DeltaTracker:
+    """Tracks last timestamp per request and rolling stats per transition type."""
+
+    __slots__ = ("_req_last", "_transition_history", "_history_size")
+
+    def __init__(self, history_size: int = 50):
+        self._req_last: Dict[str, tuple] = {}          # req[:8] -> (time.time(), stage)
+        self._transition_history: Dict[str, deque] = {} # "FROM→TO" -> deque of delta_secs
+        self._history_size = history_size
+
+    def record(self, request_id: str, stage: str):
+        """Record a timestamp. Returns (delta_secs, from_stage, is_slow) or None."""
+        now = time.time()
+        key = request_id[:8]
+        prev = self._req_last.get(key)
+        self._req_last[key] = (now, stage)
+
+        if prev is None:
+            return None
+
+        prev_ts, prev_stage = prev
+        delta = now - prev_ts
+
+        # Track per-transition rolling history
+        trans_key = f"{prev_stage}→{stage}"
+        hist = self._transition_history.get(trans_key)
+        if hist is None:
+            hist = deque(maxlen=self._history_size)
+            self._transition_history[trans_key] = hist
+        hist.append(delta)
+
+        # Adaptive threshold: P90 × 2, minimum 1.0s
+        is_slow = False
+        if len(hist) >= 5:
+            sorted_hist = sorted(hist)
+            p90 = sorted_hist[int(len(sorted_hist) * 0.9)]
+            threshold = max(1.0, p90 * 2)
+            is_slow = delta > threshold
+        elif delta > 5.0:
+            # Cold start fallback: flag anything > 5s
+            is_slow = True
+
+        return (delta, prev_stage, is_slow)
+
+    def cleanup(self, request_id: str):
+        """Remove tracking for a completed request."""
+        self._req_last.pop(request_id[:8], None)
+
+
+_delta_tracker = _DeltaTracker()
+
 
 def _pipeline_log(
     stage: str,
@@ -681,6 +740,10 @@ def _pipeline_log(
     Only fires when FEATURE_FULL_LOGGING = True.
     Per-stage sub-flags (FEATURE_LOG_TOOLS, etc.) are checked by the caller,
     not here — keeps this function fast and simple.
+
+    Auto-delta: appends Δ=Xs to the line when the gap from the previous
+    stage (same request) exceeds 500ms.  Paints the line RED when the gap
+    exceeds the adaptive threshold (P90×2 of rolling history).
     """
     if not FEATURE_FULL_LOGGING:
         return
@@ -688,10 +751,21 @@ def _pipeline_log(
     ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]  # HH:MM:SS.mmm
     tag = f"[{stage}]"
     pad = "  " * max(indent, 0)
-    line = f"{pad}{tag} {ts} req={request_id[:8]} | {message}"
 
-    # Highlight compression/compaction stages in yellow
-    if stage in _HIGHLIGHT_STAGES:
+    # Auto-delta tracking
+    delta_info = _delta_tracker.record(request_id, stage)
+    delta_suffix = ""
+    if delta_info:
+        delta_secs, _from_stage, is_slow = delta_info
+        if delta_secs >= 0.5:  # Only annotate deltas >= 500ms
+            delta_suffix = f" Δ={delta_secs:.3f}s"
+
+    line = f"{pad}{tag} {ts} req={request_id[:8]} | {message}{delta_suffix}"
+
+    # Color priority: red (slow) > yellow (highlight stage) > default
+    if delta_info and delta_info[2]:  # is_slow
+        line = f"{_ANSI_RED}{line}{_ANSI_RESET}"
+    elif stage in _HIGHLIGHT_STAGES:
         line = f"{_ANSI_YELLOW}{line}{_ANSI_RESET}"
 
     with console_lock:
@@ -813,14 +887,46 @@ _compressor_module = None     # Will be set to rag_enricher module
 _rag_available = False
 _rag_module = None            # Will be set to rag_enricher module (same module)
 
-def _terminal_status(icon: str, message: str, indent: int = 0) -> None:
-    with console_lock:
-        ts = datetime.now().strftime("%H:%M:%S")
+def _terminal_status(icon: str, message: str, indent: int = 0, *,
+                     request_id: str = None, stage: str = None) -> None:
+    """Terminal status logger.
+
+    When request_id and stage are provided, uses unified pipeline format
+    with auto-delta tracking:  icon [STAGE] HH:MM:SS.mmm req=xxx | message [Δ=Xs]
+    Otherwise uses legacy emoji format:  icon [HH:MM:SS] message
+
+    Backward compatible — all existing calls work unchanged.
+    """
+    now = datetime.now()
+
+    if request_id and stage:
+        # ── Unified format with delta tracking ──
+        ts = now.strftime("%H:%M:%S.%f")[:-3]
+        tag = f"[{stage}]"
+        pad = "  " * max(indent, 0)
+
+        delta_info = _delta_tracker.record(request_id, stage)
+        delta_suffix = ""
+        if delta_info:
+            delta_secs, _from_stage, is_slow = delta_info
+            if delta_secs >= 0.5:
+                delta_suffix = f" Δ={delta_secs:.3f}s"
+
+        line = f"{pad}{icon} {tag} {ts} req={request_id[:8]} | {message}{delta_suffix}"
+
+        if delta_info and delta_info[2]:  # is_slow
+            line = f"{_ANSI_RED}{line}{_ANSI_RESET}"
+        elif "EMERGENCY COMPRESSOR" in message:
+            line = f"{_ANSI_YELLOW}{line}{_ANSI_RESET}"
+    else:
+        # ── Legacy format (startup, system messages) ──
+        ts = now.strftime("%H:%M:%S")
         pad = "  " * max(indent, 0)
         line = f"{pad}{icon} [{ts}] {message}"
-        # Highlight emergency compressor lines in yellow
         if "EMERGENCY COMPRESSOR" in message:
             line = f"{_ANSI_YELLOW}{line}{_ANSI_RESET}"
+
+    with console_lock:
         print(line, flush=True)
 
 
@@ -1917,8 +2023,15 @@ def _metal_mem_str() -> str:
         return ""
 
 
-# Threshold (tokens) above which we run aggressive memory relief before prefill
-_PREFILL_MEMORY_RELIEF_THRESHOLD = 10000
+# Minimum tokens to even consider running memory relief (avoid overhead for tiny prefills)
+_PREFILL_MEMORY_RELIEF_MIN_TOKENS = 1000
+
+# Empirical KV cache bytes per token at FP16 (Qwen3.6-27B-class: ~65 KB/tok).
+# Scaled down by KV_BITS at runtime.  Override via PREFILL_KV_BYTES_PER_TOKEN env var.
+_PREFILL_KV_BYTES_PER_TOKEN_FP16 = int(os.environ.get("PREFILL_KV_BYTES_PER_TOKEN_FP16", "65536"))
+
+# Safety margin: run relief when projected usage exceeds this fraction of Metal budget
+_PREFILL_RELIEF_BUDGET_FRACTION = float(os.environ.get("PREFILL_RELIEF_BUDGET_FRACTION", "0.90"))
 
 # ── Metal budget (effective memory ceiling for prefill estimation) ─────────
 _metal_budget_gb_cached: Optional[float] = None
@@ -1968,12 +2081,40 @@ def _pre_prefill_memory_relief(request_id: str, rest_count: int, is_embedded_age
     Runs gc.collect + mx.clear_cache + malloc_zone_pressure_relief
     (macOS-specific: tells the C allocator to return freed pages to the OS).
     Also triggers Expert Breathing (breathe_down) for large MAIN requests.
-    Only triggers for prefills above _PREFILL_MEMORY_RELIEF_THRESHOLD tokens.
+
+    Decision is memory-based: estimates projected Metal usage after prefill
+    (current + KV cache growth + scratch) and only fires when it would exceed
+    _PREFILL_RELIEF_BUDGET_FRACTION of the Metal budget.  Tiny prefills
+    (< _PREFILL_MEMORY_RELIEF_MIN_TOKENS) are always skipped.
     """
     global _breathing_active
 
-    if rest_count < _PREFILL_MEMORY_RELIEF_THRESHOLD:
+    # Skip trivially small prefills (no benefit from relief)
+    if rest_count < _PREFILL_MEMORY_RELIEF_MIN_TOKENS:
         return
+
+    # ── Memory-based gate: project post-prefill usage ──────────────
+    _projected_gb = -1.0  # fallback if estimation fails
+    _threshold_gb = -1.0
+    try:
+        _active_gb = mx.get_active_memory() / 1e9
+        _kv_bits = SETTINGS.kv_bits or 16  # None means FP16
+        _kv_bytes_per_tok = _PREFILL_KV_BYTES_PER_TOKEN_FP16 * _kv_bits / 16
+        _kv_growth_gb = rest_count * _kv_bytes_per_tok / 1e9
+        _scratch_gb = 1.5  # activation/attention scratch during prefill
+        _projected_gb = _active_gb + _kv_growth_gb + _scratch_gb
+        _budget_gb = _get_metal_budget_gb()
+        _threshold_gb = _budget_gb * _PREFILL_RELIEF_BUDGET_FRACTION
+
+        if _projected_gb < _threshold_gb:
+            _pipeline_log("METAL", request_id,
+                f"PRE_PREFILL_RELIEF: SKIPPED (headroom) | "
+                f"rest={rest_count} | projected={_projected_gb:.2f}GB | "
+                f"threshold={_threshold_gb:.2f}GB ({_PREFILL_RELIEF_BUDGET_FRACTION:.0%} of {_budget_gb:.1f}GB) | "
+                f"{_metal_mem_str()}")
+            return
+    except Exception:
+        pass  # If estimation fails, fall through to relief (safe default)
     _mem_before = _metal_mem_str()
     import gc as _gc
     _gc.collect()
@@ -2022,7 +2163,8 @@ def _pre_prefill_memory_relief(request_id: str, rest_count: int, is_embedded_age
     _mem_after = _metal_mem_str()
     _pipeline_log("METAL", request_id,
         f"PRE_PREFILL_RELIEF: gc+clear_cache+malloc_pressure | "
-        f"rest={rest_count} | before={_mem_before} | after={_mem_after}")
+        f"rest={rest_count} | projected={_projected_gb:.2f}GB/{_threshold_gb:.2f}GB | "
+        f"before={_mem_before} | after={_mem_after}")
 
 
 def _start_prefill_progress(
