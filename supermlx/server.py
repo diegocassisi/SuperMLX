@@ -566,10 +566,35 @@ model_lock = threading.Lock()
 prompt_cache_lock = threading.Lock()
 console_lock = threading.Lock()
 
+# ── Session Log: persist all console output to lastlog.md ─────────────────────
+import re as _re
+_ANSI_STRIP_RE = _re.compile(r'\033\[[0-9;]*m')
+_LASTLOG_PATH = SETTINGS.log_root.parent / "lastlog.md"
+
+# Truncate on server start (new session)
+try:
+    with open(_LASTLOG_PATH, "w", encoding="utf-8") as _f:
+        _f.write(f"# SuperMLX Session Log — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n```\n")
+except Exception:
+    pass
+
+
+def _console_emit(line: str) -> None:
+    """Print to stdout AND append to lastlog.md (ANSI-stripped). Must be called under console_lock."""
+    print(line, flush=True)
+    try:
+        clean = _ANSI_STRIP_RE.sub("", line)
+        with open(_LASTLOG_PATH, "a", encoding="utf-8") as f:
+            f.write(clean + "\n")
+    except Exception:
+        pass  # Never crash for a log write
+
+
 # FIX-31 Cache Diagnostics singleton (shares console_lock for output)
 from .cache_diag import cache_diag as _cache_diag
 _cache_diag.enabled = FEATURE_CACHE_DIAG
 _cache_diag._lock = console_lock
+_cache_diag._emit_fn = _console_emit
 
 
 def _memory_guard_pre_prefill(request_id: str = "") -> int:
@@ -779,7 +804,7 @@ def _pipeline_log(
         line = f"{_ANSI_YELLOW}{line}{_ANSI_RESET}"
 
     with console_lock:
-        print(line, flush=True)
+        _console_emit(line)
 
     # Optionally dump structured data to disk
     if data is not None and FEATURE_LOG_PROMPTS:
@@ -937,7 +962,7 @@ def _terminal_status(icon: str, message: str, indent: int = 0, *,
             line = f"{_ANSI_YELLOW}{line}{_ANSI_RESET}"
 
     with console_lock:
-        print(line, flush=True)
+        _console_emit(line)
 
 
 

@@ -148,6 +148,7 @@ class CacheDiagnostics:
     def __init__(self, enabled: bool = False, console_lock: threading.Lock = None):
         self.enabled = enabled
         self._lock = console_lock or threading.Lock()
+        self._emit_fn = None  # Set by server.py to _console_emit for lastlog.md capture
         self._request_ops: Dict[str, List[DiagResult]] = {}  # req[:8] -> results
 
     def snapshot(
@@ -273,7 +274,10 @@ class CacheDiagnostics:
             line = f"{_ANSI_DIM}{line}{_ANSI_RESET}"
 
         with self._lock:
-            print(line, flush=True)
+            if self._emit_fn:
+                self._emit_fn(line)
+            else:
+                print(line, flush=True)
 
     def cleanup(self, request_id: str) -> None:
         """Remove tracking for completed request."""
