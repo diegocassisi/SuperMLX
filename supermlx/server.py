@@ -3601,6 +3601,9 @@ def _adaptive_prefill(
     prompt_array = mx.array(tokens_to_prefill)
     base_chunk = PREFILL_STEP_SIZE
     chunk_reductions = 0
+    _prefill_t0 = time.time()
+    _last_progress_tokens = 0
+    _PROGRESS_INTERVAL = 2000  # Log every N tokens
 
     while processed < total:
         # Compute available memory
@@ -3643,6 +3646,15 @@ def _adaptive_prefill(
         mx.clear_cache()
 
         processed += n
+
+        # Dark-zone illumination: log progress during large prefills
+        if FEATURE_FULL_LOGGING and request_id and processed - _last_progress_tokens >= _PROGRESS_INTERVAL:
+            _elapsed = time.time() - _prefill_t0
+            _tps = processed / _elapsed if _elapsed > 0 else 0
+            _pipeline_log("PREFILL", request_id,
+                f"progress | {processed}/{total} tok ({processed*100//total}%) | "
+                f"{_tps:.0f} tok/s | chunk={n} | {_metal_mem_str()}")
+            _last_progress_tokens = processed
 
     if chunk_reductions > 0:
         _terminal_status(
@@ -4974,6 +4986,10 @@ class APIHandler(BaseHTTPRequestHandler):
         try:
             model_lock.acquire(blocking=True)
             acquired = True
+            _lock_wait_ms = (time.time() - queue_started_at) * 1000
+            if FEATURE_FULL_LOGGING and _lock_wait_ms > 100:
+                _pipeline_log("LOCK_WAIT", request_id,
+                    f"model_lock acquired | waited={_lock_wait_ms:.0f}ms")
 
             generation_started_at = time.time()
             wait_seconds = generation_started_at - queue_started_at
@@ -5023,6 +5039,10 @@ class APIHandler(BaseHTTPRequestHandler):
                     _kv_off if _kv_off is not None else matched_prefix_len :
                 ]
                 _mem_profiler.snapshot(request_id, "POST_CACHE", is_anthropic=self._is_anthropic, rest_tokens=len(rest_tokens), kv_cache_offset=_kv_off, cache_hit_type=cache_match_type, matched_prefix=matched_prefix_len, prompt_tokens=len(prompt_tokens) if prompt_tokens else None)
+                if FEATURE_FULL_LOGGING:
+                    _pipeline_log("CACHE_LOOKUP", request_id,
+                        f"completed | hit={cache_match_type} | kv_off={_kv_off} | "
+                        f"rest={len(rest_tokens)} | matched={matched_prefix_len}/{len(prompt_tokens)}")
 
                 # --- M3: Stable-prefix fallback ---
                 # If the global cache lookup found fewer cached tokens than the
@@ -5683,6 +5703,10 @@ class APIHandler(BaseHTTPRequestHandler):
                 f"session={session_ctx.session_id[:16]} ({cache_selection_source}) | family={SETTINGS.model_family}",
                 indent=1,
             )
+            if FEATURE_FULL_LOGGING:
+                _pipeline_log("PRE_GEN", request_id,
+                    f"entering generation | rest={rest_count} | stream={is_streaming} | "
+                    f"{_metal_mem_str()}")
             _mem_profiler.snapshot(request_id, "PRE_PREFILL", is_anthropic=self._is_anthropic, rest_tokens=rest_count, kv_cache_offset=_kv_off)
             _mem_profiler.reset_peak()
 
