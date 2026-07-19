@@ -266,6 +266,11 @@ FEATURE_LOG_HEALING        = True   # Healing store operations (hits, store size
 FEATURE_LOG_GENERATION     = True   # tps, timing, token breakdown por etapa
 FEATURE_LOG_RESP           = True   # Response normalization, tool extraction, think stripping
 
+# FIX-31 Cache Diagnostics: opt-in before/after snapshots on every cache mutation.
+# Captures KV offset, key-tail hash, recurrent state fingerprint, and divergence detection.
+# Overhead: ~1ms per cache operation. Set FEATURE_CACHE_DIAG=false to disable.
+FEATURE_CACHE_DIAG         = _env_bool("FEATURE_CACHE_DIAG", True)
+
 # Compressor: config (env-var driven above, these are runtime defaults for rag_enricher)
 FEATURE_COMPRESSION_THRESHOLD = _env_int("COMPRESSION_THRESHOLD", 6000)
 FEATURE_COMPRESSION_GUARD     = _env_int("COMPRESSION_GUARD", 6)
@@ -560,6 +565,11 @@ def _is_vlm_config(config: Optional[Dict[str, Any]]) -> bool:
 model_lock = threading.Lock()
 prompt_cache_lock = threading.Lock()
 console_lock = threading.Lock()
+
+# FIX-31 Cache Diagnostics singleton (shares console_lock for output)
+from .cache_diag import cache_diag as _cache_diag
+_cache_diag.enabled = FEATURE_CACHE_DIAG
+_cache_diag._lock = console_lock
 
 
 def _memory_guard_pre_prefill(request_id: str = "") -> int:
@@ -2393,6 +2403,7 @@ def _post_generation_cache_update(
     """
     _cache_hit_ratio = matched_prefix_len / max(len(prompt_tokens), 1) if prompt_tokens else 1.0
 
+    _diag_pre_restore = _cache_diag.snapshot(prompt_cache, cache_key, "before_hybrid_restore")
     prepared = (
         prepare_cache_for_insertion(
             prompt_cache,
@@ -2422,6 +2433,8 @@ def _post_generation_cache_update(
             f"key={len(cache_key)} | kv_offset={_kv_cache_offset(prompt_cache)} | "
             "all recurrent layers rolled back",
         )
+        _cache_diag.compare(_diag_pre_restore, prompt_cache, cache_key, "hybrid_restore", request_id,
+            extra={"key_len": len(cache_key), "gen_tokens": len(generated_tokens)})
         # Attach verification metadata to the cache list so it survives
         # the trie store.  On the next lookup, Normal continuation can
         # verify that model_tokens[:_kv_off] hashes identically.
@@ -2596,6 +2609,7 @@ def _insert_cache_entries(
     # returns False because it requires ALL layers trimmable. In that case, we
     # trim only the trimmable KVCache layers per-layer (matching disk-save logic).
     if generated_tokens and len(cache_key) > len(generated_tokens):
+        _diag_pre_insert = _cache_diag.snapshot(prompt_cache, cache_key, "before_insert_trim")
         if can_trim_prompt_cache(prompt_cache):
             # All layers trimmable (pure KVCache model)
             if SETTINGS.prompt_cache_max_entries_global >= 2 and (tool_calls or is_vlm):
@@ -2634,6 +2648,12 @@ def _insert_cache_entries(
 
     _store.insert_cache(model_name, cache_key, prompt_cache)
     SESSION_INDEX.register_cache_key(session_ctx, cache_key)
+    # FIX-31 DIAG: after insertion — verify cache is clean
+    if 'generated_tokens' in dir() and generated_tokens:
+        _cache_diag.compare(
+            _diag_pre_insert if '_diag_pre_insert' in dir() else None,
+            prompt_cache, cache_key, "cache_insert", "",
+            extra={"gen_tokens": len(generated_tokens), "key_len": len(cache_key)})
 
     # ── AUTO-SAVE MAIN CACHE TO DISK ──────────────────────────────────────────
     _active_store = prompt_cache_store_override if prompt_cache_store_override is not None else PROMPT_CACHE
@@ -2764,6 +2784,9 @@ def _insert_cache_entries(
                             _DPC.frozen_cache = _save_cache
                             _DPC.frozen_tokens = list(_prompt_only_key)
                             _terminal_status("🧊", f"DPC: frozen cache updated | {len(_save_cache)} layers | {len(_prompt_only_key)} tokens")
+                            # FIX-31 DIAG: verify frozen cache is clean after update
+                            _cache_diag.compare(None, _save_cache, list(_prompt_only_key), "frozen_update", "",
+                                extra={"layers": len(_save_cache), "tokens": len(_prompt_only_key)})
                     except Exception as _trim_err:
                         _terminal_status("⚠️", f"Auto-save ABORTED: per-layer trim failed ({_trim_err})")
                         _save_cache = None
@@ -2869,6 +2892,7 @@ def _capture_hybrid_checkpoint_before_generation(
             f"arrays={len(checkpoint.snapshot.get('layers', {}))} | "
             f"size={checkpoint.snapshot.get('nbytes', 0) / (1024**2):.1f}MB",
         )
+        _cache_diag.snapshot(prompt_cache, list(model_tokens[:actual_model_offset]), "hybrid_capture")
         return checkpoint
     except Exception as checkpoint_err:
         _terminal_status(
@@ -3604,6 +3628,7 @@ def _adaptive_prefill(
     _prefill_t0 = time.time()
     _last_progress_tokens = 0
     _PROGRESS_INTERVAL = 2000  # Log every N tokens
+    _diag_pre_prefill = _cache_diag.snapshot(prompt_cache, rest_tokens, "before_adaptive_prefill")
 
     while processed < total:
         # Compute available memory
@@ -3663,6 +3688,8 @@ def _adaptive_prefill(
             f"chunk reductions={chunk_reductions} | req={request_id[:12] if request_id else '?'}",
         )
 
+    _cache_diag.compare(_diag_pre_prefill, prompt_cache, rest_tokens, "adaptive_prefill", request_id,
+        extra={"tokens": total, "chunks": chunk_reductions})
     return last_token
 
 
@@ -5017,6 +5044,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 # --- Cache lookup: MAIN uses SESSION_INDEX, COMPACT uses direct LRU ---
                 # Cache lookup operates on prompt_tokens (canonical key).
                 # rest_tokens will be overridden below to use model_tokens (original).
+                _diag_pre_lookup = _cache_diag.snapshot(prompt_cache, list(prompt_tokens), "before_cache_lookup")
                 (
                     prompt_cache,
                     _rest_tokens_canonical,
@@ -5039,6 +5067,8 @@ class APIHandler(BaseHTTPRequestHandler):
                     _kv_off if _kv_off is not None else matched_prefix_len :
                 ]
                 _mem_profiler.snapshot(request_id, "POST_CACHE", is_anthropic=self._is_anthropic, rest_tokens=len(rest_tokens), kv_cache_offset=_kv_off, cache_hit_type=cache_match_type, matched_prefix=matched_prefix_len, prompt_tokens=len(prompt_tokens) if prompt_tokens else None)
+                _cache_diag.compare(_diag_pre_lookup, prompt_cache, list(prompt_tokens), "cache_lookup", request_id,
+                    extra={"hit": cache_match_type, "matched": matched_prefix_len, "rest": len(rest_tokens)})
                 if FEATURE_FULL_LOGGING:
                     _pipeline_log("CACHE_LOOKUP", request_id,
                         f"completed | hit={cache_match_type} | kv_off={_kv_off} | "
@@ -5091,6 +5121,8 @@ class APIHandler(BaseHTTPRequestHandler):
             #         matched_prefix_len (19849) >= model _m_len (15848) always
             #         fired, forcing rest_tokens=1 → garbage output.
             if prompt_cache is not None and cache_session_tokens is not None:
+                # FIX-31 DIAG: snapshot before real-match sync
+                _diag_pre_fix31 = _cache_diag.snapshot(prompt_cache, cache_key, "before_fix31_sync")
                 # 1. Canonical match (determines IF the cache entry is valid).
                 _raw_match = 0
                 _limit = min(len(prompt_tokens), len(cache_session_tokens))
@@ -5134,6 +5166,8 @@ class APIHandler(BaseHTTPRequestHandler):
                                     _terminal_status("DEBUG",
                                         f"FIX-31 v9: Pollution → restored frozen cache. "
                                         f"warmup={_warmup_len} | suffix={_suffix_len}")
+                                    _cache_diag.compare(_diag_pre_fix31, prompt_cache, cache_key, "restore_frozen", request_id,
+                                        extra={"warmup": _warmup_len, "suffix": _suffix_len})
                                 else:
                                     _suffix_len = _m_len
                                     prompt_cache = None
@@ -5150,6 +5184,8 @@ class APIHandler(BaseHTTPRequestHandler):
                             
                         rest_tokens = model_tokens[-_suffix_len:]
                         _terminal_status("DEBUG", f"FIX-31 v9: Sliding window trap bypassed. rest_tokens={_suffix_len}")
+                        _cache_diag.compare(_diag_pre_fix31, prompt_cache, cache_key, "fix31_sliding_window", request_id,
+                            extra={"suffix": _suffix_len, "kv_off": _kv_off, "m_len": _m_len})
                         
                     else:
                         # 2. Unified cache alignment
@@ -5172,6 +5208,8 @@ class APIHandler(BaseHTTPRequestHandler):
                                 trim_prompt_cache(prompt_cache, _kv_off - _trim_to)
                                 rest_tokens = model_tokens[_trim_to:]
                                 _terminal_status("DEBUG", f"FIX-31 v9: Trimmed KVCache {_kv_off} -> {_trim_to}")
+                                _cache_diag.compare(_diag_pre_fix31, prompt_cache, cache_key, "trim", request_id,
+                                    extra={"from": _kv_off, "to": _trim_to})
                             else:
                                 # Hybrid wash: reprocess suffix while keeping the polluted KV as
                                 # context. Risk: if KV is large, the attention computation for
@@ -5440,6 +5478,9 @@ class APIHandler(BaseHTTPRequestHandler):
                                         f"rest={len(rest_tokens)} tok | "
                                         f"recomputed={_recomputed}",
                                     )
+                                    _cache_diag.compare(_diag_pre_fix31 if '_diag_pre_fix31' in dir() else None,
+                                        prompt_cache, cache_key, "tpc_inject", request_id,
+                                        extra={"prefix_len": _ptok_len, "recomputed": _recomputed})
                                 else:
                                     _terminal_status(
                                         "⚠️",
@@ -5455,6 +5496,9 @@ class APIHandler(BaseHTTPRequestHandler):
                     )
                     # Full miss: model prefills all original tokens (never canonical).
                     rest_tokens = model_tokens
+                    _cache_diag.compare(_diag_pre_fix31 if '_diag_pre_fix31' in dir() else None,
+                        prompt_cache, cache_key, "cold_start", request_id,
+                        extra={"rest": len(rest_tokens)})
 
 
             rest_count = len(rest_tokens) if rest_tokens is not None else _m_len
