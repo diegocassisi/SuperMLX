@@ -5216,15 +5216,22 @@ class APIHandler(BaseHTTPRequestHandler):
                         # 2. Unified cache alignment
                         # Handles exact match, shorter match, pollution, and normal prefix
                         _canonical_suffix = max(1, len(prompt_tokens) - matched_prefix_len)
+                        # FIX-31 v14: suffix must be in MODEL space (same as _kv_off and _m_len).
+                        # Before: _suffix_len was in canonical space, _trim_to = _m_len - _suffix_len
+                        # mixed spaces, causing off-by-N (typically ~27 tokens for Qwen3) that
+                        # triggered v13 cold starts on every single request.
+                        # Fix: compute model-space suffix = _m_len - _kv_off (how many model tokens
+                        # the cache does NOT cover), then take the max with canonical_suffix.
+                        _model_suffix = max(1, _m_len - _kv_off) if _kv_off is not None else _canonical_suffix
                         
                         if _cache_extended:
                             # For hybrid models, we need a min-suffix to wash out the recurrent state.
                             _MIN_POLLUTION_SUFFIX = 512
-                            _suffix_len = max(_MIN_POLLUTION_SUFFIX, _canonical_suffix)
+                            _suffix_len = max(_MIN_POLLUTION_SUFFIX, _model_suffix)
                             _terminal_status("DEBUG",
-                                f"FIX-31 v9: Cache polluted. canonical_suffix={_canonical_suffix} | effective={_suffix_len}")
+                                f"FIX-31 v9: Cache polluted. canonical_suffix={_canonical_suffix} | model_suffix={_model_suffix} | effective={_suffix_len}")
                         else:
-                            _suffix_len = _canonical_suffix
+                            _suffix_len = _model_suffix
                             
                         _trim_to = max(0, _m_len - _suffix_len)
                         
