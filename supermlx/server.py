@@ -5300,9 +5300,11 @@ class APIHandler(BaseHTTPRequestHandler):
                             if _extension_size < _MINOR_EXTENSION_THRESHOLD:
                                 # Minor extension: accept the slightly stale recurrent state.
                                 # The model's attention over N correct KV tokens will dominate.
-                                # Skip trim_to entirely — go straight to normal continuation
-                                # since ArraysCache can't be trimmed anyway.
-                                rest_tokens = model_tokens[-max(_model_suffix, 1):]
+                                # Set _trim_to = _kv_off so the downstream `_kv_off > _trim_to`
+                                # check is False, preventing entry into the wash/cold-start path.
+                                _suffix_len = max(_model_suffix, 1)
+                                _trim_to = _kv_off  # ensures _kv_off > _trim_to is False
+                                rest_tokens = model_tokens[-_suffix_len:]
                                 _terminal_status("🐞",
                                     f"FIX-31 v15: Minor extension ({_extension_size} tok) — "
                                     f"accepted | rest={len(rest_tokens)}",
