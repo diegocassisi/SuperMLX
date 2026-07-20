@@ -235,6 +235,10 @@ FEATURE_EMERGENCY_COMPRESS    = _env_str("EMERGENCY_CONTENT_COMPRESS", "true").l
 # COMPACT_PROMPT (9 sections, analysis+summary tags). Default off.
 FEATURE_HERMES_COMPACT_SWAP   = _env_str("HERMES_COMPACT_SWAP", "false").lower() in ("1", "true", "yes")
 
+# Last-seen Hermes system prompt + tools — injected into compact requests
+# so TPC prefix matches and the pre-computed KV cache is reused.
+_last_hermes_context: dict = {}  # {"system": str, "tools": list}
+
 # Prefill step size: tokens processed per chunk during prompt prefill.
 # Smaller = less Metal scratch memory (flash attention scratch ≈ 0.065 × chunk × kv_len × n_heads × 4).
 # Benchmark (mlx 0.31.1, Qwen3.5-35B-A3B-3bit, 31K tokens):
@@ -4337,6 +4341,11 @@ class APIHandler(BaseHTTPRequestHandler):
                             )
                         break
 
+                # Capture system+tools from normal requests for compact TPC reuse
+                if raw.get("tools") and _system_text:
+                    _last_hermes_context["system"] = _system_text
+                    _last_hermes_context["tools"] = list(raw["tools"])
+
                 # Claude Code compact: detect by user message phrase
                 if raw.get("tools") and "CRITICAL: Respond with TEXT ONLY" in _last_user[:200]:
                     _compact_stripped_tools = len(raw["tools"])
@@ -4369,9 +4378,29 @@ class APIHandler(BaseHTTPRequestHandler):
                                 _conv_data = _original[_conv_start:] if _conv_start > 0 else "\n\n" + _original
                                 _m["content"] = _CC_COMPACT_PROMPT + _conv_data
                             break
+
+                    # ── TPC REUSE: inject saved system+tools into compact ──
+                    # The compact arrives without system prompt or tools, so the
+                    # TPC prefix (18K tokens) can't match. By injecting the last
+                    # Hermes system+tools, the compact's tokenized prefix matches
+                    # the TPC and gets the pre-computed KV cache for free.
+                    _tpc_injected_into_compact = False
+                    if _last_hermes_context.get("system") and _last_hermes_context.get("tools"):
+                        # Inject system message
+                        _has_system = any(_m.get("role") == "system" for _m in raw.get("messages", []))
+                        if not _has_system:
+                            raw.setdefault("messages", []).insert(0, {
+                                "role": "system",
+                                "content": _last_hermes_context["system"]
+                            })
+                        # Inject tools (don't count these as stripped)
+                        raw["tools"] = _last_hermes_context["tools"]
+                        _tpc_injected_into_compact = True
+
                     _hermes_compact_swapped = True
                     _terminal_status("🪶",
-                        f"HERMES COMPACT SWAP: replaced prompt + stripped {_compact_stripped_tools} tools")
+                        f"HERMES COMPACT SWAP: replaced prompt + stripped {_compact_stripped_tools} tools"
+                        f" | TPC context injected={_tpc_injected_into_compact}")
 
             body = anthropic_to_openai_body(raw, SETTINGS.proxy_model_id)
             # Jump past the body-parse block that follows.
