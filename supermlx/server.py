@@ -955,9 +955,9 @@ def _terminal_status(icon: str, message: str, indent: int = 0, *,
             line = f"{_ANSI_YELLOW}{line}{_ANSI_RESET}"
     else:
         # ── Legacy format (startup, system messages) ──
-        ts = now.strftime("%H:%M:%S")
+        ts = now.strftime("%H:%M:%S.%f")[:-3]
         pad = "  " * max(indent, 0)
-        line = f"{pad}{icon} [{ts}] {message}"
+        line = f"{pad}  {icon} {ts} | {message}"
         if "EMERGENCY COMPRESSOR" in message:
             line = f"{_ANSI_YELLOW}{line}{_ANSI_RESET}"
 
@@ -5164,7 +5164,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 _kv_off = _kv_cache_offset(prompt_cache)
                 _m_len = len(model_tokens)
                 
-                _terminal_status("DEBUG", f"FIX-31 v4: _kv_off={_kv_off} type(layer)={type(prompt_cache[0] if prompt_cache else None)}")
+                _terminal_status("🐞", f"FIX-31 v4: _kv_off={_kv_off} type(layer)={type(prompt_cache[0] if prompt_cache else None)}",
+                    request_id=request_id, stage="DEBUG")
 
                 if _kv_off is not None:
                     # FIX-31 v4: Sliding window cap bypass
@@ -5188,9 +5189,10 @@ class APIHandler(BaseHTTPRequestHandler):
                                     prompt_cache = _restored
                                     _warmup_len = len(_DPC.frozen_tokens) if _DPC.frozen_tokens else 0
                                     _suffix_len = max(1, len(prompt_tokens) - _warmup_len)
-                                    _terminal_status("DEBUG",
+                                    _terminal_status("🐞",
                                         f"FIX-31 v9: Pollution → restored frozen cache. "
-                                        f"warmup={_warmup_len} | suffix={_suffix_len}")
+                                        f"warmup={_warmup_len} | suffix={_suffix_len}",
+                                        request_id=request_id, stage="DEBUG")
                                     _cache_diag.compare(_diag_pre_fix31, prompt_cache, cache_key, "restore_frozen", request_id,
                                         extra={"warmup": _warmup_len, "suffix": _suffix_len})
                                 else:
@@ -5208,7 +5210,8 @@ class APIHandler(BaseHTTPRequestHandler):
                             _suffix_len = max(1, len(prompt_tokens) - matched_prefix_len)
                             
                         rest_tokens = model_tokens[-_suffix_len:]
-                        _terminal_status("DEBUG", f"FIX-31 v9: Sliding window trap bypassed. rest_tokens={_suffix_len}")
+                        _terminal_status("🐞", f"FIX-31 v9: Sliding window trap bypassed. rest_tokens={_suffix_len}",
+                            request_id=request_id, stage="DEBUG")
                         _cache_diag.compare(_diag_pre_fix31, prompt_cache, cache_key, "fix31_sliding_window", request_id,
                             extra={"suffix": _suffix_len, "kv_off": _kv_off, "m_len": _m_len})
                         
@@ -5228,8 +5231,9 @@ class APIHandler(BaseHTTPRequestHandler):
                             # For hybrid models, we need a min-suffix to wash out the recurrent state.
                             _MIN_POLLUTION_SUFFIX = 512
                             _suffix_len = max(_MIN_POLLUTION_SUFFIX, _model_suffix)
-                            _terminal_status("DEBUG",
-                                f"FIX-31 v9: Cache polluted. canonical_suffix={_canonical_suffix} | model_suffix={_model_suffix} | effective={_suffix_len}")
+                            _terminal_status("🐞",
+                                f"FIX-31 v9: Cache polluted. canonical_suffix={_canonical_suffix} | model_suffix={_model_suffix} | effective={_suffix_len}",
+                                request_id=request_id, stage="DEBUG")
                         else:
                             _suffix_len = _model_suffix
                             
@@ -5239,7 +5243,8 @@ class APIHandler(BaseHTTPRequestHandler):
                             if can_trim_prompt_cache(prompt_cache):
                                 trim_prompt_cache(prompt_cache, _kv_off - _trim_to)
                                 rest_tokens = model_tokens[_trim_to:]
-                                _terminal_status("DEBUG", f"FIX-31 v9: Trimmed KVCache {_kv_off} -> {_trim_to}")
+                                _terminal_status("🐞", f"FIX-31 v9: Trimmed KVCache {_kv_off} -> {_trim_to}",
+                                    request_id=request_id, stage="DEBUG")
                                 _cache_diag.compare(_diag_pre_fix31, prompt_cache, cache_key, "trim", request_id,
                                     extra={"from": _kv_off, "to": _trim_to})
                             else:
@@ -5334,7 +5339,8 @@ class APIHandler(BaseHTTPRequestHandler):
                                             rest_tokens = model_tokens
                                             _terminal_status("⚠️",
                                                 f"FIX-31 v10: ArraysCache contaminated by DPC "
-                                                f"(kv_off={_kv_off} > request_len={_m_len}+{_DPC_CONTAMINATION_THRESHOLD}) — cold start")
+                                                f"(kv_off={_kv_off} > request_len={_m_len}+{_DPC_CONTAMINATION_THRESHOLD}) — cold start",
+                                                request_id=request_id, stage="WARN")
                                 elif _kv_off is not None and _kv_off > _HYBRID_WASH_KV_LIMIT:
                                     prompt_cache = None
                                     if _is_embedded_agent:
@@ -5345,7 +5351,8 @@ class APIHandler(BaseHTTPRequestHandler):
                                     rest_tokens = model_tokens
                                     _terminal_status("⚠️",
                                         f"FIX-31 v9: KV too large for hybrid wash "
-                                        f"({_kv_off} > {_HYBRID_WASH_KV_LIMIT}) — cold start")
+                                        f"({_kv_off} > {_HYBRID_WASH_KV_LIMIT}) — cold start",
+                                        request_id=request_id, stage="WARN")
                                 else:
                                     # FIX-31 v13: ArraysCache divergent — fail-closed cold start.
                                     # Hybrid wash cannot fix recurrent state contamination:
@@ -5367,7 +5374,8 @@ class APIHandler(BaseHTTPRequestHandler):
                                     _terminal_status("⚠️",
                                         f"FIX-31 v13: ArraysCache divergent "
                                         f"(kv_off={_kv_off} > trim_to={_trim_to}, "
-                                        f"suffix={_suffix_len}) — cold start (fail-closed)")
+                                        f"suffix={_suffix_len}) — cold start (fail-closed)",
+                                        request_id=request_id, stage="WARN")
 
                         else:
                             # Normal continuation — _kv_off ≤ _trim_to.
@@ -5390,17 +5398,21 @@ class APIHandler(BaseHTTPRequestHandler):
                                     rest_tokens = model_tokens
                                     _terminal_status("⚠️",
                                         f"FIX-31 v13: model prefix hash mismatch at offset {_kv_off} "
-                                        f"— cold start (fail-closed)")
+                                        f"— cold start (fail-closed)",
+                                        request_id=request_id, stage="WARN")
                                 else:
                                     rest_tokens = model_tokens[_kv_off:]
-                                    _terminal_status("DEBUG", f"FIX-31 v9: Normal continuation from {_kv_off} (hash verified)")
+                                    _terminal_status("🐞", f"FIX-31 v9: Normal continuation from {_kv_off} (hash verified)",
+                                        request_id=request_id, stage="DEBUG")
                             else:
                                 rest_tokens = model_tokens[_kv_off:]
-                                _terminal_status("DEBUG", f"FIX-31 v9: Normal continuation from {_kv_off}")
+                                _terminal_status("🐞", f"FIX-31 v9: Normal continuation from {_kv_off}",
+                                    request_id=request_id, stage="DEBUG")
                 else:
                     # No KV offset available — full prefill.
                     rest_tokens = model_tokens
-                    _terminal_status("DEBUG", "FIX-31 v4: Forced rest_tokens = model_tokens because _kv_off is None")
+                    _terminal_status("🐞", "FIX-31 v4: Forced rest_tokens = model_tokens because _kv_off is None",
+                        request_id=request_id, stage="DEBUG")
 
             # --- PERFECT HIT GUARD (FIX-16/17 v2) ---
             # Ensure rest_tokens is never empty (generator crash prevention).
@@ -5765,9 +5777,10 @@ class APIHandler(BaseHTTPRequestHandler):
 
             _terminal_status(
                 "📨",
-                f"Request {request_id} | {cache_light} Cache: {hit_ratio:.1f}% ({cache_match_type}) | "
+                f"{cache_light} Cache: {hit_ratio:.1f}% ({cache_match_type}) | "
                 f"tokens={matched_prefix_len}/{prompt_len} | rest={rest_count} | "
                 f"stream={body.get('stream', False)} | thinking={enable_thinking}",
+                request_id=request_id, stage="REQ",
             )
 
             # ── DPC: Auto-capture is handled by auto-save + prefix hash in
@@ -5777,7 +5790,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 "⚙️",
                 f"Generation started | wait={wait_seconds:.2f}s | prefill={rest_count} | "
                 f"session={session_ctx.session_id[:16]} ({cache_selection_source}) | family={SETTINGS.model_family}",
-                indent=1,
+                request_id=request_id, stage="GEN",
             )
             if FEATURE_FULL_LOGGING:
                 _pipeline_log("PRE_GEN", request_id,
@@ -5856,8 +5869,8 @@ class APIHandler(BaseHTTPRequestHandler):
                         _decode_tps = len(generated_tokens) / (time.time() - first_token_at) if first_token_at else 0
                         _terminal_status(
                             "⏳",
-                            f"Request {request_id} in progress | generated_tokens={len(generated_tokens)} | {_decode_tps:.1f} tok/s | {_metal_mem_str()}",
-                            indent=1,
+                            f"generated_tokens={len(generated_tokens)} | {_decode_tps:.1f} tok/s | {_metal_mem_str()}",
+                            request_id=request_id, stage="DECODE",
                         )
                 # ── THINKING CLEANUP (non-stream) ─────────────────────────
                 # If generation ended while still inside <think> (e.g. THINKING_LIMIT
@@ -6275,8 +6288,8 @@ class APIHandler(BaseHTTPRequestHandler):
                             _decode_tps = len(generated_tokens) / (time.time() - first_token_at) if first_token_at else 0
                             _terminal_status(
                                 "⏳",
-                                f"Request {request_id} in progress | generated_tokens={len(generated_tokens)} | {_decode_tps:.1f} tok/s | {_metal_mem_str()}",
-                                indent=1,
+                                f"generated_tokens={len(generated_tokens)} | {_decode_tps:.1f} tok/s | {_metal_mem_str()}",
+                                request_id=request_id, stage="DECODE",
                             )
                 finally:
                     # Stop keepalive thread BEFORE writing actual content chunks
