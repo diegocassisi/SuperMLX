@@ -5228,16 +5228,41 @@ class APIHandler(BaseHTTPRequestHandler):
                         _model_suffix = max(1, _m_len - _kv_off) if _kv_off is not None else _canonical_suffix
                         
                         if _cache_extended:
-                            # For hybrid models, we need a min-suffix to wash out the recurrent state.
-                            _MIN_POLLUTION_SUFFIX = 512
-                            _suffix_len = max(_MIN_POLLUTION_SUFFIX, _model_suffix)
-                            _terminal_status("🐞",
-                                f"FIX-31 v9: Cache polluted. canonical_suffix={_canonical_suffix} | model_suffix={_model_suffix} | effective={_suffix_len}",
-                                request_id=request_id, stage="DEBUG")
-                        else:
+                            # FIX-31 v15: If the cache extension is tiny (< 128 response
+                            # tokens residual), the recurrent state contamination is
+                            # negligible against a 48K+ context. Skip the 512-token wash
+                            # to avoid catastrophic cold starts (30K+ re-prefill).
+                            _extension_size = _kv_off - _m_len if _kv_off > _m_len else 0
+                            _MINOR_EXTENSION_THRESHOLD = 128
+                            if _extension_size < _MINOR_EXTENSION_THRESHOLD:
+                                # Minor extension: accept the slightly stale recurrent state.
+                                # The model's attention over N correct KV tokens will dominate.
+                                # Skip trim_to entirely — go straight to normal continuation
+                                # since ArraysCache can't be trimmed anyway.
+                                rest_tokens = model_tokens[-max(_model_suffix, 1):]
+                                _terminal_status("🐞",
+                                    f"FIX-31 v15: Minor extension ({_extension_size} tok) — "
+                                    f"accepted | rest={len(rest_tokens)}",
+                                    request_id=request_id, stage="DEBUG")
+                                _cache_diag.compare(_diag_pre_fix31, prompt_cache, cache_key, "v15_minor_ext", request_id,
+                                    extra={"extension": _extension_size, "rest": len(rest_tokens)})
+                            else:
+                                # For hybrid models with significant pollution, we need a
+                                # min-suffix to wash out the recurrent state.
+                                _MIN_POLLUTION_SUFFIX = 512
+                                _suffix_len = max(_MIN_POLLUTION_SUFFIX, _model_suffix)
+                                _terminal_status("🐞",
+                                    f"FIX-31 v9: Cache polluted. canonical_suffix={_canonical_suffix} | "
+                                    f"model_suffix={_model_suffix} | extension={_extension_size} | effective={_suffix_len}",
+                                    request_id=request_id, stage="DEBUG")
+                                # Fall through to _trim_to logic below
+                                _trim_to = max(0, _m_len - _suffix_len)
+                        elif not _cache_extended:
                             _suffix_len = _model_suffix
-                            
-                        _trim_to = max(0, _m_len - _suffix_len)
+                            _trim_to = max(0, _m_len - _suffix_len)
+                        else:
+                            # v15 minor extension handled — _trim_to stays at _kv_off (no trim needed)
+                            _trim_to = _kv_off
                         
                         if _kv_off > _trim_to:
                             if can_trim_prompt_cache(prompt_cache):
