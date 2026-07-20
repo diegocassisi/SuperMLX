@@ -237,7 +237,36 @@ FEATURE_HERMES_COMPACT_SWAP   = _env_str("HERMES_COMPACT_SWAP", "false").lower()
 
 # Last-seen Hermes system prompt + tools — injected into compact requests
 # so TPC prefix matches and the pre-computed KV cache is reused.
+# Persisted to disk so it survives server restarts.
 _last_hermes_context: dict = {}  # {"system": str, "tools": list}
+_HERMES_CONTEXT_FILE = "hermes_context.json"
+
+def _save_hermes_context() -> None:
+    """Persist _last_hermes_context to disk alongside TPC files."""
+    try:
+        from pathlib import Path
+        _dir = Path(os.environ.get("CACHE_PERSIST_PATH", "logs")).parent if "CACHE_PERSIST_PATH" in os.environ else Path("logs")
+        # Use TPC's cache dir if available
+        import supermlx.tool_prefix_cache as _tpc_mod
+        if _tpc_mod._cache_dir:
+            _dir = _tpc_mod._cache_dir
+        _path = _dir / _HERMES_CONTEXT_FILE
+        _path.write_text(json.dumps(_last_hermes_context, ensure_ascii=False))
+    except Exception:
+        pass  # Best-effort, non-critical
+
+def _load_hermes_context() -> None:
+    """Load persisted _last_hermes_context from disk."""
+    global _last_hermes_context
+    try:
+        from pathlib import Path
+        import supermlx.tool_prefix_cache as _tpc_mod
+        if _tpc_mod._cache_dir:
+            _path = _tpc_mod._cache_dir / _HERMES_CONTEXT_FILE
+            if _path.exists():
+                _last_hermes_context = json.loads(_path.read_text())
+    except Exception:
+        pass
 
 # Prefill step size: tokens processed per chunk during prompt prefill.
 # Smaller = less Metal scratch memory (flash attention scratch ≈ 0.065 × chunk × kv_len × n_heads × 4).
@@ -3526,6 +3555,7 @@ def _run_startup_warmup() -> None:
     if SETTINGS.cache_persist_path:
         _tpc.init(SETTINGS.cache_persist_path)
         _tpc.load_from_disk(model, SETTINGS.max_kv_size)
+        _load_hermes_context()
 
     _elapsed = time.perf_counter() - _t0
     _mem_after = mx.get_active_memory() / 1e9
@@ -4343,8 +4373,12 @@ class APIHandler(BaseHTTPRequestHandler):
 
                 # Capture system+tools from normal requests for compact TPC reuse
                 if raw.get("tools") and _system_text:
-                    _last_hermes_context["system"] = _system_text
-                    _last_hermes_context["tools"] = list(raw["tools"])
+                    _new_hash = hashlib.md5((_system_text + str(len(raw["tools"]))).encode()).hexdigest()[:8]
+                    if _last_hermes_context.get("_hash") != _new_hash:
+                        _last_hermes_context["system"] = _system_text
+                        _last_hermes_context["tools"] = list(raw["tools"])
+                        _last_hermes_context["_hash"] = _new_hash
+                        _save_hermes_context()
 
                 # Claude Code compact: detect by user message phrase
                 if raw.get("tools") and "CRITICAL: Respond with TEXT ONLY" in _last_user[:200]:
