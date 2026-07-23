@@ -799,6 +799,32 @@ def run_startup(
                 # with recurrent state that includes conversation data
                 # → cross-session contamination (e.g. quant trading → galaga).
                 state.disk_cache_saved = True
+
+                # VALIDATE: ensure warmup only contains a short user message
+                # (e.g. "hola"). A clean warmup has ≤10 tokens between the
+                # last <|im_start|>user and <|im_end|>. Longer = contaminated.
+                _IM_START, _IM_END, _USER_TOK = 248045, 248046, 846
+                try:
+                    _last_user_pos = None
+                    for _i in range(len(disk_tokens) - 1, -1, -1):
+                        if (disk_tokens[_i] == _IM_START
+                                and _i + 1 < len(disk_tokens)
+                                and disk_tokens[_i + 1] == _USER_TOK):
+                            _last_user_pos = _i
+                            break
+                    if _last_user_pos is not None:
+                        _end_pos = len(disk_tokens)
+                        for _j in range(_last_user_pos + 2, len(disk_tokens)):
+                            if disk_tokens[_j] == _IM_END:
+                                _end_pos = _j
+                                break
+                        _user_block_len = _end_pos - _last_user_pos
+                        if _user_block_len <= 10:
+                            _log("✅", f"DPC: warmup validated — clean prefix (user block={_user_block_len} tokens)")
+                        else:
+                            _log("⚠️", f"DPC: warmup may be CONTAMINATED — user block={_user_block_len} tokens (expected ≤10). Delete warmup_cache.safetensors and send 'hola' to regenerate.")
+                except Exception:
+                    pass  # Validation is best-effort, don't block startup
             else:
                 state.prefix_hash = None
                 _log("⚠️", "DPC: disk cache invalid or empty — first request will cold-start")
