@@ -397,7 +397,20 @@ def _extract_openai_tool_calls(text, model_family, allowed_tools=None):
     _has_standard = "<tool_call>" in text_lower
     _has_gemma4 = "<|tool_call|>" in text_lower
     if not _has_standard and not _has_gemma4:
-        return text, []
+        # Qwen3 fallback: model sometimes emits <function=NAME>...</function>
+        # without <tool_call> wrapper (e.g. when THINK_CLEANUP fires because
+        # the model jumped straight to tool calls without closing </think>).
+        # Wrap bare <function=...> blocks so the standard parser chain works.
+        if model_family == "qwen3" and QWEN_FUNCTION_PATTERN.search(text):
+            text = re.sub(
+                r'(<function=[^>]+>.*?</function>)',
+                r'<tool_call>\n\1\n</tool_call>',
+                text,
+                flags=re.DOTALL | re.IGNORECASE,
+            )
+            _has_standard = True
+        else:
+            return text, []
 
     def _parse_legacy_block(body):
         name_match = re.match(r"^([^\s<]+)", body)
