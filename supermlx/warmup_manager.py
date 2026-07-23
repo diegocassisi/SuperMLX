@@ -792,6 +792,13 @@ def run_startup(
                     f"DPC: MAIN cache loaded (disk) | {len(disk_tokens)} tokens | "
                     f"hash={'✓' if state.prefix_hash else '?'} | LRU (evictable)",
                 )
+                # FIX: Mark as already saved so auto-save never overwrites
+                # the clean warmup with contaminated conversation state.
+                # Without this, every restart resets disk_cache_saved=False,
+                # and the first real request overwrites the clean warmup
+                # with recurrent state that includes conversation data
+                # → cross-session contamination (e.g. quant trading → galaga).
+                state.disk_cache_saved = True
             else:
                 state.prefix_hash = None
                 _log("⚠️", "DPC: disk cache invalid or empty — first request will cold-start")
