@@ -771,7 +771,7 @@ def run_startup(
                 _t_insert_start = time.perf_counter()
                 with prompt_cache_lock:
                     prompt_cache_main.insert_cache(
-                        model_path, disk_tokens, disk_cache, pinned=False
+                        model_path, disk_tokens, disk_cache, pinned=True  # Base prefix: never evict
                     )
                 _insert_elapsed = time.perf_counter() - _t_insert_start
                 _mem_post_insert = mx.get_active_memory() / 1e9
