@@ -49,6 +49,17 @@ GEMMA4_THINK_STRIP_PATTERN = re.compile(
 GEMMA4_THINK_ORPHAN_PATTERN = re.compile(
     r"^.*?<\|/think\|>\s*", re.DOTALL | re.IGNORECASE
 )
+# Models sometimes emit <antThinking>...</antThinking> as structured reasoning blocks
+# (observed when models mimic Anthropic-style internal reasoning format).
+ANT_THINKING_STRIP_PATTERN = re.compile(
+    r"<antThinking>.*?</antThinking>\s*", re.DOTALL
+)
+ANT_THINKING_ORPHAN_CLOSE_PATTERN = re.compile(
+    r"^.*?</antThinking>\s*", re.DOTALL
+)
+ANT_THINKING_ORPHAN_OPEN_PATTERN = re.compile(
+    r"<antThinking>.*$", re.DOTALL
+)
 # Orphan </think>: content from start up to and including </think> so we hide reasoning when model
 # outputs "reasoning text</think>\n\nanswer" without a leading <think> tag.
 THINK_ORPHAN_CLOSE_PATTERN = re.compile(r"^.*?</think>\s*", re.DOTALL | re.IGNORECASE)
@@ -61,21 +72,27 @@ GEMMA4_THINK_ORPHAN_OPEN_PATTERN = re.compile(r"<\|think\|>.*$", re.DOTALL | re.
 # ── Functions ─────────────────────────────────────────────────────────────────
 
 def _extract_thinking_text(raw: str) -> str:
-    """Extract the content of <think>...</think> block for logging.
+    """Extract the content of thinking blocks for logging.
 
     Returns the raw thinking text (stripped), or "" if no thinking block found.
-    Handles Qwen3-style <think>...</think> and orphan </think> (GLM-style).
+    Handles Qwen3-style <think>...</think>, Gemma4 <|think|>...<|/think|>,
+    <antThinking>...</antThinking>, and orphan </think> (GLM-style).
     """
     if not isinstance(raw, str):
         return ""
+    # Collect all thinking fragments (there may be multiple blocks)
+    fragments = []
     # Full <think>...</think> block
-    m = re.search(r"<think>([\s\S]*?)</think>", raw, re.IGNORECASE)
-    if m:
-        return m.group(1).strip()
+    for m in re.finditer(r"<think>([\s\S]*?)</think>", raw, re.IGNORECASE):
+        fragments.append(m.group(1).strip())
     # Gemma4 <|think|>...<|/think|>
-    m = re.search(r"<\|think\|>([\s\S]*?)<\|/think\|>", raw, re.IGNORECASE)
-    if m:
-        return m.group(1).strip()
+    for m in re.finditer(r"<\|think\|>([\s\S]*?)<\|/think\|>", raw, re.IGNORECASE):
+        fragments.append(m.group(1).strip())
+    # <antThinking>...</antThinking>
+    for m in re.finditer(r"<antThinking>([\s\S]*?)</antThinking>", raw):
+        fragments.append(m.group(1).strip())
+    if fragments:
+        return "\n\n".join(fragments)
     # Orphan </think>: reasoning from start to </think> (GLM-style)
     m = re.match(r"^([\s\S]*?)</think>", raw, re.IGNORECASE)
     if m:
@@ -84,25 +101,36 @@ def _extract_thinking_text(raw: str) -> str:
 
 
 def _strip_thinking_from_content(text: str) -> str:
-    """Remove <think>...</think> and <|think|>...<|/think|> blocks so reasoning is hidden."""
+    """Remove thinking blocks so reasoning is hidden from client.
+
+    Handles <think>, <|think|>, and <antThinking> tag formats.
+    """
     if not isinstance(text, str):
         return text
     # First remove full think blocks (Qwen/GLM/Hermes/DeepSeek style).
     out = THINK_TAG_STRIP_PATTERN.sub("", text)
     # Then remove Gemma 4 pipe-style think blocks.
     out = GEMMA4_THINK_STRIP_PATTERN.sub("", out)
-    # Remove orphan close tags (both styles), but only if content remains after.
+    # Then remove <antThinking> blocks (Anthropic-style structured reasoning).
+    out = ANT_THINKING_STRIP_PATTERN.sub("", out)
+    # Remove orphan close tags (all styles), but only if content remains after.
     candidate = THINK_ORPHAN_CLOSE_PATTERN.sub("", out, count=1)
     if candidate.strip():
         out = candidate
     candidate = GEMMA4_THINK_ORPHAN_PATTERN.sub("", out, count=1)
     if candidate.strip():
         out = candidate
-    # Remove orphan open tags (generation cut mid-thinking without </think>).
+    candidate = ANT_THINKING_ORPHAN_CLOSE_PATTERN.sub("", out, count=1)
+    if candidate.strip():
+        out = candidate
+    # Remove orphan open tags (generation cut mid-thinking without closing tag).
     candidate = THINK_ORPHAN_OPEN_PATTERN.sub("", out)
     if candidate.strip():
         out = candidate
     candidate = GEMMA4_THINK_ORPHAN_OPEN_PATTERN.sub("", out)
+    if candidate.strip():
+        out = candidate
+    candidate = ANT_THINKING_ORPHAN_OPEN_PATTERN.sub("", out)
     if candidate.strip():
         out = candidate
     return out.strip()

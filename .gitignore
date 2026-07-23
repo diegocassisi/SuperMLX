@@ -30,3 +30,7 @@ Private-docs/
 dist/
 build/
 lab/
+
+# === PRIVADO (no publicar) ===
+abliterated/
+lastlog.md
