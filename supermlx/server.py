@@ -2133,6 +2133,11 @@ def _get_metal_budget_gb() -> float:
 # Threshold for Expert Breathing: rest tokens above this trigger breathe_down
 _BREATHE_DOWN_REST_THRESHOLD = int(os.environ.get("BREATHE_DOWN_REST_THRESHOLD", "15000"))
 
+# GPU yield: insert a tiny sleep between generated tokens so other Metal clients
+# (Chrome/Safari VideoToolbox) can squeeze command buffers into the GPU queue.
+# 0 = disabled (default), 1-2 ms is enough for smooth video playback alongside inference.
+_GPU_YIELD_SECONDS = float(os.environ.get("GPU_YIELD_MS", "0")) / 1000.0
+
 # Track whether breathing is active for the current request
 _breathing_active = False
 
@@ -3728,6 +3733,10 @@ def _adaptive_prefill(
             else:
                 mx.eval(c)
         mx.clear_cache()
+
+        # GPU yield: let other Metal clients (Chrome VideoToolbox) process between chunks
+        if _GPU_YIELD_SECONDS > 0:
+            time.sleep(_GPU_YIELD_SECONDS)
 
         processed += n
 
@@ -5918,6 +5927,7 @@ class APIHandler(BaseHTTPRequestHandler):
 
                 generated_parts = []
                 _thinking_token_count_ns = 0
+                _think_close_count_ns = 0
                 _in_think_ns = False
                 _max_thinking_ns = 128 if _is_embedded_agent else SETTINGS.max_thinking_tokens
                 progress_last_at = time.time()
@@ -5933,6 +5943,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 ):
                     generated_parts.append(response.text)
                     generated_tokens.append(int(response.token))
+                    if _GPU_YIELD_SECONDS > 0:
+                        time.sleep(_GPU_YIELD_SECONDS)
                     if first_token_at is None:
                         first_token_at = time.time()
                         _prefill_done.set()  # Stop prefill progress
@@ -5941,6 +5953,28 @@ class APIHandler(BaseHTTPRequestHandler):
                         _in_think_ns = True
                     if "</think>" in response.text:
                         _in_think_ns = False
+                        _think_close_count_ns += 1
+                    # ── REPEATED </think> BREAK (non-stream) ─────────
+                    # After the first </think>, any subsequent </think>
+                    # means the model is looping. Stop immediately.
+                    if _think_close_count_ns >= 2:
+                        # Truncate to content before second </think>
+                        _full = "".join(generated_parts)
+                        _first_c = _full.index("</think>")
+                        _second_c = _full.index("</think>", _first_c + len("</think>"))
+                        generated_parts.clear()
+                        generated_parts.append(_full[:_second_c].rstrip())
+                        _terminal_status(
+                            "🛑",
+                            f"THINK_LOOP_BREAK: second </think> detected after "
+                            f"{len(generated_tokens)} tokens. Model is looping — "
+                            f"stopping generation.",
+                            indent=1,
+                        )
+                        _pipeline_log("GEN", request_id,
+                            f"THINK_LOOP_BREAK: repeated </think> at token "
+                            f"{len(generated_tokens)}. Truncated and stopped.")
+                        break
                     if _in_think_ns and _max_thinking_ns > 0:
                         _thinking_token_count_ns += 1
                         if _thinking_token_count_ns >= _max_thinking_ns:
@@ -6235,6 +6269,8 @@ class APIHandler(BaseHTTPRequestHandler):
                         cache_match_type=cache_match_type,
                     ):
                         generated_tokens.append(int(response.token))
+                        if _GPU_YIELD_SECONDS > 0:
+                            time.sleep(_GPU_YIELD_SECONDS)
                         if first_token_at is None:
                             first_token_at = time.time()
                             _prefill_done_s.set()  # Stop prefill progress
@@ -6343,11 +6379,38 @@ class APIHandler(BaseHTTPRequestHandler):
                                             self.wfile.flush()
                                         _anthropic_thinking_streamed.append(_new_think)
                             elif _anthropic_streaming and _seen_think_close:
+                                # ── REPEATED </think> BREAK ──────────────────
+                                # After the first </think>, any subsequent </think>
+                                # means the model is looping (generating multiple
+                                # response blocks). Stop generation immediately
+                                # to free the GPU and avoid sending duplicates.
+                                _post_acc = "".join(raw_parts)
+                                # Count </think> in full accumulated text — first one
+                                # is the real close, any more = loop
+                                if _post_acc.count("</think>") >= 2:
+                                    # Truncate raw_parts to content before second </think>
+                                    _first_close = _post_acc.index("</think>")
+                                    _second_close = _post_acc.index("</think>", _first_close + len("</think>"))
+                                    _clean = _post_acc[:_second_close].rstrip()
+                                    raw_parts.clear()
+                                    raw_parts.append(_clean)
+                                    _terminal_status(
+                                        "🛑",
+                                        f"THINK_LOOP_BREAK: second </think> detected after "
+                                        f"{len(generated_tokens)} tokens. Model is looping — "
+                                        f"stopping generation.",
+                                        indent=1,
+                                    )
+                                    _pipeline_log("GEN", request_id,
+                                        f"THINK_LOOP_BREAK: repeated </think> at token "
+                                        f"{len(generated_tokens)}. Truncated and stopped.")
+                                    break
+
                                 # Suppress raw <tool_call> XML from being streamed as text.
                                 # The post-generation code extracts tool_calls and sends
                                 # proper Anthropic tool_use blocks. Track open/close tags
                                 # so text AFTER a closed </tool_call> resumes streaming.
-                                _acc_text = "".join(raw_parts)
+                                _acc_text = _post_acc
                                 _acc_lower = _acc_text.lower()
                                 _in_tool_block = (
                                     bool(tools)
