@@ -2477,6 +2477,10 @@ def _post_generation_cache_update(
     _cache_hit_ratio = matched_prefix_len / max(len(prompt_tokens), 1) if prompt_tokens else 1.0
 
     if skip_cache_store:
+        # Housekeeping detection moved upstream: for housekeeping requests,
+        # cache_lookup is bypassed entirely (they use TPC cold start instead).
+        # This branch handles the edge case where skip_cache_store was set
+        # but cache_lookup still ran (shouldn't happen with the upstream fix).
         _pipeline_log(
             "CACHE",
             request_id,
@@ -5243,20 +5247,37 @@ class APIHandler(BaseHTTPRequestHandler):
                 # --- Cache lookup: MAIN uses SESSION_INDEX, COMPACT uses direct LRU ---
                 # Cache lookup operates on prompt_tokens (canonical key).
                 # rest_tokens will be overridden below to use model_tokens (original).
+                #
+                # HOUSEKEEPING BYPASS: housekeeping requests (skill review / memory save)
+                # must NOT touch the trie because fetch_nearest_cache → _extract()
+                # DELETES the matched entry.  Since housekeeping skips cache store,
+                # the entry is never re-inserted, causing a 0% MISS for the next
+                # normal request.  Instead, housekeeping starts from TPC cold start.
                 _diag_pre_lookup = _cache_diag.snapshot(prompt_cache, list(prompt_tokens), "before_cache_lookup")
-                (
-                    prompt_cache,
-                    _rest_tokens_canonical,
-                    cache_session_tokens,
-                    cache_match_type,
-                    matched_prefix_len,
-                    cache_selection_source,
-                ) = SESSION_INDEX.select_best_cache(
-                    model_name=SETTINGS.model_path,
-                    prompt_tokens=prompt_tokens,
-                    session_ctx=session_ctx,
-                    prompt_cache_store=_active_cache_store,
-                )
+                if _is_housekeeping:
+                    prompt_cache = None
+                    _rest_tokens_canonical = prompt_tokens
+                    cache_session_tokens = prompt_tokens
+                    cache_match_type = "miss"
+                    matched_prefix_len = 0
+                    cache_selection_source = "housekeeping_bypass"
+                    if FEATURE_FULL_LOGGING:
+                        _pipeline_log("CACHE", request_id,
+                            "HOUSEKEEPING_BYPASS: skipping trie lookup to protect MAIN cache entry")
+                else:
+                    (
+                        prompt_cache,
+                        _rest_tokens_canonical,
+                        cache_session_tokens,
+                        cache_match_type,
+                        matched_prefix_len,
+                        cache_selection_source,
+                    ) = SESSION_INDEX.select_best_cache(
+                        model_name=SETTINGS.model_path,
+                        prompt_tokens=prompt_tokens,
+                        session_ctx=session_ctx,
+                        prompt_cache_store=_active_cache_store,
+                    )
                 # Model always prefills from original tokens (dual-pipeline invariant).
                 # Use the actual KV cache offset (number of original tokens stored)
                 # rather than matched_prefix_len (which is a canonical token count and
