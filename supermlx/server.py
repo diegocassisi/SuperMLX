@@ -5300,8 +5300,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 # using the stable prefix as the minimum acceptable match.
                 # Only triggers when there is a real improvement available.
                 if (
-                    not _is_housekeeping
-                    and stable_prefix_token_len_computed > matched_prefix_len
+                    stable_prefix_token_len_computed > matched_prefix_len
                     and stable_prefix_token_len_computed > 0
                     and stable_prefix_token_len_computed < len(prompt_tokens)
                 ):
