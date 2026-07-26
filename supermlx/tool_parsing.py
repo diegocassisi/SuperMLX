@@ -133,6 +133,10 @@ def _strip_thinking_from_content(text: str) -> str:
     candidate = ANT_THINKING_ORPHAN_OPEN_PATTERN.sub("", out)
     if candidate.strip():
         out = candidate
+    # Final pass: remove residual orphan closing tags that are the only content
+    # left after tool extraction + thinking strip (e.g. </think> or </tool_call>
+    # left behind by THINK_CLEANUP rewriting bare function calls).
+    out = re.sub(r'</(?:think|tool_call|antThinking)>\s*', '', out, flags=re.IGNORECASE)
     return out.strip()
 
 
@@ -391,6 +395,24 @@ def _extract_openai_tool_calls(text, model_family, allowed_tools=None):
         and (allowed_names is None or "terminal" in allowed_names)
     ):
         text = _convert_markdown_tool_calls(text)
+        text_lower = text.lower()
+
+    # Normalize </think>function=, </think> function=, or </think><function= patterns where model outputs
+    # bare function syntax immediately following the thinking block.
+    if "function=" in text_lower:
+        text = re.sub(
+            r'</think>\s*<?function=([^\s>]+)>?',
+            r'</think>\n<tool_call>\n<function=\1>',
+            text,
+            flags=re.IGNORECASE,
+        )
+        if "<tool_call>" in text and "</tool_call>" not in text:
+            text = re.sub(
+                r'(</function>)',
+                r'\1\n</tool_call>',
+                text,
+                flags=re.IGNORECASE,
+            )
         text_lower = text.lower()
 
     # Quick-exit: no tool call markers at all

@@ -385,6 +385,35 @@ def _is_rag_bypass_request(messages: List[Dict[str, Any]]) -> bool:
                     return True
     return False
 
+def _is_hermes_housekeeping_request(messages: List[Dict[str, Any]]) -> bool:
+    """Detects Hermes housekeeping injections (skill review, memory save).
+
+    These requests inject a long user message (~1300-1500 extra tokens) into
+    an otherwise normal conversation session.  If their cache is stored in the
+    main trie, the next normal request finds a cache with a much larger
+    kv_offset (the housekeeping tokens), triggering v13 cold starts and
+    recurrent-state contamination loops.
+
+    Signatures (last user message starts with):
+      - "Review the conversation above and update the skill library"
+      - "Review the conversation above and consider saving to memory"
+    """
+    if not messages:
+        return False
+    for msg in reversed(messages):
+        role = (msg.get("role") or "").lower()
+        if role != "user":
+            continue
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            content = " ".join(
+                p.get("text", "") for p in content if isinstance(p, dict)
+            )
+        if not isinstance(content, str):
+            break
+        return content.strip().startswith("Review the conversation above and")
+    return False
+
 
 def _detect_compact_runner(messages: List[Dict[str, Any]], tools: Any) -> bool:
     """Detects if the incoming request is from OpenClaw's compact runner.

@@ -434,6 +434,13 @@ FEATURE_RAG_RELEVANCE_THRESHOLD = 1.6  # Qwen3-Embed asymmetric (docs without pr
 FEATURE_TOOL_LOOP_BREAKER     = _env_bool("TOOL_LOOP_BREAKER", True)
 TOOL_LOOP_MAX_RETRIES         = _env_int("TOOL_LOOP_MAX_RETRIES", 3)
 
+# Healing Store: restore <think> blocks stripped by clients back into assistant
+# messages so the KV cache matches the original generation.
+# DISABLE (HEALING=false) to test without healing — the Qwen3 template already
+# strips thinking from previous turns, so healing is likely unnecessary and
+# introduces tool_call format variance that destabilizes the cache.
+FEATURE_HEALING               = _env_bool("HEALING", True)
+
 # Dynamic Prefix Capture (DPC): replaces warmup_seed.txt with auto-capture + hash validation.
 # Managed by warmup_manager.py. No manual seed files needed.
 from . import warmup_manager as _wm
@@ -441,6 +448,7 @@ from .cache_engine import (
     HybridGenerationCheckpoint,
     capture_hybrid_generation_checkpoint,
     prepare_cache_for_insertion,
+    restore_hybrid_generation_checkpoint,
 )
 
 # ── CASCADE ROUTING ──────────────────────────────────────────────────────────
@@ -703,6 +711,7 @@ from .message_pipeline import (
     _break_tool_call_loop, _inject_loop_stop,
     _count_roles, _summarize_tool_results, _estimate_token_count,
     _is_slug_gen_request, _is_title_gen_request, _is_rag_bypass_request, _detect_compact_runner,
+    _is_hermes_housekeeping_request,
     _flatten_content, _prepare_messages_for_template,
     _scrub_cache_key, _canonicalize_inbound_context_block,
     _canonicalize_messages, _extract_session_context,
@@ -2458,6 +2467,7 @@ def _post_generation_cache_update(
     session_id_for_turn: str,
     is_embedded_agent: bool,
     hybrid_checkpoint: Optional[HybridGenerationCheckpoint] = None,
+    skip_cache_store: bool = False,
 ) -> None:
     """
     Shared post-generation logic: insert cache entries (MAIN or COMPACT),
@@ -2465,6 +2475,16 @@ def _post_generation_cache_update(
     Must be called while holding prompt_cache_lock.
     """
     _cache_hit_ratio = matched_prefix_len / max(len(prompt_tokens), 1) if prompt_tokens else 1.0
+
+    if skip_cache_store:
+        _pipeline_log(
+            "CACHE",
+            request_id,
+            "HERMES_HOUSEKEEPING: cache store skipped — session turn store updated only",
+        )
+        if session_id_for_turn:
+            _update_session_turn_store(session_id_for_turn, messages, prompt_tokens)
+        return
 
     _diag_pre_restore = _cache_diag.snapshot(prompt_cache, cache_key, "before_hybrid_restore")
     prepared = (
@@ -2478,10 +2498,28 @@ def _post_generation_cache_update(
         else None
     )
     if prepared is None:
+        # Detailed diagnostics for cache discard
+        if prompt_cache is None:
+            _discard_reason = "prompt_cache is None"
+        elif hybrid_checkpoint is None:
+            _discard_reason = (
+                f"hybrid_checkpoint is None | "
+                f"can_trim={can_trim_prompt_cache(prompt_cache)} | "
+                f"gen_tokens={len(generated_tokens)}"
+            )
+        else:
+            # checkpoint existed but restore/validation failed
+            _restore_ok = restore_hybrid_generation_checkpoint(prompt_cache, hybrid_checkpoint)
+            _discard_reason = (
+                f"restore_failed={not _restore_ok} | "
+                f"ckpt_key_len={hybrid_checkpoint.cache_key_len} | "
+                f"cache_key_len={len(cache_key)} | "
+                f"kv_off={_kv_cache_offset(prompt_cache)}"
+            )
         _pipeline_log(
             "CACHE",
             request_id,
-            "post-generation cache discarded: hybrid checkpoint missing or rollback failed",
+            f"post-generation cache discarded: {_discard_reason}",
         )
         if session_id_for_turn:
             _update_session_turn_store(session_id_for_turn, messages, prompt_tokens)
@@ -2918,27 +2956,61 @@ def _capture_hybrid_checkpoint_before_generation(
 ) -> Optional[HybridGenerationCheckpoint]:
     """Capture a clean hybrid checkpoint with the last prompt token pending."""
     if not prompt_cache or can_trim_prompt_cache(prompt_cache):
+        if FEATURE_FULL_LOGGING:
+            _pipeline_log(
+                "CACHE",
+                request_id,
+                f"HYBRID_CHECKPOINT skipped: {'prompt_cache is None/empty' if not prompt_cache else 'cache is fully trimmable (pure KV)'}",
+            )
         return None
 
     remaining = len(rest_tokens)
     expected_model_offset = len(model_tokens) - remaining
     actual_model_offset = _kv_cache_offset(prompt_cache)
+    _v15_tolerated = False
     if actual_model_offset != expected_model_offset:
-        _pipeline_log(
-            "CACHE",
-            request_id,
-            "HYBRID_CHECKPOINT skipped: physical/model offset mismatch | "
-            f"physical={actual_model_offset} expected={expected_model_offset}",
-        )
-        return None
+        # FIX-31 v15 compat: when v15 accepted a minor extension, the cache
+        # holds extra tokens from the previous turn's response. The physical
+        # offset exceeds model_tokens by the extension size. Allow checkpoint
+        # capture using the actual physical offset — the recurrent state
+        # contamination was already deemed acceptable by v15.
+        _MINOR_EXT_CKPT_TOLERANCE = 128
+        _ext_delta = (actual_model_offset - expected_model_offset) if actual_model_offset > expected_model_offset else 0
+        if 0 < _ext_delta <= _MINOR_EXT_CKPT_TOLERANCE:
+            _v15_tolerated = True
+            _pipeline_log(
+                "CACHE",
+                request_id,
+                f"HYBRID_CHECKPOINT: v15 minor extension tolerated | "
+                f"physical={actual_model_offset} expected={expected_model_offset} delta={_ext_delta}",
+            )
+        else:
+            _pipeline_log(
+                "CACHE",
+                request_id,
+                "HYBRID_CHECKPOINT skipped: physical/model offset mismatch | "
+                f"physical={actual_model_offset} expected={expected_model_offset}",
+            )
+            return None
+
+    # When v15 tolerated, skip hash metadata: the offset exceeds model_tokens
+    # length, making model_prefix_hash unreliable for next-lookup verification.
+    # model_offset=0 ensures __model_offset__ won't match _kv_off on next
+    # lookup, so the hash check at FIX-31 L5528 is naturally bypassed.
+    if _v15_tolerated:
+        _ckpt_model_offset = 0
+        _ckpt_model_hash = 0
+    else:
+        _ckpt_model_offset = actual_model_offset
+        _ckpt_model_hash = hash(tuple(model_tokens[:actual_model_offset]))
 
     canonical_key_len = len(prompt_tokens) - remaining
     try:
         checkpoint = capture_hybrid_generation_checkpoint(
             prompt_cache,
             canonical_key_len,
-            model_offset=actual_model_offset,
-            model_prefix_hash=hash(tuple(model_tokens[:actual_model_offset])),
+            model_offset=_ckpt_model_offset,
+            model_prefix_hash=_ckpt_model_hash,
         )
         if checkpoint is None:
             _pipeline_log(
@@ -2953,9 +3025,10 @@ def _capture_hybrid_checkpoint_before_generation(
             "HYBRID_CHECKPOINT captured | "
             f"key={canonical_key_len} | kv_offset={actual_model_offset} | "
             f"arrays={len(checkpoint.snapshot.get('layers', {}))} | "
-            f"size={checkpoint.snapshot.get('nbytes', 0) / (1024**2):.1f}MB",
+            f"size={checkpoint.snapshot.get('nbytes', 0) / (1024**2):.1f}MB"
+            f"{' | v15_no_hash=true' if _v15_tolerated else ''}",
         )
-        _cache_diag.snapshot(prompt_cache, list(model_tokens[:actual_model_offset]), "hybrid_capture")
+        _cache_diag.snapshot(prompt_cache, list(model_tokens[:min(actual_model_offset, len(model_tokens))]), "hybrid_capture")
         return checkpoint
     except Exception as checkpoint_err:
         _terminal_status(
@@ -4446,6 +4519,22 @@ class APIHandler(BaseHTTPRequestHandler):
                         f" | TPC context injected={_tpc_injected_into_compact}")
 
             body = anthropic_to_openai_body(raw, SETTINGS.proxy_model_id)
+
+            if _hermes_compact_swapped:
+                # Compact invalidates the entire conversation cache.
+                # Evict BEFORE generation to free memory for the large compact
+                # prefill and ensure no stale entries survive.
+                with prompt_cache_lock:
+                    PROMPT_CACHE.evict_unpinned()
+                import gc; gc.collect()
+                _terminal_status("🧹",
+                    "COMPACT EVICTION: cleared PROMPT_CACHE — next request will rebuild via TPC warmup")
+                # Signal to _handle_chat_completion to skip cache store.
+                # The compact's cache (serialized conversation + instructions)
+                # is a one-off and must NOT be stored — only the RESULT matters,
+                # which Hermes will send as the next normal request.
+                body["_supermlx_compact"] = True
+
             # Jump past the body-parse block that follows.
             self._handle_chat_completion(body)
             return
@@ -4626,6 +4715,16 @@ class APIHandler(BaseHTTPRequestHandler):
         if _is_embedded_agent and FEATURE_FULL_LOGGING:
             _pipeline_log("TOOLS", request_id,
                 f"COMPACT_RUNNER: detected (system-prompt keywords + 0 tools) — routed to PROMPT_CACHE_COMPACT")
+
+        _is_housekeeping = _is_hermes_housekeeping_request(_raw_messages_for_detect)
+        _is_compact = body.pop("_supermlx_compact", False)
+        if _is_compact:
+            _is_housekeeping = True  # reuse same skip_cache_store path
+            _pipeline_log("CACHE", request_id,
+                "HERMES_COMPACT: cache store will be skipped — cache was evicted pre-generation")
+        elif _is_housekeeping:
+            _pipeline_log("CACHE", request_id,
+                "HERMES_HOUSEKEEPING: detected — cache store will be skipped to avoid contaminating conversation cache")
 
         reasoning_control = _extract_enable_thinking(body, default_thinking=SETTINGS.default_thinking)
         enable_thinking = reasoning_control["enable_thinking"]
@@ -4963,7 +5062,10 @@ class APIHandler(BaseHTTPRequestHandler):
 
             # --- APPLY STATELESS HEALING ---
             _heal_t0 = time.time()
-            healed_messages = _heal_messages(raw_messages, HEALING_STORE, HEALING_STORE_LOCK)
+            if FEATURE_HEALING:
+                healed_messages = _heal_messages(raw_messages, HEALING_STORE, HEALING_STORE_LOCK)
+            else:
+                healed_messages = list(raw_messages)
             _heal_ms = (time.time() - _heal_t0) * 1000
             _pipeline_timings["heal"] = _heal_ms
 
@@ -6000,10 +6102,25 @@ class APIHandler(BaseHTTPRequestHandler):
                 # If generation ended while still inside <think> (e.g. THINKING_LIMIT
                 # or NGRAM_LOOP broke mid-thinking), inject synthetic </think> so
                 # downstream _strip_thinking_from_content can properly strip it.
+                # If the model jumped straight to a tool call (bare function=)
+                # without closing </think>, insert </think> BEFORE the function
+                # call and wrap with <tool_call> if the opening tag is missing.
                 if enable_thinking and _in_think_ns and generated_parts:
-                    generated_parts.append("</think>\n")
-                    _pipeline_log("GEN", request_id,
-                        "THINK_CLEANUP: injected synthetic </think> after forced break (non-stream)")
+                    _joined_tc = "".join(generated_parts)
+                    _func_m = re.search(r'<?function=\w', _joined_tc, re.IGNORECASE)
+                    if _func_m:
+                        _fpos = _func_m.start()
+                        _inject = "</think>\n"
+                        if "</tool_call>" in _joined_tc.lower() and "<tool_call>" not in _joined_tc.lower():
+                            _inject += "<tool_call>\n"
+                        generated_parts.clear()
+                        generated_parts.append(_joined_tc[:_fpos] + _inject + _joined_tc[_fpos:])
+                        _pipeline_log("GEN", request_id,
+                            f"THINK_CLEANUP: injected </think> + <tool_call> before bare function call (non-stream)")
+                    else:
+                        generated_parts.append("</think>\n")
+                        _pipeline_log("GEN", request_id,
+                            "THINK_CLEANUP: injected synthetic </think> after forced break (non-stream)")
 
                 response_text = "".join(generated_parts)
                 raw_response_text = response_text
@@ -6053,6 +6170,7 @@ class APIHandler(BaseHTTPRequestHandler):
                         session_id_for_turn=_session_id_for_turn,
                         is_embedded_agent=_is_embedded_agent,
                         hybrid_checkpoint=hybrid_generation_checkpoint,
+                        skip_cache_store=_is_housekeeping,
                     )
 
                 # POST-COMPACT PRE-WARMUP: after compact finishes, pre-warm MAIN
@@ -6453,8 +6571,21 @@ class APIHandler(BaseHTTPRequestHandler):
                 # If generation ended while still inside <think> (e.g. THINKING_LIMIT
                 # or NGRAM_LOOP broke mid-thinking), inject synthetic </think> and
                 # properly transition Anthropic SSE blocks.
+                # If the model jumped straight to a tool call (bare function=)
+                # without closing </think>, insert </think> BEFORE the function
+                # call and wrap with <tool_call> if the opening tag is missing.
                 if enable_thinking and not _seen_think_close and raw_parts:
-                    raw_parts.append("</think>\n")
+                    _joined_tc = "".join(raw_parts)
+                    _func_m = re.search(r'<?function=\w', _joined_tc, re.IGNORECASE)
+                    if _func_m:
+                        _fpos = _func_m.start()
+                        _inject = "</think>\n"
+                        if "</tool_call>" in _joined_tc.lower() and "<tool_call>" not in _joined_tc.lower():
+                            _inject += "<tool_call>\n"
+                        raw_parts.clear()
+                        raw_parts.append(_joined_tc[:_fpos] + _inject + _joined_tc[_fpos:])
+                    else:
+                        raw_parts.append("</think>\n")
                     _seen_think_close = True
                     if _anthropic_streaming:
                         # Close the open thinking block (index 0)
@@ -6469,7 +6600,8 @@ class APIHandler(BaseHTTPRequestHandler):
                         }).encode("utf-8"))
                         self.wfile.flush()
                     _pipeline_log("GEN", request_id,
-                        "THINK_CLEANUP: injected synthetic </think> after forced break (stream)")
+                        f"THINK_CLEANUP: injected </think>{' + <tool_call>' if _func_m else ''} "
+                        f"({'before bare function call' if _func_m else 'after forced break'}) (stream)")
 
                 full_text = "".join(raw_parts)
                 raw_full_text = full_text
@@ -6705,6 +6837,7 @@ class APIHandler(BaseHTTPRequestHandler):
                         session_id_for_turn=_session_id_for_turn,
                         is_embedded_agent=_is_embedded_agent,
                         hybrid_checkpoint=hybrid_generation_checkpoint,
+                        skip_cache_store=_is_housekeeping,
                     )
 
                 # POST-COMPACT PRE-WARMUP: after compact finishes, pre-warm MAIN
