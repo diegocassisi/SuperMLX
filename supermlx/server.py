@@ -441,6 +441,12 @@ TOOL_LOOP_MAX_RETRIES         = _env_int("TOOL_LOOP_MAX_RETRIES", 3)
 # introduces tool_call format variance that destabilizes the cache.
 FEATURE_HEALING               = _env_bool("HEALING", True)
 
+# Housekeeping Cache Borrow: when True, housekeeping requests USE the
+# conversation cache (good model quality) but RESTORE it afterwards
+# so the next normal request still gets a cache hit.
+# When False, housekeeping skips cache lookup entirely (TPC cold start).
+FEATURE_HOUSEKEEPING_CACHE_BORROW = _env_bool("HOUSEKEEPING_CACHE_BORROW", True)
+
 # Dynamic Prefix Capture (DPC): replaces warmup_seed.txt with auto-capture + hash validation.
 # Managed by warmup_manager.py. No manual seed files needed.
 from . import warmup_manager as _wm
@@ -449,6 +455,8 @@ from .cache_engine import (
     capture_hybrid_generation_checkpoint,
     prepare_cache_for_insertion,
     restore_hybrid_generation_checkpoint,
+    snapshot_arrays_cache,
+    rollback_arrays_cache,
 )
 
 # ── CASCADE ROUTING ──────────────────────────────────────────────────────────
@@ -2468,6 +2476,8 @@ def _post_generation_cache_update(
     is_embedded_agent: bool,
     hybrid_checkpoint: Optional[HybridGenerationCheckpoint] = None,
     skip_cache_store: bool = False,
+    housekeeping_pre_snapshot: Optional[Dict] = None,
+    housekeeping_original_tokens: Optional[tuple] = None,
 ) -> None:
     """
     Shared post-generation logic: insert cache entries (MAIN or COMPACT),
@@ -2477,15 +2487,42 @@ def _post_generation_cache_update(
     _cache_hit_ratio = matched_prefix_len / max(len(prompt_tokens), 1) if prompt_tokens else 1.0
 
     if skip_cache_store:
-        # Housekeeping detection moved upstream: for housekeeping requests,
-        # cache_lookup is bypassed entirely (they use TPC cold start instead).
-        # This branch handles the edge case where skip_cache_store was set
-        # but cache_lookup still ran (shouldn't happen with the upstream fix).
-        _pipeline_log(
-            "CACHE",
-            request_id,
-            "HERMES_HOUSEKEEPING: cache store skipped — session turn store updated only",
-        )
+        # BORROW & RETURN: if we have a pre-housekeeping snapshot, restore
+        # the ArraysCache to its pre-housekeeping state and re-insert the
+        # trie entry with the original key.  This preserves the cache for
+        # the next normal request while still giving housekeeping good quality.
+        if (
+            FEATURE_HOUSEKEEPING_CACHE_BORROW
+            and housekeeping_pre_snapshot is not None
+            and housekeeping_original_tokens is not None
+            and prompt_cache is not None
+        ):
+            _restored = rollback_arrays_cache(prompt_cache, housekeeping_pre_snapshot)
+            if _restored:
+                PROMPT_CACHE.insert_cache(
+                    SETTINGS.model_path,
+                    list(housekeeping_original_tokens),
+                    prompt_cache,
+                )
+                _pipeline_log(
+                    "CACHE",
+                    request_id,
+                    f"HOUSEKEEPING_BORROW: cache restored & re-inserted | "
+                    f"original_key_len={len(housekeeping_original_tokens)} | "
+                    f"kv_off={_kv_cache_offset(prompt_cache)}",
+                )
+            else:
+                _pipeline_log(
+                    "CACHE",
+                    request_id,
+                    "HOUSEKEEPING_BORROW: rollback FAILED — cache entry lost",
+                )
+        else:
+            _pipeline_log(
+                "CACHE",
+                request_id,
+                "HERMES_HOUSEKEEPING: cache store skipped — session turn store updated only",
+            )
         if session_id_for_turn:
             _update_session_turn_store(session_id_for_turn, messages, prompt_tokens)
         return
@@ -5248,13 +5285,14 @@ class APIHandler(BaseHTTPRequestHandler):
                 # Cache lookup operates on prompt_tokens (canonical key).
                 # rest_tokens will be overridden below to use model_tokens (original).
                 #
-                # HOUSEKEEPING BYPASS: housekeeping requests (skill review / memory save)
-                # must NOT touch the trie because fetch_nearest_cache → _extract()
-                # DELETES the matched entry.  Since housekeeping skips cache store,
-                # the entry is never re-inserted, causing a 0% MISS for the next
-                # normal request.  Instead, housekeeping starts from TPC cold start.
+                # HOUSEKEEPING CACHE STRATEGY:
+                # When HOUSEKEEPING_CACHE_BORROW=True: allow normal cache lookup
+                # (good quality), snapshot beforehand, restore+re-insert after.
+                # When False: bypass trie lookup (TPC cold start, lower quality).
                 _diag_pre_lookup = _cache_diag.snapshot(prompt_cache, list(prompt_tokens), "before_cache_lookup")
-                if _is_housekeeping:
+                _housekeeping_pre_snapshot = None
+                _housekeeping_original_tokens = None
+                if _is_housekeeping and not FEATURE_HOUSEKEEPING_CACHE_BORROW:
                     prompt_cache = None
                     _rest_tokens_canonical = prompt_tokens
                     cache_session_tokens = prompt_tokens
@@ -5300,7 +5338,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 # using the stable prefix as the minimum acceptable match.
                 # Only triggers when there is a real improvement available.
                 if (
-                    stable_prefix_token_len_computed > matched_prefix_len
+                    (not _is_housekeeping or FEATURE_HOUSEKEEPING_CACHE_BORROW)
+                    and stable_prefix_token_len_computed > matched_prefix_len
                     and stable_prefix_token_len_computed > 0
                     and stable_prefix_token_len_computed < len(prompt_tokens)
                 ):
@@ -5324,6 +5363,24 @@ class APIHandler(BaseHTTPRequestHandler):
                         matched_prefix_len = sp_matched_prefix_len
                         cache_match_type = "stable_prefix_" + sp_match_type
                         cache_selection_source = "stable_prefix"
+
+                # --- HOUSEKEEPING BORROW: snapshot before prefill ---
+                # If housekeeping found a cache entry (via main lookup or M3),
+                # snapshot the ArraysCache NOW (before prefill modifies it).
+                # After generation, we'll restore this snapshot and re-insert
+                # the entry with cache_session_tokens as the key.
+                if (
+                    _is_housekeeping
+                    and FEATURE_HOUSEKEEPING_CACHE_BORROW
+                    and prompt_cache is not None
+                    and cache_session_tokens is not None
+                ):
+                    _housekeeping_pre_snapshot = snapshot_arrays_cache(prompt_cache)
+                    _housekeeping_original_tokens = tuple(cache_session_tokens)
+                    _pipeline_log("CACHE", request_id,
+                        f"HOUSEKEEPING_BORROW: snapshot captured | "
+                        f"original_key_len={len(_housekeeping_original_tokens)} | "
+                        f"snapshot_bytes={_housekeeping_pre_snapshot.get('nbytes', 0)}")
             
             # --- REAL-MATCH SYNC (FIX-31 v3) ---
             # Two coordinate systems:
@@ -6192,6 +6249,8 @@ class APIHandler(BaseHTTPRequestHandler):
                         is_embedded_agent=_is_embedded_agent,
                         hybrid_checkpoint=hybrid_generation_checkpoint,
                         skip_cache_store=_is_housekeeping,
+                        housekeeping_pre_snapshot=_housekeeping_pre_snapshot,
+                        housekeeping_original_tokens=_housekeeping_original_tokens,
                     )
 
                 # POST-COMPACT PRE-WARMUP: after compact finishes, pre-warm MAIN
@@ -6859,6 +6918,8 @@ class APIHandler(BaseHTTPRequestHandler):
                         is_embedded_agent=_is_embedded_agent,
                         hybrid_checkpoint=hybrid_generation_checkpoint,
                         skip_cache_store=_is_housekeeping,
+                        housekeeping_pre_snapshot=_housekeeping_pre_snapshot,
+                        housekeeping_original_tokens=_housekeeping_original_tokens,
                     )
 
                 # POST-COMPACT PRE-WARMUP: after compact finishes, pre-warm MAIN
