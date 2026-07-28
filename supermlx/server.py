@@ -5496,8 +5496,15 @@ class APIHandler(BaseHTTPRequestHandler):
 
                 # ── Marconi early trim ────────────────────────────────────
                 # With ArraysCache monkey-patched (is_trimmable=True), we can
-                # trim the stale overflow BEFORE FIX-31. KVCache layers reduce
-                # offset; ArraysCache layers rollback to checkpoint.
+                # trim the stale KVCache overflow BEFORE FIX-31.
+                #
+                # CRITICAL: Only trim KVCache layers (positional, safe).
+                # DO NOT rollback ArraysCache here — the _supermlx_snapshot
+                # is from the PREVIOUS request's checkpoint (taken after
+                # adaptive_prefill at an offset past the current match point).
+                # Rolling back to that snapshot contaminates recurrent state
+                # with influence from divergent tokens. The ArraysCache will
+                # be corrected by the new checkpoint after adaptive_prefill.
                 #
                 # CRITICAL: _kv_off is model-space, matched_prefix_len is
                 # canonical-space. Compute model-space match point to avoid
@@ -5510,12 +5517,17 @@ class APIHandler(BaseHTTPRequestHandler):
                     and can_trim_prompt_cache(prompt_cache)
                 ):
                     _marconi_trim_n = _kv_off - _model_match_point
-                    trim_prompt_cache(prompt_cache, _marconi_trim_n)
+                    # KVCache-only trim: skip ArraysCache to avoid stale rollback
+                    _kv_trimmed = 0
+                    for layer in prompt_cache:
+                        if hasattr(layer, 'offset') and hasattr(layer, 'trim'):
+                            layer.trim(_marconi_trim_n)
+                            _kv_trimmed += 1
                     _kv_off = _kv_cache_offset(prompt_cache)
                     rest_tokens = model_tokens[-_canonical_rest:]
                     _terminal_status("✅",
                         f"Marconi trim: {_marconi_trim_n} stale tokens trimmed | "
-                        f"kv_off={_kv_off} | rest={len(rest_tokens)}",
+                        f"kv_off={_kv_off} | rest={len(rest_tokens)} | kv_layers={_kv_trimmed}",
                         request_id=request_id, stage="DEBUG")
                     _cache_diag.compare(_diag_pre_fix31, prompt_cache, cache_key,
                         "marconi_trim", request_id,
