@@ -5494,7 +5494,44 @@ class APIHandler(BaseHTTPRequestHandler):
                 _terminal_status("🐞", f"FIX-31 v4: _kv_off={_kv_off} type(layer)={type(prompt_cache[0] if prompt_cache else None)}",
                     request_id=request_id, stage="DEBUG")
 
-                if _kv_off is not None:
+                # ── Marconi early trim ────────────────────────────────────
+                # With ArraysCache monkey-patched (is_trimmable=True), we can
+                # trim the stale overflow BEFORE FIX-31. KVCache layers reduce
+                # offset; ArraysCache layers rollback to checkpoint.
+                #
+                # CRITICAL: _kv_off is model-space, matched_prefix_len is
+                # canonical-space. Compute model-space match point to avoid
+                # the v14 space-mismatch bug.
+                _canonical_rest = max(1, len(prompt_tokens) - matched_prefix_len)
+                _model_match_point = _m_len - _canonical_rest  # model-space
+                if (
+                    _kv_off is not None
+                    and _kv_off > _model_match_point
+                    and can_trim_prompt_cache(prompt_cache)
+                ):
+                    _marconi_trim_n = _kv_off - _model_match_point
+                    trim_prompt_cache(prompt_cache, _marconi_trim_n)
+                    _kv_off = _kv_cache_offset(prompt_cache)
+                    rest_tokens = model_tokens[-_canonical_rest:]
+                    _terminal_status("✅",
+                        f"Marconi trim: {_marconi_trim_n} stale tokens trimmed | "
+                        f"kv_off={_kv_off} | rest={len(rest_tokens)}",
+                        request_id=request_id, stage="DEBUG")
+                    _cache_diag.compare(_diag_pre_fix31, prompt_cache, cache_key,
+                        "marconi_trim", request_id,
+                        extra={"trimmed": _marconi_trim_n, "kv_off": _kv_off})
+                elif (
+                    _kv_off is not None
+                    and _kv_off <= _model_match_point
+                    and can_trim_prompt_cache(prompt_cache)
+                ):
+                    # Marconi normal continuation: cache is aligned, just prefill delta
+                    rest_tokens = model_tokens[-_canonical_rest:]
+                    _terminal_status("✅",
+                        f"Marconi: normal continuation | kv_off={_kv_off} | rest={len(rest_tokens)}",
+                        request_id=request_id, stage="DEBUG")
+                # ──────────────────────────────────────────────────────────
+                elif _kv_off is not None:
                     # FIX-31 v4: Sliding window cap bypass
                     # If physical tensor size (_kv_off) is capped (e.g., 8192 sliding window limit) 
                     # but the logical match (matched_prefix_len) proves we matched far beyond it.
