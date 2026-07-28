@@ -7104,6 +7104,43 @@ class APIHandler(BaseHTTPRequestHandler):
                     "client disconnected (BrokenPipeError)",
                     request_id=request_id,
                 )
+            # ── CACHE SALVAGE ──────────────────────────────────────────────
+            # _extract() removed the cache entry from the LRU store during
+            # fetch (line ~1168). Normally _post_generation_cache_update
+            # re-inserts it after generation. But BrokenPipeError skips that
+            # path, leaving the LRU empty → next request cold-starts from 0%.
+            # Salvage: re-insert the cache using the same post-generation
+            # logic (restores hybrid checkpoint, trims generated tokens).
+            # Wrapped in try/except: failure = current behavior (cache lost).
+            try:
+                if prompt_cache is not None and len(cache_key) > 0:
+                    cache_key.extend(generated_tokens)
+                    with prompt_cache_lock:
+                        _post_generation_cache_update(
+                            request_id=request_id,
+                            messages=messages,
+                            prompt_tokens=prompt_tokens,
+                            cache_key=cache_key,
+                            prompt_cache=prompt_cache,
+                            generated_tokens=generated_tokens,
+                            tool_calls=None,
+                            matched_prefix_len=matched_prefix_len,
+                            session_ctx=session_ctx,
+                            session_id_for_turn=_session_id_for_turn,
+                            is_embedded_agent=_is_embedded_agent,
+                            hybrid_checkpoint=hybrid_generation_checkpoint,
+                        )
+                    _terminal_status(
+                        "♻️",
+                        f"Request {request_id} cache salvaged after disconnect",
+                        indent=1,
+                    )
+            except Exception as _salvage_err:
+                _terminal_status(
+                    "⚠️",
+                    f"Request {request_id} cache salvage failed: {_salvage_err}",
+                    indent=1,
+                )
         except Exception as e:
             _err_str = str(e).lower()
             _is_oom = any(k in _err_str for k in ("out of memory", "memory", "allocation", "metal"))
