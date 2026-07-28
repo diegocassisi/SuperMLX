@@ -6718,6 +6718,24 @@ class APIHandler(BaseHTTPRequestHandler):
                 # ── ANTHROPIC SSE OUTPUT ──────────────────────────────────
                 if self._is_anthropic:
                     if _anthropic_streaming and _seen_think_close:
+                        # FIX: Qwen3.6 sometimes generates the response text
+                        # BEFORE </think> (no reasoning, just answer + closing
+                        # tag).  During streaming, all tokens were sent as
+                        # thinking_delta because _seen_think_close was False.
+                        # The post-processed message_text has the correct answer
+                        # but it was never sent as text_delta.  Send it now.
+                        if message_text and not _anthropic_streamed_text:
+                            with _wfile_lock:
+                                self.wfile.write(_sse_event("content_block_delta", {
+                                    "type": "content_block_delta",
+                                    "index": _anthropic_block_idx,
+                                    "delta": {"type": "text_delta", "text": message_text},
+                                }).encode("utf-8"))
+                                self.wfile.flush()
+                            _anthropic_streamed_text.append(message_text)
+                            _pipeline_log("WIRE", request_id,
+                                f"SSE_TEXT_RECOVERY: sent {len(message_text)} chars "
+                                f"that were streamed as thinking_delta")
                         # We already streamed content_block_delta events during
                         # generation. Now close the current block and message.
                         _stop_reason = "end_turn"
