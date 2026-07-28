@@ -54,13 +54,19 @@ class FetchResult:
 # ── Hybrid trim helpers ──────────────────────────────────────────────────────
 
 def _is_arrays_cache(layer: Any) -> bool:
-    """Check if a cache layer is an ArraysCache (not trimmable, has .cache list)."""
-    return (
-        hasattr(layer, "is_trimmable")
-        and not layer.is_trimmable()
-        and hasattr(layer, "cache")
-        and isinstance(layer.cache, list)
-    )
+    """Check if a cache layer is an ArraysCache (recurrent state, not KVCache)."""
+    # NOTE: Cannot use `not layer.is_trimmable()` — the Marconi monkey-patch
+    # makes is_trimmable() return True for ArraysCache.
+    try:
+        from mlx_lm.models.cache import ArraysCache
+        return isinstance(layer, ArraysCache)
+    except ImportError:
+        # Fallback: duck-typing (has .cache list but no .offset)
+        return (
+            hasattr(layer, "cache")
+            and isinstance(layer.cache, list)
+            and not hasattr(layer, "offset")
+        )
 
 
 def _trim_hybrid(cache: list, n: int) -> bool:
