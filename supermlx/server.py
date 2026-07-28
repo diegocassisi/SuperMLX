@@ -172,8 +172,59 @@ from mlx_lm.models.cache import (
     make_prompt_cache,
     can_trim_prompt_cache,
     trim_prompt_cache,
+    ArraysCache,
 )
 import supermlx.tool_prefix_cache as _tpc
+
+# ── Marconi Pattern: ArraysCache monkey-patch ────────────────────────────────
+# Ref: "Gestión Avanzada de Caché Híbrida y Estados Recurrentes en LLMs"
+#
+# mlx-lm's ArraysCache (recurrent state for Gated DeltaNet / Mamba layers)
+# lacks checkpoint/rollback/trim, causing can_trim_prompt_cache() to return
+# False for hybrid models (Qwen3 MoE). This forces cold starts (60-120s)
+# on every prompt change.
+#
+# Solution: patch ArraysCache with checkpoint/rollback/trim so the normal
+# KVCache trim path works. trim() is a no-op that calls rollback(), matching
+# the design from mlx-lm PRs #1462/#1497 (speculative decoding).
+#
+# Cost: ~61MB per snapshot (30 ArraysCache layers × ~2MB each). Negligible
+# on Apple Silicon unified memory.
+# ─────────────────────────────────────────────────────────────────────────────
+import copy as _copy
+
+def _ac_checkpoint(self):
+    """Snapshot current recurrent state tensors (deep copy, O(1) per layer)."""
+    self._supermlx_snapshot = _copy.deepcopy(self.cache)
+
+def _ac_rollback(self):
+    """Restore recurrent state from last checkpoint."""
+    if hasattr(self, '_supermlx_snapshot') and self._supermlx_snapshot is not None:
+        self.cache = _copy.deepcopy(self._supermlx_snapshot)
+        mx.eval(*[a for a in self.cache if a is not None])
+
+def _ac_trim(self, n):
+    """No-op positional trim — rollback recurrent state instead.
+    
+    KVCache.trim(n) reduces offset by n (positional).
+    ArraysCache has no positional offset; trim() restores the last
+    checkpoint, which is the correct semantic equivalent for recurrent state.
+    Returns n to satisfy trim_prompt_cache()'s return contract.
+    """
+    self._ac_rollback()
+    return n
+
+def _ac_is_trimmable(self):
+    """Allow can_trim_prompt_cache() to return True for hybrid caches."""
+    return True
+
+ArraysCache.checkpoint = _ac_checkpoint
+ArraysCache.rollback = _ac_rollback
+ArraysCache._ac_rollback = _ac_rollback
+ArraysCache.trim = _ac_trim
+ArraysCache.is_trimmable = _ac_is_trimmable
+
+print("[INIT] ArraysCache monkey-patched: checkpoint/rollback/trim (Marconi pattern)")
 
 # Optional VLM support (Blaizzy/mlx-vlm). If unavailable, is_vlm is always False.
 try:
@@ -2995,15 +3046,39 @@ def _capture_hybrid_checkpoint_before_generation(
     model_tokens: List[int],
     rest_tokens: List[int],
 ) -> Optional[HybridGenerationCheckpoint]:
-    """Capture a clean hybrid checkpoint with the last prompt token pending."""
-    if not prompt_cache or can_trim_prompt_cache(prompt_cache):
+    """Capture a clean hybrid checkpoint with the last prompt token pending.
+    
+    With the Marconi monkey-patch, can_trim_prompt_cache() returns True even
+    for hybrid caches. We detect ArraysCache layers directly and invoke their
+    native checkpoint() before capturing the SuperMLX snapshot.
+    """
+    if not prompt_cache:
         if FEATURE_FULL_LOGGING:
             _pipeline_log(
                 "CACHE",
                 request_id,
-                f"HYBRID_CHECKPOINT skipped: {'prompt_cache is None/empty' if not prompt_cache else 'cache is fully trimmable (pure KV)'}",
+                "HYBRID_CHECKPOINT skipped: prompt_cache is None/empty",
             )
         return None
+
+    # Check if any layer is ArraysCache (recurrent state that needs checkpoint)
+    _has_recurrent_layers = any(
+        hasattr(c, '_supermlx_snapshot') or (hasattr(c, 'is_trimmable') and isinstance(c, ArraysCache))
+        for c in prompt_cache
+    )
+    if not _has_recurrent_layers:
+        if FEATURE_FULL_LOGGING:
+            _pipeline_log(
+                "CACHE",
+                request_id,
+                "HYBRID_CHECKPOINT skipped: no ArraysCache layers (pure KV)",
+            )
+        return None
+
+    # Invoke native checkpoint() on each ArraysCache layer (Marconi pattern)
+    for c in prompt_cache:
+        if isinstance(c, ArraysCache) and hasattr(c, 'checkpoint'):
+            c.checkpoint()
 
     remaining = len(rest_tokens)
     expected_model_offset = len(model_tokens) - remaining
