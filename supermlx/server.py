@@ -6556,14 +6556,14 @@ class APIHandler(BaseHTTPRequestHandler):
                                             "type": "content_block_start", "index": 1,
                                             "content_block": {"type": "text", "text": ""},
                                         }).encode("utf-8"))
-                                        # Stream text after </think>
-                                        _post_think = _acc.split("</think>", 1)[1].lstrip("\n")
-                                        if _post_think:
-                                            self.wfile.write(_sse_event("content_block_delta", {
-                                                "type": "content_block_delta", "index": 1,
-                                                "delta": {"type": "text_delta", "text": _post_think},
-                                            }).encode("utf-8"))
-                                            _anthropic_streamed_text.append(_post_think)
+                                        # NOTE: Do NOT stream _post_think as text_delta here.
+                                        # The text after </think> may contain tool call XML
+                                        # fragments (e.g. malformed `function=browser_navigate>`).
+                                        # Streaming it raw would send corrupted content as visible
+                                        # text to Hermes, which stores it in history and feeds it
+                                        # back to the model as context — causing progressive
+                                        # degradation.  Instead, SSE_TEXT_RECOVERY (below) sends
+                                        # the post-processed message_text after tool extraction.
                                         self.wfile.flush()
                                 else:
                                     # Still in thinking — stream as thinking_delta
