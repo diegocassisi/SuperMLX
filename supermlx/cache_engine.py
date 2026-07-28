@@ -229,7 +229,13 @@ def capture_hybrid_generation_checkpoint(
     without ArraysCache state.  Callers must treat ``None`` as non-reusable
     after generation; partially trimming only the KV layers is unsafe.
     """
-    if not cache or cache_key_len <= 0 or can_trim_prompt_cache(cache):
+    if not cache or cache_key_len <= 0:
+        return None
+    # With the Marconi monkey-patch, can_trim_prompt_cache() returns True even
+    # for hybrid caches. Check for ArraysCache layers directly to decide if a
+    # checkpoint is needed (pure KV caches don't need one).
+    _has_arrays = any(_is_arrays_cache(c) for c in cache)
+    if not _has_arrays:
         return None
     snapshot = snapshot_arrays_cache(cache)
     if not snapshot.get("layers"):
