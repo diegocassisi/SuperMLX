@@ -131,11 +131,12 @@ _MUTATING_OPS = frozenset({
     "prefill", "adaptive_prefill", "generate", "stream_generate",
     "trim", "trim_prompt_cache", "cold_start", "make_prompt_cache",
     "tpc_inject", "restore_frozen", "hybrid_restore",
+    "cache_insert", "marconi_trim",
 })
 
 # Operations that should NOT change the hash (read-only or identity)
 _READONLY_OPS = frozenset({
-    "cache_lookup", "hybrid_capture", "cache_insert",
+    "cache_lookup", "hybrid_capture",
 })
 
 
