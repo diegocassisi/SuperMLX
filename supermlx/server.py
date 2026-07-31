@@ -3855,6 +3855,89 @@ def _adaptive_prefill_chunk(base_chunk: int, kv_length: int, available_bytes: fl
     return chunk
 
 
+# ── Memory pressure gate for first Metal shader compilation ───────────────
+# Metal compiles GPU shaders on the first forward pass. Under memory pressure
+# this can take 30s+ instead of 8s. We gate the first prefill to ensure the
+# OS has had time to rebalance memory after model load (16+ GB).
+#
+# Measurement basis: bench_warmup_diag.py showed:
+#   22% free → 10.9s shader compile
+#   85% free →  0.8s shader compile
+#
+# API: vm_stat (BSD, stable since OS X 10.0, forward-compatible with
+# Sequoia/Tahoe). Does NOT use malloc_zone_pressure_relief (private API)
+# or os_proc_available_memory (iOS-only).
+_shader_warmup_done = False
+_SHADER_WARMUP_FREE_THRESHOLD = 40   # % system memory free+inactive
+_SHADER_WARMUP_MAX_WAIT_S = 10       # max seconds to wait for OS to settle
+_SHADER_WARMUP_POLL_INTERVAL_S = 2   # seconds between polls
+
+
+def _get_system_free_memory_pct() -> float:
+    """System free+inactive memory as % of total via vm_stat (stable BSD API).
+
+    Returns percentage (0-100). Returns 100.0 on any failure (fail-open: skip wait).
+    """
+    try:
+        import subprocess
+        out = subprocess.check_output(["vm_stat"], text=True, timeout=2)
+        free_pages = 0
+        inactive_pages = 0
+        for line in out.splitlines():
+            if "Pages free" in line:
+                free_pages = int(line.split(":")[1].strip().rstrip("."))
+            elif "Pages inactive" in line:
+                inactive_pages = int(line.split(":")[1].strip().rstrip("."))
+        total_pages = os.sysconf("SC_PHYS_PAGES")
+        if total_pages > 0:
+            return ((free_pages + inactive_pages) / total_pages) * 100
+    except Exception:
+        pass
+    return 100.0  # fail-open
+
+
+def _memory_pressure_gate(request_id: str) -> None:
+    """Wait for sufficient free memory before first-ever Metal shader compilation.
+
+    Only runs ONCE per process lifetime. Subsequent calls are no-ops.
+    """
+    global _shader_warmup_done
+    if _shader_warmup_done:
+        return
+    _shader_warmup_done = True
+
+    free_pct = _get_system_free_memory_pct()
+    if free_pct >= _SHADER_WARMUP_FREE_THRESHOLD:
+        _pipeline_log("METAL", request_id,
+            f"SHADER_WARMUP_GATE: SKIPPED (adequate memory) | "
+            f"free={free_pct:.0f}% >= {_SHADER_WARMUP_FREE_THRESHOLD}%")
+        return
+
+    _pipeline_log("METAL", request_id,
+        f"SHADER_WARMUP_GATE: memory pressure detected | "
+        f"free={free_pct:.0f}% < {_SHADER_WARMUP_FREE_THRESHOLD}% | "
+        f"waiting up to {_SHADER_WARMUP_MAX_WAIT_S}s for OS to settle...")
+
+    import gc as _gc
+    waited = 0
+    while waited < _SHADER_WARMUP_MAX_WAIT_S:
+        _gc.collect()
+        mx.clear_cache()
+        time.sleep(_SHADER_WARMUP_POLL_INTERVAL_S)
+        waited += _SHADER_WARMUP_POLL_INTERVAL_S
+        free_pct = _get_system_free_memory_pct()
+        if free_pct >= _SHADER_WARMUP_FREE_THRESHOLD:
+            _pipeline_log("METAL", request_id,
+                f"SHADER_WARMUP_GATE: memory settled | "
+                f"free={free_pct:.0f}% | waited={waited}s")
+            return
+
+    _pipeline_log("METAL", request_id,
+        f"SHADER_WARMUP_GATE: timeout after {waited}s | "
+        f"free={free_pct:.0f}% (still < {_SHADER_WARMUP_FREE_THRESHOLD}%) | "
+        f"proceeding anyway")
+
+
 def _adaptive_prefill(
     rest_tokens: list,
     prompt_cache: list,
@@ -3869,6 +3952,9 @@ def _adaptive_prefill(
     """
     if len(rest_tokens) <= 1:
         return rest_tokens
+
+    # Gate: ensure OS has settled memory before first Metal shader compilation
+    _memory_pressure_gate(request_id)
 
     tokens_to_prefill = rest_tokens[:-1]
     last_token = rest_tokens[-1:]  # keep as list for stream_generate
