@@ -34,3 +34,7 @@ lab/
 # === PRIVADO (no publicar) ===
 abliterated/
 lastlog.md
+envs/
+venv/
+.venv-vllm-metal/
+requirements_full_backup.txt
