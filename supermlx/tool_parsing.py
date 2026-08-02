@@ -69,6 +69,57 @@ THINK_ORPHAN_OPEN_PATTERN = re.compile(r"<think>.*$", re.DOTALL | re.IGNORECASE)
 GEMMA4_THINK_ORPHAN_OPEN_PATTERN = re.compile(r"<\|think\|>.*$", re.DOTALL | re.IGNORECASE)
 
 
+# ── Token-level thinking detection ────────────────────────────────────────────
+# Resolves think token IDs once from the tokenizer vocabulary.
+# Much faster and more robust than substring matching on decoded text.
+
+# Known think token strings by model family (ordered by priority)
+_THINK_TOKEN_CANDIDATES = [
+    ("<think>", "</think>"),           # Qwen3/ChatML/GLM/Hermes/DeepSeek
+    ("<|think|>", "<|/think|>"),       # Gemma4
+]
+
+
+def get_think_token_ids(tokenizer: Any) -> Tuple[Optional[int], Optional[int]]:
+    """Resolve think start/end token IDs from the tokenizer vocabulary.
+
+    Returns (start_id, end_id) or (None, None) if no think tokens found.
+    Call once at model load, cache the result.
+    """
+    vocab = {}
+    # Get vocabulary: try .get_vocab() first (fast), fall back to .vocab
+    if hasattr(tokenizer, "get_vocab"):
+        vocab = tokenizer.get_vocab()
+    elif hasattr(tokenizer, "vocab"):
+        vocab = tokenizer.vocab
+
+    if not vocab:
+        return (None, None)
+
+    for start_str, end_str in _THINK_TOKEN_CANDIDATES:
+        start_id = vocab.get(start_str)
+        end_id = vocab.get(end_str)
+        if start_id is not None and end_id is not None:
+            return (start_id, end_id)
+
+    return (None, None)
+
+
+def is_think_token(token_id: int, think_start_id: Optional[int], think_end_id: Optional[int]) -> Optional[bool]:
+    """Check if a token is a think boundary token.
+
+    Returns:
+        True  = this is the think START token (entering thinking)
+        False = this is the think END token (leaving thinking)
+        None  = not a think boundary token
+    """
+    if think_start_id is not None and token_id == think_start_id:
+        return True
+    if think_end_id is not None and token_id == think_end_id:
+        return False
+    return None
+
+
 # ── Functions ─────────────────────────────────────────────────────────────────
 
 def _extract_thinking_text(raw: str) -> str:

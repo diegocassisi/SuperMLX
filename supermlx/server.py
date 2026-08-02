@@ -758,6 +758,7 @@ from .tool_parsing import (
     _strip_thinking_from_content, _extract_thinking_text, _should_enable_thinking,
     _reasoning_level_to_enable_thinking, _extract_enable_thinking,
     _normalize_assistant_text, _coerce_arg_value, _extract_openai_tool_calls,
+    get_think_token_ids, is_think_token,
 )
 # ── Message pipeline (extracted to message_pipeline.py) ──────────────────────
 from .message_pipeline import (
@@ -3485,6 +3486,13 @@ else:
         model, tokenizer = load(SETTINGS.model_path, **_load_kwargs)
     _terminal_status("✅", "Model loaded (mlx-lm).")
     _terminal_status("⚡", "Torch acceleration: N/A (text-only model).")
+
+    # ── Resolve think token IDs (once, at load) ───────────────────────────
+    _think_start_id, _think_end_id = get_think_token_ids(tokenizer)
+    if _think_start_id is not None:
+        _terminal_status("🧠", f"Think tokens resolved: start={_think_start_id} end={_think_end_id}")
+    else:
+        _terminal_status("ℹ️", "Think tokens: not found in vocab — using text-based detection")
 
     # Some models (e.g. Agents-A1) ship chat_template.jinja separately instead of
     # embedding it in tokenizer_config.json. Load it so tools get injected into the prompt.
@@ -6338,12 +6346,19 @@ class APIHandler(BaseHTTPRequestHandler):
                     if first_token_at is None:
                         first_token_at = time.time()
                         _prefill_done.set()  # Stop prefill progress
-                    # Track think state for token limit
-                    if "<think>" in response.text:
-                        _in_think_ns = True
-                    if "</think>" in response.text:
-                        _in_think_ns = False
-                        _think_close_count_ns += 1
+                    # Track think state for token limit (token-based when available)
+                    _think_boundary = is_think_token(int(response.token), _think_start_id, _think_end_id)
+                    if _think_boundary is not None:
+                        _in_think_ns = _think_boundary
+                        if not _think_boundary:  # end token
+                            _think_close_count_ns += 1
+                    elif _think_start_id is None:
+                        # Fallback: text-based detection only when no token IDs
+                        if "<think>" in response.text:
+                            _in_think_ns = True
+                        if "</think>" in response.text:
+                            _in_think_ns = False
+                            _think_close_count_ns += 1
                     # ── REPEATED </think> BREAK (non-stream) ─────────
                     # After the first </think>, any subsequent </think>
                     # means the model is looping. Stop immediately.
@@ -6752,8 +6767,14 @@ class APIHandler(BaseHTTPRequestHandler):
                             # AFTER that tag — so output never starts with <think>.
                             # All output is thinking until </think> appears.
                             if _anthropic_streaming and not _seen_think_close:
-                                _acc = "".join(raw_parts)
-                                if "</think>" in _acc:
+                                # Token-based detection (fast path)
+                                _tb = is_think_token(int(response.token), _think_start_id, _think_end_id)
+                                _is_close = (_tb is not None and not _tb)  # end token
+                                # Text fallback for models without think tokens
+                                if not _is_close and _think_start_id is None:
+                                    _acc = "".join(raw_parts)
+                                    _is_close = "</think>" in _acc
+                                if _is_close:
                                     _seen_think_close = True
                                     # Close thinking block (index 0)
                                     with _wfile_lock:
