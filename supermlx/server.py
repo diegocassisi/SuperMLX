@@ -253,7 +253,7 @@ DOTENV_PATH = SCRIPT_DIR / ".env"
 if DOTENV_PATH.exists():
     load_dotenv(dotenv_path=DOTENV_PATH, override=True)
 
-__version__ = "1.4.2"
+__version__ = "2.0.0-dev"
 
 
 # ── Configuration (extracted to config.py) ────────────────────────────────────
@@ -7409,8 +7409,11 @@ def run():
     # (safe for cold prefill), then expand_expert_capacity() runs after response.
 
     _mem_profiler.init(SETTINGS.log_root)
+    import mlx.core as _mx_banner
+    _mlx_ver = getattr(_mx_banner, '__version__', 'unknown')
     print("\n" + "=" * 50)
-    print("🟢 SYSTEM READY")
+    print(f"🟢 SYSTEM READY — SuperMLX v{__version__}")
+    print(f"   • MLX:          v{_mlx_ver}")
     print(f"   • Mode:         {'VLM (vision)' if is_vlm else 'LM (text-only)'}")
     print(f"   • MLX Engine:   http://{SETTINGS.mlx_host}:{SETTINGS.mlx_port}")
     #print(f"   • LiteLLM:      http://0.0.0.0:{SETTINGS.proxy_port}")

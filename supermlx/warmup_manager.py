@@ -30,6 +30,8 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from supermlx.cache_types import is_recurrent_layer
+
 import mlx.core as mx
 from mlx_lm.models.cache import (
     make_prompt_cache,
@@ -459,17 +461,23 @@ def create_frozen_snapshot(
     """
     _log = log_fn or (lambda *a: None)
     try:
-        from mlx_lm.models.cache import ArraysCache as _AC
-
         if isinstance(prompt_cache, list) and len(prompt_cache) > 0:
             frozen = []
             for layer in prompt_cache:
-                if isinstance(layer, _AC):
-                    new_layer = _AC(len(layer.cache))
-                    new_layer.cache = [
-                        mx.array(c) if c is not None else None
-                        for c in layer.cache
-                    ]
+                if is_recurrent_layer(layer):
+                    # Recurrent layer: copy arrays without importing ArraysCache
+                    cache_data = getattr(layer, 'cache', getattr(layer, 'state', []))
+                    new_layer = copy.copy(layer)
+                    if hasattr(layer, 'cache'):
+                        new_layer.cache = [
+                            mx.array(c) if c is not None else None
+                            for c in layer.cache
+                        ]
+                    elif hasattr(layer, 'state'):
+                        new_layer.state = [
+                            mx.array(c) if c is not None else None
+                            for c in layer.state
+                        ]
                     frozen.append(new_layer)
                 else:
                     frozen.append(copy.deepcopy(layer))
@@ -506,16 +514,20 @@ def restore_frozen_snapshot(
     if frozen_cache is None:
         return None
     try:
-        from mlx_lm.models.cache import ArraysCache as _AC
-
         restored = []
         for layer in frozen_cache:
-            if isinstance(layer, _AC):
-                new_layer = _AC(len(layer.cache))
-                new_layer.cache = [
-                    mx.array(c) if c is not None else None
-                    for c in layer.cache
-                ]
+            if is_recurrent_layer(layer):
+                new_layer = copy.copy(layer)
+                if hasattr(layer, 'cache'):
+                    new_layer.cache = [
+                        mx.array(c) if c is not None else None
+                        for c in layer.cache
+                    ]
+                elif hasattr(layer, 'state'):
+                    new_layer.state = [
+                        mx.array(c) if c is not None else None
+                        for c in layer.state
+                    ]
                 restored.append(new_layer)
             else:
                 restored.append(copy.deepcopy(layer))

@@ -26,6 +26,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 
+from supermlx.cache_types import is_recurrent_layer
+
 import mlx.core as mx
 from mlx_lm.models.cache import (
     LRUPromptCache,
@@ -53,20 +55,8 @@ class FetchResult:
 
 # ── Hybrid trim helpers ──────────────────────────────────────────────────────
 
-def _is_arrays_cache(layer: Any) -> bool:
-    """Check if a cache layer is an ArraysCache (recurrent state, not KVCache)."""
-    # NOTE: Cannot use `not layer.is_trimmable()` — the Marconi monkey-patch
-    # makes is_trimmable() return True for ArraysCache.
-    try:
-        from mlx_lm.models.cache import ArraysCache
-        return isinstance(layer, ArraysCache)
-    except ImportError:
-        # Fallback: duck-typing (has .cache list but no .offset)
-        return (
-            hasattr(layer, "cache")
-            and isinstance(layer.cache, list)
-            and not hasattr(layer, "offset")
-        )
+# _is_arrays_cache removed — use is_recurrent_layer from cache_types (SSoT)
+_is_arrays_cache = is_recurrent_layer  # backward compat alias for internal refs
 
 
 def _trim_hybrid(cache: list, n: int) -> bool:
