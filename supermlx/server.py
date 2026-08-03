@@ -6358,13 +6358,13 @@ class APIHandler(BaseHTTPRequestHandler):
                         _prefill_done.set()  # Stop prefill progress
                     # Feed token to tracker (SSoT)
                     _thinking_tracker.feed(int(response.token), response.text)
-                    # THINK_LOOP_BREAK: model emitted 2+ </think>
                     if _thinking_tracker.is_looping:
                         _full = "".join(generated_parts)
-                        _first_c = _full.index("</think>")
-                        _second_c = _full.index("</think>", _first_c + len("</think>"))
-                        generated_parts.clear()
-                        generated_parts.append(_full[:_second_c].rstrip())
+                        if _full.count("</think>") >= 2:
+                            _first_c = _full.index("</think>")
+                            _second_c = _full.index("</think>", _first_c + len("</think>"))
+                            generated_parts.clear()
+                            generated_parts.append(_full[:_second_c].rstrip())
                         _terminal_status(
                             "🛑",
                             f"THINK_LOOP_BREAK: second </think> detected after "
@@ -6415,6 +6415,7 @@ class APIHandler(BaseHTTPRequestHandler):
                         generated_parts.append("</think>\n")
                         _pipeline_log("GEN", request_id,
                             "THINK_CLEANUP: injected synthetic </think> after forced break (non-stream)")
+                    _thinking_tracker.force_exit()
 
                 response_text = "".join(generated_parts)
                 raw_response_text = response_text
@@ -6712,11 +6713,15 @@ class APIHandler(BaseHTTPRequestHandler):
                         # THINK_LOOP_BREAK: model emitted 2+ </think> = looping
                         if _thinking_tracker.is_looping:
                             _post_acc = "".join(raw_parts)
-                            _first_close = _post_acc.index("</think>")
-                            _second_close = _post_acc.index("</think>", _first_close + len("</think>"))
-                            _clean = _post_acc[:_second_close].rstrip()
-                            raw_parts.clear()
-                            raw_parts.append(_clean)
+                            if _post_acc.count("</think>") >= 2:
+                                _first_close = _post_acc.index("</think>")
+                                _second_close = _post_acc.index("</think>", _first_close + len("</think>"))
+                                _clean = _post_acc[:_second_close].rstrip()
+                                raw_parts.clear()
+                                raw_parts.append(_clean)
+                            else:
+                                # Token-ID detected looping but text doesn't have 2 tags — stop anyway
+                                pass
                             _terminal_status(
                                 "🛑",
                                 f"THINK_LOOP_BREAK: second </think> detected after "
@@ -6848,6 +6853,8 @@ class APIHandler(BaseHTTPRequestHandler):
                         raw_parts.append(_joined_tc[:_fpos] + _inject + _joined_tc[_fpos:])
                     else:
                         raw_parts.append("</think>\n")
+                    # Mark tracker as exited so SSE output uses streaming path
+                    _thinking_tracker.force_exit()
                     if _anthropic_streaming:
                         # Close the open thinking block (index 0)
                         self.wfile.write(_sse_event("content_block_stop", {
@@ -7223,6 +7230,8 @@ class APIHandler(BaseHTTPRequestHandler):
                     pass
             else:
                 _terminal_status("❌", f"Request {request_id} failed: {e}", indent=1)
+                import traceback
+                _pipeline_log("ERROR", request_id, f"traceback: {traceback.format_exc()}")
             if request_logger:
                 request_logger.log("generation", f"error: {e}", request_id=request_id)
         finally:

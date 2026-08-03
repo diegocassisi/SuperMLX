@@ -220,6 +220,16 @@ class ThinkingTracker:
         self._total_count = 0
         self._text_acc = ""
 
+    def force_exit(self) -> None:
+        """Force transition to RESPONDING state.
+
+        Used by THINK_CLEANUP when it injects a synthetic </think>
+        after generation ended mid-thinking. This ensures downstream
+        SSE output logic knows thinking has "exited".
+        """
+        self._state = ThinkingState.RESPONDING
+        self._exit_count += 1
+
 
 # ── Module-level helpers ──────────────────────────────────────────────────────
 
