@@ -760,6 +760,7 @@ from .tool_parsing import (
     _normalize_assistant_text, _coerce_arg_value, _extract_openai_tool_calls,
     get_think_token_ids, is_think_token,
 )
+from .thinking_tracker import ThinkingTracker, ThinkingEvent
 # ── Message pipeline (extracted to message_pipeline.py) ──────────────────────
 from .message_pipeline import (
     INBOUND_META_MESSAGE_ID_PATTERN, SUBAGENT_STATS_PATTERN,
@@ -2713,20 +2714,27 @@ def _log_generation_telemetry(
     finish_reason: str,
     is_embedded_agent: bool,
     timing: Dict[str, Any],
+    thinking_token_count: Optional[int] = None,
 ) -> None:
     """Shared post-generation pipeline logging (GEN + RESP + MSG_OUT)."""
+    if thinking_token_count is not None and thinking_token_count > 0:
+        # Use the real count from the generation loop (token-based, accurate)
+        _reas = thinking_token_count
+        _non_reas = max(0, len(generated_tokens) - _reas)
+    else:
+        # Fallback: estimate from retokenized message_text (less accurate)
+        _non_reas = len(_tokenize_prompt(message_text)) if message_text else 0
+        _reas = max(0, len(generated_tokens) - _non_reas)
+
     if FEATURE_LOG_GENERATION:
         _gen_ms = (time.time() - generation_started_at) * 1000
         _pipeline_log("GEN", request_id,
             f"finished: {len(generated_tokens)} tokens in {_gen_ms/1000:.2f}s "
             f"({timing.get('decode_tps', 0):.1f} tok/s decode)")
-        _non_reas = len(_tokenize_prompt(message_text)) if message_text else 0
-        _reas = max(0, len(generated_tokens) - _non_reas)
         _pipeline_log("GEN", request_id,
             f"thinking_tokens={_reas} | output_tokens={_non_reas}")
     else:
-        _non_reas = len(_tokenize_prompt(message_text)) if message_text else 0
-        _reas = max(0, len(generated_tokens) - _non_reas)
+        pass  # _reas/_non_reas already computed above
 
     if FEATURE_LOG_RESP:
         _pipeline_log("RESP", request_id,
@@ -3493,6 +3501,13 @@ else:
         _terminal_status("🧠", f"Think tokens resolved: start={_think_start_id} end={_think_end_id}")
     else:
         _terminal_status("ℹ️", "Think tokens: not found in vocab — using text-based detection")
+    # ThinkingTracker: SSoT for thinking state — created once, reset() per request
+    _thinking_tracker = ThinkingTracker(
+        think_start_id=_think_start_id,
+        think_end_id=_think_end_id,
+        enable_thinking=SETTINGS.default_thinking,
+    )
+    _terminal_status("🧠", "ThinkingTracker initialized (SSoT for thinking state)")
 
     # Some models (e.g. Agents-A1) ship chat_template.jinja separately instead of
     # embedding it in tokenizer_config.json. Load it so tools get injected into the prompt.
@@ -4480,22 +4495,18 @@ class SidecarHandler(BaseHTTPRequestHandler):
 
         token_count = 0
         full_text = ""
-        in_thinking = False
+        # ThinkingTracker: SSoT — starts in THINKING when enable_thinking=True
+        _thinking_tracker.reset(enable_thinking=True)
 
         for resp in stream_generate(
             **_stream_generate_kwargs(prompt_tokens, max_tokens, sampler, ephemeral_cache)
         ):
             token_count += 1
             text = resp.text
+            _thinking_tracker.feed(int(resp.token), text)
 
-            # Simple think-tag stripping for streaming
-            if "<think>" in text:
-                in_thinking = True
-                continue
-            if "</think>" in text:
-                in_thinking = False
-                continue
-            if in_thinking:
+            # Skip thinking tokens — only stream visible response
+            if _thinking_tracker.is_thinking:
                 continue
 
             full_text += text
@@ -6324,9 +6335,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 _prefill_done, _prefill_thread = _start_prefill_progress(request_id, rest_count)
 
                 generated_parts = []
-                _thinking_token_count_ns = 0
-                _think_close_count_ns = 0
-                _in_think_ns = False
+                # ThinkingTracker: reset for this request (SSoT)
+                _thinking_tracker.reset(enable_thinking=enable_thinking)
                 _max_thinking_ns = 128 if _is_embedded_agent else SETTINGS.max_thinking_tokens
                 progress_last_at = time.time()
                 for response in _stream_generate_unified(
@@ -6346,24 +6356,10 @@ class APIHandler(BaseHTTPRequestHandler):
                     if first_token_at is None:
                         first_token_at = time.time()
                         _prefill_done.set()  # Stop prefill progress
-                    # Track think state for token limit (token-based when available)
-                    _think_boundary = is_think_token(int(response.token), _think_start_id, _think_end_id)
-                    if _think_boundary is not None:
-                        _in_think_ns = _think_boundary
-                        if not _think_boundary:  # end token
-                            _think_close_count_ns += 1
-                    elif _think_start_id is None:
-                        # Fallback: text-based detection only when no token IDs
-                        if "<think>" in response.text:
-                            _in_think_ns = True
-                        if "</think>" in response.text:
-                            _in_think_ns = False
-                            _think_close_count_ns += 1
-                    # ── REPEATED </think> BREAK (non-stream) ─────────
-                    # After the first </think>, any subsequent </think>
-                    # means the model is looping. Stop immediately.
-                    if _think_close_count_ns >= 2:
-                        # Truncate to content before second </think>
+                    # Feed token to tracker (SSoT)
+                    _thinking_tracker.feed(int(response.token), response.text)
+                    # THINK_LOOP_BREAK: model emitted 2+ </think>
+                    if _thinking_tracker.is_looping:
                         _full = "".join(generated_parts)
                         _first_c = _full.index("</think>")
                         _second_c = _full.index("</think>", _first_c + len("</think>"))
@@ -6380,12 +6376,12 @@ class APIHandler(BaseHTTPRequestHandler):
                             f"THINK_LOOP_BREAK: repeated </think> at token "
                             f"{len(generated_tokens)}. Truncated and stopped.")
                         break
-                    if _in_think_ns and _max_thinking_ns > 0:
-                        _thinking_token_count_ns += 1
-                        if _thinking_token_count_ns >= _max_thinking_ns:
+                    # THINKING_LIMIT
+                    if _thinking_tracker.is_thinking and _max_thinking_ns > 0:
+                        if _thinking_tracker.thinking_count >= _max_thinking_ns:
                             _terminal_status(
                                 "🛑",
-                                f"THINKING LIMIT: {_thinking_token_count_ns} tokens in <think> "
+                                f"THINKING LIMIT: {_thinking_tracker.thinking_count} tokens in <think> "
                                 f"(limit={_max_thinking_ns}). Breaking generation.",
                                 indent=1,
                             )
@@ -6402,13 +6398,8 @@ class APIHandler(BaseHTTPRequestHandler):
                             request_id=request_id, stage="DECODE",
                         )
                 # ── THINKING CLEANUP (non-stream) ─────────────────────────
-                # If generation ended while still inside <think> (e.g. THINKING_LIMIT
-                # or NGRAM_LOOP broke mid-thinking), inject synthetic </think> so
-                # downstream _strip_thinking_from_content can properly strip it.
-                # If the model jumped straight to a tool call (bare function=)
-                # without closing </think>, insert </think> BEFORE the function
-                # call and wrap with <tool_call> if the opening tag is missing.
-                if enable_thinking and _in_think_ns and generated_parts:
+                # If generation ended while still in THINKING state, inject </think>.
+                if enable_thinking and _thinking_tracker.is_thinking and generated_parts:
                     _joined_tc = "".join(generated_parts)
                     _func_m = re.search(r'<?function=\w', _joined_tc, re.IGNORECASE)
                     if _func_m:
@@ -6550,7 +6541,7 @@ class APIHandler(BaseHTTPRequestHandler):
                             "mode": "non-stream",
                             "timing": timing,
                             "thinking_text": _think_log,
-                            "thinking_tokens": len(_think_log) // 4 if _think_log else 0,
+                            "thinking_tokens": _thinking_tracker.thinking_count,
                             "response_text": message_text,
                             "raw_response_text": raw_response_text,
                             "normalized_response_text": response_text,
@@ -6566,6 +6557,7 @@ class APIHandler(BaseHTTPRequestHandler):
                         request_id, generation_started_at, generated_tokens,
                         message_text, tool_calls, enable_thinking, finish_reason,
                         _is_embedded_agent, timing,
+                        thinking_token_count=_thinking_tracker.thinking_count if enable_thinking else None,
                     )
             else:
                 self.send_response(200)
@@ -6580,10 +6572,11 @@ class APIHandler(BaseHTTPRequestHandler):
                 response_id = f"chatcmpl-{int(time.time())}"
                 # ── ANTHROPIC: send message_start + content_block_start immediately ──
                 _anthropic_streaming = self._is_anthropic
-                _seen_think_close = False  # True only after </think> is detected in stream
                 _anthropic_streamed_text = []  # chunks already sent via SSE
                 _anthropic_block_idx = 0
-                _anthropic_thinking_streamed = []  # thinking chunks for the thinking block
+                # ThinkingTracker: reset for this request (SSoT)
+                _thinking_tracker.reset(enable_thinking=enable_thinking)
+                _max_thinking = 128 if _is_embedded_agent else SETTINGS.max_thinking_tokens  # 0=unlimited
                 if _anthropic_streaming:
                     _msg_id = f"msg_{uuid.uuid4().hex[:24]}"
                     _msg_start = _sse_event("message_start", {
@@ -6607,7 +6600,6 @@ class APIHandler(BaseHTTPRequestHandler):
                             "type": "content_block_start", "index": 0,
                             "content_block": {"type": "text", "text": ""},
                         })
-                        _seen_think_close = True  # No thinking expected
                     self.wfile.write(_msg_start.encode("utf-8"))
                     self.wfile.write(_block_start.encode("utf-8"))
                     self.wfile.flush()
@@ -6676,8 +6668,6 @@ class APIHandler(BaseHTTPRequestHandler):
                 _prefill_done_s, _ = _start_prefill_progress(request_id, rest_count)
 
                 raw_parts = []
-                _thinking_token_count = 0
-                _max_thinking = 128 if _is_embedded_agent else SETTINGS.max_thinking_tokens  # 0=unlimited
 
                 progress_last_at = time.time()
                 try:
@@ -6699,23 +6689,45 @@ class APIHandler(BaseHTTPRequestHandler):
                             _prefill_done_s.set()  # Stop prefill progress
                         response_text = response.text
 
-                        # ── THINKING TOKEN LIMIT ──────────────────────────
-                        # Count tokens while still inside <think> block.
-                        # When limit is exceeded, break generation to prevent
-                        # circular reasoning loops that produce 0 output.
-                        if not _seen_think_close and _max_thinking > 0:
-                            _thinking_token_count += 1
-                            if _thinking_token_count >= _max_thinking:
+                        # ── THINKING TRACKER (SSoT) ──────────────────────
+                        # Feed every token to the centralized tracker.
+                        # It detects <think>/<\/think> transitions, counts tokens,
+                        # and detects thinking loops (repeated </think>).
+                        _think_event = _thinking_tracker.feed(int(response.token), response_text)
+
+                        # THINKING_LIMIT: break if too many tokens in thinking
+                        if _thinking_tracker.is_thinking and _max_thinking > 0:
+                            if _thinking_tracker.thinking_count >= _max_thinking:
                                 _terminal_status(
                                     "🛑",
-                                    f"THINKING LIMIT: {_thinking_token_count} tokens in <think> block "
+                                    f"THINKING LIMIT: {_thinking_tracker.thinking_count} tokens in <think> block "
                                     f"(limit={_max_thinking}). Forcing generation stop.",
                                     indent=1,
                                 )
                                 _pipeline_log("GEN", request_id,
-                                    f"THINKING_LIMIT_HIT: {_thinking_token_count} thinking tokens, "
+                                    f"THINKING_LIMIT_HIT: {_thinking_tracker.thinking_count} thinking tokens, "
                                     f"limit={_max_thinking}. Breaking generation loop.")
                                 break
+
+                        # THINK_LOOP_BREAK: model emitted 2+ </think> = looping
+                        if _thinking_tracker.is_looping:
+                            _post_acc = "".join(raw_parts)
+                            _first_close = _post_acc.index("</think>")
+                            _second_close = _post_acc.index("</think>", _first_close + len("</think>"))
+                            _clean = _post_acc[:_second_close].rstrip()
+                            raw_parts.clear()
+                            raw_parts.append(_clean)
+                            _terminal_status(
+                                "🛑",
+                                f"THINK_LOOP_BREAK: second </think> detected after "
+                                f"{len(generated_tokens)} tokens. Model is looping — "
+                                f"stopping generation.",
+                                indent=1,
+                            )
+                            _pipeline_log("GEN", request_id,
+                                f"THINK_LOOP_BREAK: repeated </think> at token "
+                                f"{len(generated_tokens)}. Truncated and stopped.")
+                            break
 
                         # ── N-GRAM LOOP DETECTION ────────────────────────
                         # Detect verbatim phrase repetition in generated output.
@@ -6761,107 +6773,49 @@ class APIHandler(BaseHTTPRequestHandler):
                                 break
                         if response_text:
                             raw_parts.append(response_text)
-                            # ── ANTHROPIC LIVE STREAMING ─────────────────────
-                            # The chat template puts <think>\n in the PROMPT when
-                            # enable_thinking=True. Model output is the continuation
-                            # AFTER that tag — so output never starts with <think>.
-                            # All output is thinking until </think> appears.
-                            if _anthropic_streaming and not _seen_think_close:
-                                # Token-based detection (fast path)
-                                _tb = is_think_token(int(response.token), _think_start_id, _think_end_id)
-                                _is_close = (_tb is not None and not _tb)  # end token
-                                # Text fallback for models without think tokens
-                                if not _is_close and _think_start_id is None:
-                                    _acc = "".join(raw_parts)
-                                    _is_close = "</think>" in _acc
-                                if _is_close:
-                                    _seen_think_close = True
-                                    # Close thinking block (index 0)
+                            # ── ANTHROPIC LIVE STREAMING (tracker-based) ────
+                            if _anthropic_streaming:
+                                if _think_event == ThinkingEvent.EXIT_THINKING:
+                                    # Transition: close thinking block, open text block
                                     with _wfile_lock:
                                         self.wfile.write(_sse_event("content_block_stop", {
                                             "type": "content_block_stop", "index": 0,
                                         }).encode("utf-8"))
-                                        # Open text block (index 1)
                                         _anthropic_block_idx = 1
                                         self.wfile.write(_sse_event("content_block_start", {
                                             "type": "content_block_start", "index": 1,
                                             "content_block": {"type": "text", "text": ""},
                                         }).encode("utf-8"))
-                                        # NOTE: Do NOT stream _post_think as text_delta here.
-                                        # The text after </think> may contain tool call XML
-                                        # fragments (e.g. malformed `function=browser_navigate>`).
-                                        # Streaming it raw would send corrupted content as visible
-                                        # text to Hermes, which stores it in history and feeds it
-                                        # back to the model as context — causing progressive
-                                        # degradation.  Instead, SSE_TEXT_RECOVERY (below) sends
-                                        # the post-processed message_text after tool extraction.
                                         self.wfile.flush()
-                                else:
+                                elif _thinking_tracker.is_thinking:
                                     # Still in thinking — stream as thinking_delta
-                                    _new_think = response_text
-                                    if _new_think:
-                                        with _wfile_lock:
-                                            self.wfile.write(_sse_event("content_block_delta", {
-                                                "type": "content_block_delta", "index": 0,
-                                                "delta": {"type": "thinking_delta", "thinking": _new_think},
-                                            }).encode("utf-8"))
-                                            self.wfile.flush()
-                                        _anthropic_thinking_streamed.append(_new_think)
-                            elif _anthropic_streaming and _seen_think_close:
-                                # ── REPEATED </think> BREAK ──────────────────
-                                # After the first </think>, any subsequent </think>
-                                # means the model is looping (generating multiple
-                                # response blocks). Stop generation immediately
-                                # to free the GPU and avoid sending duplicates.
-                                _post_acc = "".join(raw_parts)
-                                # Count </think> in full accumulated text — first one
-                                # is the real close, any more = loop
-                                if _post_acc.count("</think>") >= 2:
-                                    # Truncate raw_parts to content before second </think>
-                                    _first_close = _post_acc.index("</think>")
-                                    _second_close = _post_acc.index("</think>", _first_close + len("</think>"))
-                                    _clean = _post_acc[:_second_close].rstrip()
-                                    raw_parts.clear()
-                                    raw_parts.append(_clean)
-                                    _terminal_status(
-                                        "🛑",
-                                        f"THINK_LOOP_BREAK: second </think> detected after "
-                                        f"{len(generated_tokens)} tokens. Model is looping — "
-                                        f"stopping generation.",
-                                        indent=1,
+                                    with _wfile_lock:
+                                        self.wfile.write(_sse_event("content_block_delta", {
+                                            "type": "content_block_delta", "index": 0,
+                                            "delta": {"type": "thinking_delta", "thinking": response_text},
+                                        }).encode("utf-8"))
+                                        self.wfile.flush()
+                                elif _thinking_tracker.is_responding:
+                                    # In response mode — stream as text_delta
+                                    # Suppress raw <tool_call> XML from being streamed
+                                    _acc_text = "".join(raw_parts).lower()
+                                    _in_tool_block = (
+                                        bool(tools)
+                                        and _acc_text.count("<tool_call") > _acc_text.count("</tool_call>")
                                     )
-                                    _pipeline_log("GEN", request_id,
-                                        f"THINK_LOOP_BREAK: repeated </think> at token "
-                                        f"{len(generated_tokens)}. Truncated and stopped.")
-                                    break
-
-                                # Suppress raw <tool_call> XML from being streamed as text.
-                                # The post-generation code extracts tool_calls and sends
-                                # proper Anthropic tool_use blocks. Track open/close tags
-                                # so text AFTER a closed </tool_call> resumes streaming.
-                                _acc_text = _post_acc
-                                _acc_lower = _acc_text.lower()
-                                _in_tool_block = (
-                                    bool(tools)
-                                    and _acc_lower.count("<tool_call") > _acc_lower.count("</tool_call>")
-                                )
-                                if _in_tool_block:
-                                    # Inside an unclosed tool_call — suppress text streaming.
-                                    pass
-                                else:
-                                    _delta_ev = _sse_event("content_block_delta", {
-                                        "type": "content_block_delta", "index": _anthropic_block_idx,
-                                        "delta": {"type": "text_delta", "text": response_text},
-                                    })
-                                    try:
-                                        with _wfile_lock:
-                                            self.wfile.write(_delta_ev.encode("utf-8"))
-                                            self.wfile.flush()
-                                        _anthropic_streamed_text.append(response_text)
-                                    except BrokenPipeError:
-                                        _pipeline_log("WIRE", request_id,
-                                            "❌ BROKEN PIPE during Anthropic SSE streaming")
-                                        raise
+                                    if not _in_tool_block:
+                                        try:
+                                            with _wfile_lock:
+                                                self.wfile.write(_sse_event("content_block_delta", {
+                                                    "type": "content_block_delta", "index": _anthropic_block_idx,
+                                                    "delta": {"type": "text_delta", "text": response_text},
+                                                }).encode("utf-8"))
+                                                self.wfile.flush()
+                                            _anthropic_streamed_text.append(response_text)
+                                        except BrokenPipeError:
+                                            _pipeline_log("WIRE", request_id,
+                                                "❌ BROKEN PIPE during Anthropic SSE streaming")
+                                            raise
                         if (
                             len(generated_tokens) % 64 == 0
                             and (time.time() - progress_last_at) >= 1.0
@@ -6879,13 +6833,10 @@ class APIHandler(BaseHTTPRequestHandler):
                     _keepalive_thread.join(timeout=2)
 
                 # ── THINKING CLEANUP (stream) ──────────────────────────────
-                # If generation ended while still inside <think> (e.g. THINKING_LIMIT
+                # If generation ended while still in THINKING state (e.g. THINKING_LIMIT
                 # or NGRAM_LOOP broke mid-thinking), inject synthetic </think> and
                 # properly transition Anthropic SSE blocks.
-                # If the model jumped straight to a tool call (bare function=)
-                # without closing </think>, insert </think> BEFORE the function
-                # call and wrap with <tool_call> if the opening tag is missing.
-                if enable_thinking and not _seen_think_close and raw_parts:
+                if enable_thinking and _thinking_tracker.is_thinking and raw_parts:
                     _joined_tc = "".join(raw_parts)
                     _func_m = re.search(r'<?function=\w', _joined_tc, re.IGNORECASE)
                     if _func_m:
@@ -6897,7 +6848,6 @@ class APIHandler(BaseHTTPRequestHandler):
                         raw_parts.append(_joined_tc[:_fpos] + _inject + _joined_tc[_fpos:])
                     else:
                         raw_parts.append("</think>\n")
-                    _seen_think_close = True
                     if _anthropic_streaming:
                         # Close the open thinking block (index 0)
                         self.wfile.write(_sse_event("content_block_stop", {
@@ -6948,13 +6898,10 @@ class APIHandler(BaseHTTPRequestHandler):
 
                 # ── ANTHROPIC SSE OUTPUT ──────────────────────────────────
                 if self._is_anthropic:
-                    if _anthropic_streaming and _seen_think_close:
-                        # FIX: Qwen3.6 sometimes generates the response text
-                        # BEFORE </think> (no reasoning, just answer + closing
-                        # tag).  During streaming, all tokens were sent as
-                        # thinking_delta because _seen_think_close was False.
-                        # The post-processed message_text has the correct answer
-                        # but it was never sent as text_delta.  Send it now.
+                    if _anthropic_streaming and (_thinking_tracker.has_exited_thinking or not enable_thinking):
+                        # SSE_TEXT_RECOVERY: safety net — if nothing was streamed
+                        # as text_delta (e.g. model never emitted </think> token
+                        # and THINK_CLEANUP injected it), send the full text now.
                         if message_text and not _anthropic_streamed_text:
                             with _wfile_lock:
                                 self.wfile.write(_sse_event("content_block_delta", {
@@ -6966,7 +6913,7 @@ class APIHandler(BaseHTTPRequestHandler):
                             _anthropic_streamed_text.append(message_text)
                             _pipeline_log("WIRE", request_id,
                                 f"SSE_TEXT_RECOVERY: sent {len(message_text)} chars "
-                                f"that were streamed as thinking_delta")
+                                f"(not streamed during generation)")
                         # We already streamed content_block_delta events during
                         # generation. Now close the current block and message.
                         _stop_reason = "end_turn"
@@ -7124,7 +7071,7 @@ class APIHandler(BaseHTTPRequestHandler):
                             "mode": "stream",
                             "timing": timing,
                             "thinking_text": _think_log,
-                            "thinking_tokens": len(_think_log) // 4 if _think_log else 0,
+                            "thinking_tokens": _thinking_tracker.thinking_count,
                             "response_text": message_text,
                             "raw_response_text": raw_full_text,
                             "normalized_response_text": full_text,
@@ -7140,6 +7087,7 @@ class APIHandler(BaseHTTPRequestHandler):
                         request_id, generation_started_at, generated_tokens,
                         message_text, tool_calls, enable_thinking, finish_reason,
                         _is_embedded_agent, timing,
+                        thinking_token_count=_thinking_tracker.thinking_count if enable_thinking else None,
                     )
 
                 # ── DEFERRED POST-PROCESSING ──────────────────────────────
