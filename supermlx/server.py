@@ -472,8 +472,6 @@ def _compress_with_cache(
     return compressed, elapsed_ms, False
 
 
-# RAG: config
-FEATURE_RAG_TOP_K             = 5      # chunks a recuperar de LanceDB
 FEATURE_RAG_RELEVANCE_THRESHOLD = 1.6  # Qwen3-Embed asymmetric (docs without prefix). Tested 0.8: filters too much
 
 # Tool Call Loop Breaker: detect and break infinite tool-call retry loops.
@@ -1774,7 +1772,6 @@ def _compute_msg_token_boundaries(
         and not is_vlm
     ):
         try:
-            cumulative_lengths: List[int] = []
             prev_len = 0
             for i in range(n):
                 # Render prefix messages[0..i] without generation prompt so the
@@ -2270,7 +2267,6 @@ def _pre_prefill_memory_relief(request_id: str, rest_count: int, is_embedded_age
             from .expert_cache import breathe_down, PredictiveCachedSwitchLinear
             config = model._moe_config
             current_cap = config.get("capacity", 256)
-            num_experts = config.get("num_experts", 256)
             # Count experts with non-zero breathing priority (session*3 + historical*1)
             # Target = keep only the ones that have SOME usage signal, evict the rest
             min_used = current_cap  # worst case: keep all
