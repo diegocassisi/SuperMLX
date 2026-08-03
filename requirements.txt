@@ -25,3 +25,4 @@ litellm>=1.83.2        # OpenAI-compatible reverse proxy
 # lancedb>=0.26.1
 # sentence-transformers>=5.2.0
 # llmlingua>=0.2.2
+pyobjc-framework-NaturalLanguage==12.2.1
