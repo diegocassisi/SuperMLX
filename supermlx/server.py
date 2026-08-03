@@ -7250,15 +7250,18 @@ class APIHandler(BaseHTTPRequestHandler):
                 output_tokens = len(generated_tokens)
                 speed = output_tokens / elapsed if output_tokens else 0.0
 
-                non_reasoning_tokens = (
-                    len(_tokenize_prompt(message_text)) if message_text else 0
-                )
-                reasoning_tokens = max(0, output_tokens - non_reasoning_tokens)
-                token_breakdown = (
-                    f"{output_tokens} (reasoning: {reasoning_tokens}, output: {non_reasoning_tokens})"
-                    if enable_thinking
-                    else f"{output_tokens}"
-                )
+                if enable_thinking:
+                    _t_thinking = _thinking_tracker.thinking_count
+                    _t_visible = (
+                        len(_tokenize_prompt(message_text)) if message_text else 0
+                    )
+                    _t_markup = max(0, output_tokens - _t_thinking - _t_visible)
+                    token_breakdown = (
+                        f"{output_tokens} (thinking: {_t_thinking}, "
+                        f"visible: {_t_visible}, markup: {_t_markup})"
+                    )
+                else:
+                    token_breakdown = f"{output_tokens}"
 
                 if first_token_at is not None:
                     prefill_seconds = first_token_at - generation_started_at
