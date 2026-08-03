@@ -4505,7 +4505,10 @@ class SidecarHandler(BaseHTTPRequestHandler):
         ):
             token_count += 1
             text = resp.text
-            _thinking_tracker.feed(int(resp.token), text)
+            _sc_event = _thinking_tracker.feed(int(resp.token), text)
+            if _sc_event != ThinkingEvent.NONE:
+                _pipeline_log("THINK", request_id,
+                    f"{_sc_event.name} at token {token_count} (sidecar)")
 
             # Skip thinking tokens — only stream visible response
             if _thinking_tracker.is_thinking:
@@ -6359,7 +6362,10 @@ class APIHandler(BaseHTTPRequestHandler):
                         first_token_at = time.time()
                         _prefill_done.set()  # Stop prefill progress
                     # Feed token to tracker (SSoT)
-                    _thinking_tracker.feed(int(response.token), response.text)
+                    _ns_event = _thinking_tracker.feed(int(response.token), response.text)
+                    if _ns_event != ThinkingEvent.NONE:
+                        _pipeline_log("THINK", request_id,
+                            f"{_ns_event.name} at token {len(generated_tokens)} (non-stream)")
                     if _thinking_tracker.is_looping:
                         _full = "".join(generated_parts)
                         if _full.count("</think>") >= 2:
@@ -6418,6 +6424,8 @@ class APIHandler(BaseHTTPRequestHandler):
                         _pipeline_log("GEN", request_id,
                             "THINK_CLEANUP: injected synthetic </think> after forced break (non-stream)")
                     _thinking_tracker.force_exit()
+                    _pipeline_log("THINK", request_id,
+                        f"FORCE_EXIT (non-stream) | thinking={_thinking_tracker.thinking_count} responding={_thinking_tracker.responding_count}")
 
                 response_text = "".join(generated_parts)
                 raw_response_text = response_text
@@ -6697,6 +6705,9 @@ class APIHandler(BaseHTTPRequestHandler):
                         # It detects <think>/<\/think> transitions, counts tokens,
                         # and detects thinking loops (repeated </think>).
                         _think_event = _thinking_tracker.feed(int(response.token), response_text)
+                        if _think_event != ThinkingEvent.NONE:
+                            _pipeline_log("THINK", request_id,
+                                f"{_think_event.name} at token {len(generated_tokens)} (stream)")
 
                         # THINKING_LIMIT: break if too many tokens in thinking
                         if _thinking_tracker.is_thinking and _max_thinking > 0:
@@ -6857,6 +6868,8 @@ class APIHandler(BaseHTTPRequestHandler):
                         raw_parts.append("</think>\n")
                     # Mark tracker as exited so SSE output uses streaming path
                     _thinking_tracker.force_exit()
+                    _pipeline_log("THINK", request_id,
+                        f"FORCE_EXIT (stream) | thinking={_thinking_tracker.thinking_count} responding={_thinking_tracker.responding_count}")
                     if _anthropic_streaming:
                         # Close the open thinking block (index 0)
                         self.wfile.write(_sse_event("content_block_stop", {
