@@ -258,10 +258,8 @@ __version__ = "2.0.0-dev"
 
 # ── Configuration (extracted to config.py) ────────────────────────────────────
 from .config import (
-    Settings, build_settings,
+    build_settings,
     _env_str, _env_int, _env_float, _env_bool,
-    _env_str_any, _env_int_any, _env_bool_any, _env_kv_bits,
-    _normalize_model_family, _infer_model_family,
 )
 
 SETTINGS = build_settings(script_dir=SCRIPT_DIR)
@@ -751,33 +749,24 @@ proxy_config_path = None
 
 # ── Tool parsing (extracted to tool_parsing.py) ──────────────────────────────
 from .tool_parsing import (
-    TOOL_CALL_PATTERN, GEMMA4_TOOL_CALL_PATTERN, ARG_PAIR_PATTERN,
-    QWEN_FUNCTION_PATTERN, QWEN_PARAMETER_PATTERN,
-    THINK_TAG_STRIP_PATTERN, GEMMA4_THINK_STRIP_PATTERN,
-    GEMMA4_THINK_ORPHAN_PATTERN, THINK_ORPHAN_CLOSE_PATTERN,
-    _strip_thinking_from_content, _extract_thinking_text, _should_enable_thinking,
-    _reasoning_level_to_enable_thinking, _extract_enable_thinking,
-    _normalize_assistant_text, _coerce_arg_value, _extract_openai_tool_calls,
-    get_think_token_ids, is_think_token,
+    _strip_thinking_from_content, _extract_thinking_text,
+    _extract_enable_thinking,
+    _normalize_assistant_text, _extract_openai_tool_calls,
+    get_think_token_ids,
 )
 from .thinking_tracker import ThinkingTracker, ThinkingEvent
 # ── Message pipeline (extracted to message_pipeline.py) ──────────────────────
 from .message_pipeline import (
-    INBOUND_META_MESSAGE_ID_PATTERN, SUBAGENT_STATS_PATTERN,
-    CACHE_TIME_PATTERN, CACHE_TIME_COLON_PATTERN, CACHE_CCH_PATTERN,
-    CACHE_BILLING_HEADER_PATTERN, CACHE_SYSTEM_REMINDER_PATTERN,
-    CACHE_SKILLS_BLOCK_PATTERN, CACHE_RUNTIME_LINE_PATTERN,
     SessionContext,
-    _get_healing_hash, _heal_messages, _extract_tool_call_signature,
-    _break_tool_call_loop, _inject_loop_stop,
+    _get_healing_hash, _heal_messages,
+    _break_tool_call_loop,
     _count_roles, _summarize_tool_results, _estimate_token_count,
     _is_slug_gen_request, _is_title_gen_request, _is_rag_bypass_request, _detect_compact_runner,
     _is_hermes_housekeeping_request,
-    _flatten_content, _prepare_messages_for_template,
-    _scrub_cache_key, _canonicalize_inbound_context_block,
+    _prepare_messages_for_template,
+    _scrub_cache_key,
     _canonicalize_messages, _extract_session_context,
     _assert_cache_key_safety, _hoist_system_messages,
-    _COMPACT_RUNNER_SIGNALS, _RAG_BYPASS_SIGNALS_USER, _RAG_BYPASS_SIGNALS_SYSTEM,
 )
 from .debug_tools import _debug_token_divergence
 from .anthropic_compat import (
