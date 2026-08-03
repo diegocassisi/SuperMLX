@@ -209,7 +209,7 @@ class ThinkingTracker:
     @property
     def is_looping(self) -> bool:
         """True if model emitted 2+ </think> tags (thinking loop detected)."""
-        return self._exit_count >= 2
+        return self._exit_count >= 3
 
     def reset(self, enable_thinking: bool = True) -> None:
         """Reset tracker for a new generation (reuse same token IDs)."""
