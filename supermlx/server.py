@@ -6190,6 +6190,12 @@ class APIHandler(BaseHTTPRequestHandler):
                 # Hide <think> blocks from the client whenever reasoning was requested.
                 if enable_thinking:
                     message_text = _strip_thinking_from_content(message_text)
+                    # THINKING_LEAK_GUARD: if tracker says ALL tokens were thinking
+                    # (responding_count==0), the model never produced visible content.
+                    # _strip_thinking_from_content may fail to strip when <think> tag
+                    # is missing (qwen3/deepseek/hermes/glm4 skip _normalize injection).
+                    if _thinking_tracker.responding_count == 0 and _thinking_tracker.thinking_count > 0:
+                        message_text = ""
 
                     _update_healing_store(raw_response_text, message_text, tool_calls)
 
@@ -6649,6 +6655,12 @@ class APIHandler(BaseHTTPRequestHandler):
                 # Hide <think> blocks from the client whenever reasoning was requested.
                 if enable_thinking:
                     message_text = _strip_thinking_from_content(message_text)
+                    # THINKING_LEAK_GUARD: if tracker says ALL tokens were thinking
+                    # (responding_count==0), the model never produced visible content.
+                    # _strip_thinking_from_content may fail to strip when <think> tag
+                    # is missing (qwen3/deepseek/hermes/glm4 skip _normalize injection).
+                    if _thinking_tracker.responding_count == 0 and _thinking_tracker.thinking_count > 0:
+                        message_text = ""
 
                 finish_reason = "tool_calls" if tool_calls else "stop"
                 # LOOP BREAK ESCALATION: if LOOP_BREAK fired but model still
