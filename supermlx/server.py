@@ -3891,9 +3891,11 @@ def _adaptive_prefill_chunk(base_chunk: int, kv_length: int, available_bytes: fl
 # Sequoia/Tahoe). Does NOT use malloc_zone_pressure_relief (private API)
 # or os_proc_available_memory (iOS-only).
 _shader_warmup_done = False
-_SHADER_WARMUP_FREE_THRESHOLD = 40   # % system memory free+inactive
-_SHADER_WARMUP_MAX_WAIT_S = 10       # max seconds to wait for OS to settle
-_SHADER_WARMUP_POLL_INTERVAL_S = 2   # seconds between polls
+_SHADER_WARMUP_FREE_THRESHOLD = 4    # % system free+inactive — derived from measurement:
+                                      # shader+prefill overhead = 0.45GB (1.9% of 24GB)
+                                      # 4% = 2x safety margin over measured overhead
+_SHADER_WARMUP_MAX_WAIT_S = 3        # max seconds to wait (OS won't free more with MoE resident)
+_SHADER_WARMUP_POLL_INTERVAL_S = 1   # seconds between polls
 
 
 def _get_system_free_memory_pct() -> float:
