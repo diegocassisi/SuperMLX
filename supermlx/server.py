@@ -742,8 +742,7 @@ def _memory_guard_pre_prefill(request_id: str = "") -> int:
         return 0  # Never crash on guard failure
 
 
-proxy_process = None
-proxy_config_path = None
+
 
 # ── Tool parsing (extracted to tool_parsing.py) ──────────────────────────────
 from .tool_parsing import (
@@ -1407,11 +1406,6 @@ class LRUPromptCache:
         key = (model, tuple(tokens))
         return key in self._entries
 
-    def extract_exact_cache(self, model, tokens):
-        if not self.contains_tokens(model, tokens):
-            return None
-        return self._extract(model, tuple(tokens))
-
 
 PROMPT_CACHE = LRUPromptCache(
     max_size=SETTINGS.prompt_cache_max_entries_global,
@@ -1459,21 +1453,6 @@ class SessionIndex:
         ]
         for session_id in stale:
             self._sessions.pop(session_id, None)
-
-    def _lineage_chain(self, session_id: str, max_depth: int = 8) -> List[str]:
-        chain: List[str] = []
-        seen = set()
-        current = session_id
-        depth = 0
-        while current and current not in seen and depth < max_depth:
-            chain.append(current)
-            seen.add(current)
-            state = self._sessions.get(current)
-            if state is None:
-                break
-            current = state.parent_session_id
-            depth += 1
-        return chain
 
     @staticmethod
     def _lcp_len(a: List[int], b: Tuple[int, ...]) -> int:
@@ -1538,49 +1517,6 @@ class SessionIndex:
             self._append_unique_bounded(
                 state.anchors, key_tuple, self._max_anchor_entries
             )
-
-    def _selection_from_exact_entry(
-        self,
-        prompt_tokens: List[int],
-        cache_tokens: Tuple[int, ...],
-        cache_entry: Any,
-    ):
-        prefix_len = self._lcp_len(prompt_tokens, cache_tokens)
-        if prefix_len <= 0:
-            return None
-
-        if len(cache_tokens) > prefix_len:
-            if not can_trim_prompt_cache(cache_entry.prompt_cache):
-                return None
-            trim_prompt_cache(cache_entry.prompt_cache, len(cache_tokens) - prefix_len)
-
-        if prefix_len == len(prompt_tokens):
-            if len(prompt_tokens) > 1 and can_trim_prompt_cache(
-                cache_entry.prompt_cache
-            ):
-                trim_prompt_cache(cache_entry.prompt_cache, 1)
-                return (
-                    cache_entry.prompt_cache,
-                    prompt_tokens[-1:],
-                    list(cache_tokens),
-                    "exact",
-                    len(prompt_tokens) - 1,
-                )
-            return (
-                cache_entry.prompt_cache,
-                prompt_tokens,
-                list(cache_tokens),
-                "exact",
-                len(prompt_tokens),
-            )
-
-        return (
-            cache_entry.prompt_cache,
-            prompt_tokens[prefix_len:],
-            list(cache_tokens),
-            "shorter",
-            prefix_len,
-        )
 
     def select_best_cache(
         self,
@@ -3204,179 +3140,6 @@ def _build_sampler(body):
                 return make_sampler(temp=temperature), {"temp": temperature}
 
 
-def _find_pids_listening_on_port(port: int) -> List[int]:
-    try:
-        result = subprocess.run(
-            ["lsof", "-nP", "-t", f"-iTCP:{port}", "-sTCP:LISTEN"],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-    except FileNotFoundError:
-        return []
-    if result.returncode not in (0, 1):
-        return []
-    pids: List[int] = []
-    for line in result.stdout.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            pid = int(line)
-        except ValueError:
-            continue
-        if pid != os.getpid():
-            pids.append(pid)
-    return pids
-
-
-def _stop_stale_litellm_on_proxy_port(port: int) -> None:
-    pids = _find_pids_listening_on_port(port)
-    if not pids:
-        return
-    stopped_any = False
-    for pid in pids:
-        cmdline = ""
-        try:
-            ps_result = subprocess.run(
-                ["ps", "-p", str(pid), "-o", "command="],
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-            cmdline = ps_result.stdout.strip().lower()
-        except Exception:
-            pass
-        if "litellm" not in cmdline:
-            continue
-        try:
-            os.kill(pid, signal.SIGTERM)
-            stopped_any = True
-            time.sleep(0.2)
-            try:
-                os.kill(pid, 0)
-            except OSError:
-                continue
-            os.kill(pid, signal.SIGKILL)
-        except OSError:
-            continue
-    if stopped_any:
-        _terminal_status(
-            "♻️", f"Stopped stale LiteLLM process(es) on port {port} before restart."
-        )
-
-
-def start_litellm_proxy():
-    global proxy_process, proxy_config_path
-    _stop_stale_litellm_on_proxy_port(SETTINGS.proxy_port)
-    _terminal_status("🌉", f"Launching LiteLLM Proxy on port {SETTINGS.proxy_port}...")
-
-    # Use proxy config so unsupported OpenAI params (e.g. "store") are dropped.
-    # request_timeout (seconds): allow long prefills (e.g. 75k tokens) so client retries
-    # don't trigger a timeout death spiral; 20 min is generous for local MLX.
-    config_yaml = f"""model_list:
-  - model_name: {SETTINGS.proxy_model_id}
-    litellm_params:
-      model: {SETTINGS.proxy_model_id}
-      api_base: http://127.0.0.1:{SETTINGS.mlx_port}/v1
-      api_key: local
-      timeout: 1200
-      stream_timeout: 1200
-      # Keep these request fields when drop_params=true so this server can map
-      # OpenClaw/Claude reasoning intent into tokenizer enable_thinking.
-      allowed_openai_params:
-        - reasoning_effort
-litellm_settings:
-  drop_params: true
-  request_timeout: 1200
-  stream_timeout: 1200
-"""
-    fd, temp_path = tempfile.mkstemp(prefix="litellm-qwen-", suffix=".yaml")
-    with os.fdopen(fd, "w") as config_file:
-        config_file.write(config_yaml)
-    proxy_config_path = temp_path
-
-    litellm_cli = Path(sys.executable).with_name("litellm")
-    if litellm_cli.exists():
-        cmd = [
-            str(litellm_cli),
-            "--config",
-            proxy_config_path,
-            "--port",
-            str(SETTINGS.proxy_port),
-            "--host",
-            "0.0.0.0",
-        ]
-    else:
-        # Fallback path for environments where the CLI script is not next to Python.
-        resolved = shutil.which("litellm")
-        if resolved:
-            cmd = [
-                resolved,
-                "--config",
-                proxy_config_path,
-                "--port",
-                str(SETTINGS.proxy_port),
-                "--host",
-                "0.0.0.0",
-            ]
-        else:
-            cmd = [
-                sys.executable,
-                "-m",
-                "litellm",
-                "--config",
-                proxy_config_path,
-                "--port",
-                str(SETTINGS.proxy_port),
-                "--host",
-                "0.0.0.0",
-            ]
-
-    my_env = os.environ.copy()
-    my_env["OPENAI_API_KEY"] = "local"
-    proxy_process = subprocess.Popen(
-        cmd, env=my_env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
-    )
-    time.sleep(SETTINGS.proxy_startup_wait_seconds)
-    if proxy_process.poll() is not None:
-        stderr_output = ""
-        if proxy_process.stderr is not None:
-            try:
-                stderr_output = proxy_process.stderr.read().decode(
-                    "utf-8", errors="replace"
-                )
-            except Exception:
-                stderr_output = ""
-        raise RuntimeError(
-            "LiteLLM proxy failed to start. "
-            + (
-                f"stderr: {stderr_output.strip()}"
-                if stderr_output
-                else "No stderr captured."
-            )
-        )
-    _terminal_status(
-        "✅",
-        f"LiteLLM Proxy ready at http://127.0.0.1:{SETTINGS.proxy_port} (model: {SETTINGS.proxy_model_id})",
-    )
-
-
-def cleanup():
-    global proxy_config_path
-    if proxy_process:
-        _terminal_status("🧹", "Shutting down LiteLLM Proxy...")
-        proxy_process.terminate()
-        proxy_process.wait()
-    if proxy_config_path:
-        try:
-            Path(proxy_config_path).unlink(missing_ok=True)
-        except Exception:
-            pass
-    _terminal_status("👋", "MLX Server stopped.")
-
-
-atexit.register(cleanup)
 
 # Model loading: LM or VLM based on config.
 model = None
@@ -7356,7 +7119,6 @@ class APIHandler(BaseHTTPRequestHandler):
 
 
 def run():
-    #start_litellm_proxy()
     server_address = (SETTINGS.mlx_host, SETTINGS.mlx_port)
     httpd = ThreadingHTTPServer(server_address, APIHandler)
 
