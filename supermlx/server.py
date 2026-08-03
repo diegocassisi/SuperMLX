@@ -2654,6 +2654,12 @@ def _log_generation_telemetry(
             f"({timing.get('decode_tps', 0):.1f} tok/s decode)")
         _pipeline_log("GEN", request_id,
             f"thinking_tokens={_reas} | output_tokens={_non_reas}")
+        # DIAGNOSTIC: model skipped thinking and reasoned in visible text
+        if enable_thinking and _thinking_tracker.thinking_count <= 1 and _thinking_tracker.responding_count > 10:
+            _pipeline_log("THINK", request_id,
+                f"EMPTY_THINKING_BLOCK | thinking={_thinking_tracker.thinking_count} "
+                f"responding={_thinking_tracker.responding_count} "
+                f"(model reasoning in visible text)")
     else:
         pass  # _reas/_non_reas already computed above
 
