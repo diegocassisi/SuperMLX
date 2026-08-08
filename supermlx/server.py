@@ -752,6 +752,7 @@ from .tool_parsing import (
     get_think_token_ids,
 )
 from .thinking_tracker import ThinkingTracker, ThinkingEvent
+from .tool_call_tracker import ToolCallTracker, ToolCallEvent
 # ── Message pipeline (extracted to message_pipeline.py) ──────────────────────
 from .message_pipeline import (
     SessionContext,
@@ -2293,7 +2294,14 @@ def _start_prefill_progress(
 
 
 def _update_healing_store(raw_text: str, message_text: str, tool_calls: Optional[List]) -> None:
-    """Store the raw (with <think>) response keyed by the stripped version's hash."""
+    """Store raw response (without <think>) keyed by the stripped version's hash.
+
+    Thinking blocks are ephemeral — they don't persist between turns.
+    Storing them inflates the prompt when healed (e.g. 22K→72K observed),
+    triggering COMPACT GUARD rejection and session death.
+    """
+    # Strip thinking blocks before storing — only tool_call markup needs healing
+    raw_text = _strip_thinking_from_content(raw_text)
     if raw_text == message_text:
         return
     h = _get_healing_hash(message_text, tool_calls)
@@ -3098,8 +3106,10 @@ def _capture_hybrid_checkpoint_before_generation(
 
 def _build_sampler(body):
     """
-    Build a sampler with conservative anti-loop defaults.
-    If mlx_lm in this environment does not support some kwargs, fall back safely.
+    Build a sampler and logits processors with anti-loop defaults.
+    Sampler handles: temp, top_p, top_k, min_p (token selection).
+    Logits processors handle: repetition_penalty, presence_penalty (penalty application).
+    Returns (sampler, logits_processors, applied_kwargs).
     """
     temperature = body.get("temperature", SETTINGS.default_temperature)
     if not isinstance(temperature, (int, float)):
@@ -3107,43 +3117,63 @@ def _build_sampler(body):
     if temperature < 0.01:
         temperature = 0
 
-    # Anti-loop defaults can be overridden by request body.
-    candidate_kwargs = {
+    # ── Sampler params (token selection) ──────────────────────────────────
+    sampler_kwargs = {
         "temp": temperature,
         "top_p": body.get("top_p", SETTINGS.default_top_p),
         "top_k": body.get("top_k", SETTINGS.default_top_k),
         "min_p": body.get("min_p", SETTINGS.default_min_p),
-        "repetition_penalty": body.get(
-            "repetition_penalty", SETTINGS.default_repetition_penalty
-        ),
-        "repetition_context_size": body.get(
-            "repetition_context_size", SETTINGS.default_repetition_context_size
-        ),
-        "presence_penalty": body.get(
-            "presence_penalty", SETTINGS.default_presence_penalty
-        ),
-        "presence_context_size": body.get(
-            "presence_context_size", SETTINGS.default_presence_context_size
-        ),
     }
 
-    # Some mlx_lm versions don't support all params. Drop unsupported keys progressively.
-    kwargs = dict(candidate_kwargs)
+    # Build sampler with progressive fallback for compatibility
+    kwargs = dict(sampler_kwargs)
+    sampler = None
     while True:
         try:
-            return make_sampler(**kwargs), kwargs
+            sampler = make_sampler(**kwargs)
+            break
         except TypeError as e:
             msg = str(e)
             removed = False
             for key in list(kwargs.keys()):
-                # Typical error: unexpected keyword argument 'xyz'
                 if f"'{key}'" in msg:
                     kwargs.pop(key, None)
                     removed = True
                     break
             if not removed:
-                # Unknown failure mode, use minimal safe sampler.
-                return make_sampler(temp=temperature), {"temp": temperature}
+                sampler = make_sampler(temp=temperature)
+                kwargs = {"temp": temperature}
+                break
+
+    # ── Logits processors (penalty application) ───────────────────────────
+    _rep_penalty = body.get("repetition_penalty", SETTINGS.default_repetition_penalty)
+    _rep_ctx = body.get("repetition_context_size", SETTINGS.default_repetition_context_size)
+    _pres_penalty = body.get("presence_penalty", SETTINGS.default_presence_penalty)
+    _pres_ctx = body.get("presence_context_size", SETTINGS.default_presence_context_size)
+
+    logits_processors = None
+    try:
+        from mlx_lm.sample_utils import make_logits_processors
+        logits_processors = make_logits_processors(
+            repetition_penalty=_rep_penalty,
+            repetition_context_size=_rep_ctx,
+            presence_penalty=_pres_penalty,
+            presence_context_size=_pres_ctx,
+        )
+        if not logits_processors:
+            logits_processors = None  # Empty list → None (no-op)
+    except (ImportError, TypeError):
+        logits_processors = None  # mlx_lm version without make_logits_processors
+
+    # Combined kwargs for logging
+    applied_kwargs = dict(kwargs)
+    applied_kwargs["repetition_penalty"] = _rep_penalty
+    applied_kwargs["repetition_context_size"] = _rep_ctx
+    applied_kwargs["presence_penalty"] = _pres_penalty
+    applied_kwargs["presence_context_size"] = _pres_ctx
+    applied_kwargs["logits_processors_active"] = logits_processors is not None
+
+    return sampler, logits_processors, applied_kwargs
 
 
 
@@ -3262,6 +3292,8 @@ else:
         enable_thinking=SETTINGS.default_thinking,
     )
     _terminal_status("🧠", "ThinkingTracker initialized (SSoT for thinking state)")
+    _tool_call_tracker = ToolCallTracker()
+    _terminal_status("🔧", "ToolCallTracker initialized (SSoT for tool call streaming state)")
 
     # Some models (e.g. Agents-A1) ship chat_template.jinja separately instead of
     # embedding it in tokenizer_config.json. Load it so tools get injected into the prompt.
@@ -3815,7 +3847,7 @@ def _adaptive_prefill(
     return last_token
 
 
-def _stream_generate_kwargs(prompt_tokens, max_tokens, sampler, prompt_cache):
+def _stream_generate_kwargs(prompt_tokens, max_tokens, sampler, prompt_cache, logits_processors=None):
     kwargs = {
         "model": model,
         "tokenizer": tokenizer,
@@ -3829,6 +3861,8 @@ def _stream_generate_kwargs(prompt_tokens, max_tokens, sampler, prompt_cache):
     }
     if SETTINGS.kv_bits is not None:
         kwargs["kv_bits"] = SETTINGS.kv_bits
+    if logits_processors is not None:
+        kwargs["logits_processors"] = logits_processors
     return kwargs
 
 
@@ -3841,6 +3875,7 @@ def _stream_generate_unified(
     vlm_mask=None,
     vlm_kwargs=None,
     cache_match_type="miss",
+    logits_processors=None,
 ):
     """
     Yields response objects with .text and .token (LM: GenerationResponse, VLM: GenerationResult).
@@ -3920,7 +3955,7 @@ def _stream_generate_unified(
             _dcu_policy = None
 
         for resp in stream_generate(
-            **_stream_generate_kwargs(rest_tokens, max_tokens, sampler, prompt_cache)
+            **_stream_generate_kwargs(rest_tokens, max_tokens, sampler, prompt_cache, logits_processors=logits_processors)
         ):
             yield resp
 
@@ -4103,7 +4138,7 @@ class SidecarHandler(BaseHTTPRequestHandler):
         )
 
         # ── BUILD SAMPLER ──────────────────────────────────────────────────
-        sampler, _ = _build_sampler(body)
+        sampler, logits_processors, _ = _build_sampler(body)
 
         # ── GENERATE (under model_lock) ────────────────────────────────────
         acquired = False
@@ -4129,12 +4164,14 @@ class SidecarHandler(BaseHTTPRequestHandler):
                 self._handle_streaming(
                     request_id, prompt_tokens, max_tokens,
                     sampler, ephemeral_cache, generation_started_at, prepared,
+                    logits_processors=logits_processors,
                 )
             else:
                 self._handle_non_streaming(
                     request_id, prompt_tokens, max_tokens,
                     sampler, ephemeral_cache, generation_started_at, prepared,
                     enable_thinking=_enable_thinking,
+                    logits_processors=logits_processors,
                 )
 
         except Exception as e:
@@ -4158,13 +4195,13 @@ class SidecarHandler(BaseHTTPRequestHandler):
 
     def _handle_non_streaming(self, request_id, prompt_tokens, max_tokens,
                                sampler, ephemeral_cache, gen_start, prepared_messages_ref,
-                               enable_thinking=True):
+                               enable_thinking=True, logits_processors=None):
         """Generate complete response and send as single JSON."""
         full_text = ""
         token_count = 0
 
         for resp in stream_generate(
-            **_stream_generate_kwargs(prompt_tokens, max_tokens, sampler, ephemeral_cache)
+            **_stream_generate_kwargs(prompt_tokens, max_tokens, sampler, ephemeral_cache, logits_processors=logits_processors)
         ):
             full_text += resp.text
             token_count += 1
@@ -4202,7 +4239,7 @@ class SidecarHandler(BaseHTTPRequestHandler):
             full_text = ""
             token_count = 0
             for resp in stream_generate(
-                **_stream_generate_kwargs(retry_tokens, max_tokens, sampler, retry_cache)
+                **_stream_generate_kwargs(retry_tokens, max_tokens, sampler, retry_cache, logits_processors=logits_processors)
             ):
                 full_text += resp.text
                 token_count += 1
@@ -4241,7 +4278,8 @@ class SidecarHandler(BaseHTTPRequestHandler):
         )
 
     def _handle_streaming(self, request_id, prompt_tokens, max_tokens,
-                           sampler, ephemeral_cache, gen_start, prepared_messages_ref):
+                           sampler, ephemeral_cache, gen_start, prepared_messages_ref,
+                           logits_processors=None):
         """Stream SSE chunks as they're generated."""
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -4255,7 +4293,7 @@ class SidecarHandler(BaseHTTPRequestHandler):
         _thinking_tracker.reset(enable_thinking=True)
 
         for resp in stream_generate(
-            **_stream_generate_kwargs(prompt_tokens, max_tokens, sampler, ephemeral_cache)
+            **_stream_generate_kwargs(prompt_tokens, max_tokens, sampler, ephemeral_cache, logits_processors=logits_processors)
         ):
             token_count += 1
             text = resp.text
@@ -5165,7 +5203,7 @@ class APIHandler(BaseHTTPRequestHandler):
         cache_selection_source = "none"
         rest_count = len(model_tokens)
         request_logger = None
-        sampler, sampler_kwargs = _build_sampler(body)
+        sampler, logits_processors, sampler_kwargs = _build_sampler(body)
         # Always use server DEFAULT_MAX_TOKENS — Claude Code sends max_tokens=8192
         # which truncates long code generation. We override it entirely.
         max_tokens = SETTINGS.default_max_tokens
@@ -6107,6 +6145,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     vlm_mask=vlm_mask,
                     vlm_kwargs=vlm_kwargs,
                     cache_match_type=cache_match_type,
+                    logits_processors=logits_processors,
                 ):
                     generated_parts.append(response.text)
                     generated_tokens.append(int(response.token))
@@ -6120,24 +6159,12 @@ class APIHandler(BaseHTTPRequestHandler):
                     if _ns_event != ThinkingEvent.NONE:
                         _pipeline_log("THINK", request_id,
                             f"{_ns_event.name} at token {len(generated_tokens)} (non-stream)")
-                    if _thinking_tracker.is_looping:
-                        _full = "".join(generated_parts)
-                        if _full.count("</think>") >= 2:
-                            _first_c = _full.index("</think>")
-                            _second_c = _full.index("</think>", _first_c + len("</think>"))
-                            generated_parts.clear()
-                            generated_parts.append(_full[:_second_c].rstrip())
-                        _terminal_status(
-                            "🛑",
-                            f"THINK_LOOP_BREAK: second </think> detected after "
-                            f"{len(generated_tokens)} tokens. Model is looping — "
-                            f"stopping generation.",
-                            indent=1,
-                        )
-                        _pipeline_log("GEN", request_id,
-                            f"THINK_LOOP_BREAK: repeated </think> at token "
-                            f"{len(generated_tokens)}. Truncated and stopped.")
-                        break
+                    # THINK_LOOP_BREAK: DISABLED — was a workaround for when
+                    # repetition_penalty wasn't read. Now rep penalty works and
+                    # n-gram detector handles real loops. Re-enable if needed.
+                    # if _thinking_tracker.is_looping:
+                    #     ...
+                    #     break
                     # THINKING_LIMIT
                     if _thinking_tracker.is_thinking and _max_thinking_ns > 0:
                         if _thinking_tracker.thinking_count >= _max_thinking_ns:
@@ -6347,6 +6374,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 _anthropic_block_idx = 0
                 # ThinkingTracker: reset for this request (SSoT)
                 _thinking_tracker.reset(enable_thinking=enable_thinking)
+                _tool_call_tracker = ToolCallTracker()  # Fresh tracker per request
                 _max_thinking = 128 if _is_embedded_agent else SETTINGS.max_thinking_tokens  # 0=unlimited
                 if _anthropic_streaming:
                     _msg_id = f"msg_{uuid.uuid4().hex[:24]}"
@@ -6451,6 +6479,7 @@ class APIHandler(BaseHTTPRequestHandler):
                         vlm_mask=vlm_mask,
                         vlm_kwargs=vlm_kwargs,
                         cache_match_type=cache_match_type,
+                        logits_processors=logits_processors,
                     ):
                         generated_tokens.append(int(response.token))
                         if _GPU_YIELD_SECONDS > 0:
@@ -6483,29 +6512,12 @@ class APIHandler(BaseHTTPRequestHandler):
                                     f"limit={_max_thinking}. Breaking generation loop.")
                                 break
 
-                        # THINK_LOOP_BREAK: model emitted 2+ </think> = looping
-                        if _thinking_tracker.is_looping:
-                            _post_acc = "".join(raw_parts)
-                            if _post_acc.count("</think>") >= 2:
-                                _first_close = _post_acc.index("</think>")
-                                _second_close = _post_acc.index("</think>", _first_close + len("</think>"))
-                                _clean = _post_acc[:_second_close].rstrip()
-                                raw_parts.clear()
-                                raw_parts.append(_clean)
-                            else:
-                                # Token-ID detected looping but text doesn't have 2 tags — stop anyway
-                                pass
-                            _terminal_status(
-                                "🛑",
-                                f"THINK_LOOP_BREAK: second </think> detected after "
-                                f"{len(generated_tokens)} tokens. Model is looping — "
-                                f"stopping generation.",
-                                indent=1,
-                            )
-                            _pipeline_log("GEN", request_id,
-                                f"THINK_LOOP_BREAK: repeated </think> at token "
-                                f"{len(generated_tokens)}. Truncated and stopped.")
-                            break
+                        # THINK_LOOP_BREAK: DISABLED — was a workaround for when
+                        # repetition_penalty wasn't read. Now rep penalty works and
+                        # n-gram detector handles real loops. Re-enable if needed.
+                        # if _thinking_tracker.is_looping:
+                        #     ...
+                        #     break
 
                         # ── N-GRAM LOOP DETECTION ────────────────────────
                         # Detect verbatim phrase repetition in generated output.
@@ -6574,22 +6586,30 @@ class APIHandler(BaseHTTPRequestHandler):
                                         }).encode("utf-8"))
                                         self.wfile.flush()
                                 elif _thinking_tracker.is_responding:
-                                    # In response mode — stream as text_delta
-                                    # Suppress raw <tool_call> XML from being streamed
-                                    _acc_text = "".join(raw_parts).lower()
-                                    _in_tool_block = (
-                                        bool(tools)
-                                        and _acc_text.count("<tool_call") > _acc_text.count("</tool_call>")
-                                    )
-                                    if not _in_tool_block:
+                                    # In response mode — use ToolCallTracker to decide
+                                    # what to stream vs buffer
+                                    _tc_event = _tool_call_tracker.feed(response_text)
+                                    if _tc_event == ToolCallEvent.ENTER_TOOL_CALL:
+                                        _pipeline_log("TOOL_TRACK", request_id,
+                                            f"ENTER_TOOL_CALL at token {len(generated_tokens)}")
+                                    elif _tc_event == ToolCallEvent.EXIT_TOOL_CALL:
+                                        _tc_last = _tool_call_tracker.last_completed
+                                        _pipeline_log("TOOL_TRACK", request_id,
+                                            f"EXIT_TOOL_CALL at token {len(generated_tokens)} | "
+                                            f"has_params={_tc_last['has_parameters'] if _tc_last else '?'} | "
+                                            f"incomplete={_tc_last.get('incomplete', False) if _tc_last else '?'}")
+
+                                    # Stream flushable text (text before/between tool calls)
+                                    _flush = _tool_call_tracker.flushable_text
+                                    if _flush and not _tool_call_tracker.is_buffering:
                                         try:
                                             with _wfile_lock:
                                                 self.wfile.write(_sse_event("content_block_delta", {
                                                     "type": "content_block_delta", "index": _anthropic_block_idx,
-                                                    "delta": {"type": "text_delta", "text": response_text},
+                                                    "delta": {"type": "text_delta", "text": _flush},
                                                 }).encode("utf-8"))
                                                 self.wfile.flush()
-                                            _anthropic_streamed_text.append(response_text)
+                                            _anthropic_streamed_text.append(_flush)
                                         except BrokenPipeError:
                                             _pipeline_log("WIRE", request_id,
                                                 "❌ BROKEN PIPE during Anthropic SSE streaming")
@@ -6645,6 +6665,29 @@ class APIHandler(BaseHTTPRequestHandler):
                     _pipeline_log("GEN", request_id,
                         f"THINK_CLEANUP: injected </think>{' + <tool_call>' if _func_m else ''} "
                         f"({'before bare function call' if _func_m else 'after forced break'}) (stream)")
+
+                # ── TOOL CALL TRACKER FINALIZE ─────────────────────────────
+                _tc_final = _tool_call_tracker.finalize()
+                if _tc_final == ToolCallEvent.EXIT_TOOL_CALL:
+                    _tc_last = _tool_call_tracker.last_completed
+                    _pipeline_log("TOOL_TRACK", request_id,
+                        f"INCOMPLETE at EOS | has_params={_tc_last['has_parameters'] if _tc_last else '?'}")
+                if _tool_call_tracker.call_count > 0:
+                    _pipeline_log("TOOL_TRACK", request_id,
+                        f"summary: {_tool_call_tracker.summary()}")
+                # Flush any remaining holdback text
+                _tc_remaining = _tool_call_tracker.flushable_text
+                if _tc_remaining and _anthropic_streaming:
+                    try:
+                        with _wfile_lock:
+                            self.wfile.write(_sse_event("content_block_delta", {
+                                "type": "content_block_delta", "index": _anthropic_block_idx,
+                                "delta": {"type": "text_delta", "text": _tc_remaining},
+                            }).encode("utf-8"))
+                            self.wfile.flush()
+                        _anthropic_streamed_text.append(_tc_remaining)
+                    except BrokenPipeError:
+                        pass
 
                 full_text = "".join(raw_parts)
                 raw_full_text = full_text
@@ -7197,8 +7240,9 @@ def run():
             from .expert_cache import save_frequency_stats
             _stats_path = os.path.join("logs", "expert_stats.json")
             save_frequency_stats(model, _stats_path)
-        except Exception:
-            pass  # Best-effort on shutdown
+            print(f"[SHUTDOWN] Expert frequency stats saved to {_stats_path}")
+        except Exception as _save_err:
+            print(f"[SHUTDOWN] Expert frequency stats FAILED: {_save_err}")
         if sidecar_httpd:
             sidecar_httpd.shutdown()
 

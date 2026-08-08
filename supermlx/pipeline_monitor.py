@@ -25,7 +25,7 @@ import streamlit as st
 # ── Config ────────────────────────────────────────────────────────────────────
 
 SCRIPT_DIR = Path(__file__).parent
-DEFAULT_LOGS_DIR = SCRIPT_DIR / "logs"
+DEFAULT_LOGS_DIR = SCRIPT_DIR.parent / "logs"
 
 # Parse --logs-dir from sys.argv (Streamlit passes args after --)
 _logs_dir_str = os.environ.get("SUPERMLX_LOGS_DIR", "")

@@ -219,7 +219,7 @@ def build_settings(script_dir: Path = Path(__file__).parent) -> Settings:
         default_min_p=_env_float("DEFAULT_MIN_P", 0.0),
         default_repetition_penalty=_env_float("DEFAULT_REPETITION_PENALTY", 1.1),
         default_repetition_context_size=_env_int(
-            "DEFAULT_REPETITION_CONTEXT_SIZE", 2048
+            "DEFAULT_REPETITION_CONTEXT_SIZE", 64
         ),
         default_presence_penalty=_env_float("DEFAULT_PRESENCE_PENALTY", 0.0),
         default_presence_context_size=_env_int("DEFAULT_PRESENCE_CONTEXT_SIZE", 20),
