@@ -658,7 +658,7 @@ _tc_logger = _logging.getLogger(__name__)
 # Required args per tool: if a tool call is missing ANY of these, it's broken.
 # Only list tools known to suffer from argument dropping under context pressure.
 _TOOL_REQUIRED_ARGS: Dict[str, List[str]] = {
-    "write_file": ["content"],
+    "write_file": ["path", "content"],
     "patch": ["path"],
 }
 
