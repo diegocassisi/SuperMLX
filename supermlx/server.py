@@ -750,6 +750,7 @@ from .tool_parsing import (
     _extract_enable_thinking,
     _normalize_assistant_text, _extract_openai_tool_calls,
     get_think_token_ids,
+    _sanitize_tool_calls,
 )
 from .thinking_tracker import ThinkingTracker, ThinkingEvent
 from .tool_call_tracker import ToolCallTracker, ToolCallEvent
@@ -6235,6 +6236,13 @@ class APIHandler(BaseHTTPRequestHandler):
                 message_text, tool_calls = _extract_openai_tool_calls(
                     response_text, SETTINGS.model_family, allowed_tools=tools or []
                 )
+                # TOOL_SANITIZE: normalize aliases + strip incomplete tool calls
+                if tool_calls:
+                    tool_calls, _stripped = _sanitize_tool_calls(tool_calls, request_id)
+                    if _stripped:
+                        _terminal_status("⚠️",
+                            f"TOOL_SANITIZE: stripped {_stripped} incomplete tool call(s)",
+                            indent=1)
                 # Hide <think> blocks from the client whenever reasoning was requested.
                 if enable_thinking:
                     message_text = _strip_thinking_from_content(message_text)
@@ -6716,6 +6724,13 @@ class APIHandler(BaseHTTPRequestHandler):
                 message_text, tool_calls = _extract_openai_tool_calls(
                     full_text, SETTINGS.model_family, allowed_tools=tools or []
                 )
+                # TOOL_SANITIZE: normalize aliases + strip incomplete tool calls
+                if tool_calls:
+                    tool_calls, _stripped = _sanitize_tool_calls(tool_calls, request_id)
+                    if _stripped:
+                        _terminal_status("⚠️",
+                            f"TOOL_SANITIZE: stripped {_stripped} incomplete tool call(s)",
+                            indent=1)
                 # Hide <think> blocks from the client whenever reasoning was requested.
                 if enable_thinking:
                     message_text = _strip_thinking_from_content(message_text)

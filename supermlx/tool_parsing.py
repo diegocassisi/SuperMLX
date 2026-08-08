@@ -648,3 +648,99 @@ def _extract_openai_tool_calls(text, model_family, allowed_tools=None):
         cleaned_parts.append(text[cursor:])
     cleaned_text = "".join(cleaned_parts).strip()
     return cleaned_text, tool_calls
+
+
+# ── Tool call sanitization (incomplete / alias normalization) ────────────────
+
+import logging as _logging
+_tc_logger = _logging.getLogger(__name__)
+
+# Required args per tool: if a tool call is missing ANY of these, it's broken.
+# Only list tools known to suffer from argument dropping under context pressure.
+_TOOL_REQUIRED_ARGS: Dict[str, List[str]] = {
+    "write_file": ["content"],
+    "patch": ["path"],
+}
+
+# Alias normalization: model sometimes uses alternate names for arguments.
+# Maps tool_name → {alias: canonical}.  Canonical wins if both are present.
+_TOOL_ARG_ALIASES: Dict[str, Dict[str, str]] = {
+    "write_file": {
+        "file_content": "content",
+        "file_path": "path",
+    },
+    "read_file": {
+        "file_path": "path",
+    },
+    "patch": {
+        "file_path": "path",
+        "file_content": "new_string",
+    },
+    "skill_manage": {
+        # skill_manage already accepts file_path/file_content natively,
+        # but models sometimes cross-pollinate to write_file.
+    },
+}
+
+
+def _sanitize_tool_calls(
+    tool_calls: List[Dict[str, Any]],
+    request_id: str = "",
+) -> tuple:
+    """Validate and normalize extracted tool calls.
+
+    Returns (sanitized_tool_calls, stripped_count).
+
+    1. Alias normalization: renames known alternate arg names to canonical.
+    2. Required arg check: strips tool calls missing required arguments
+       (typically caused by EOS mid-tool-call / argument dropping).
+
+    Stripped tool calls are logged for diagnostics.
+    """
+    if not tool_calls:
+        return tool_calls, 0
+
+    sanitized = []
+    stripped = 0
+
+    for tc in tool_calls:
+        fn = tc.get("function", {})
+        name = fn.get("name", "")
+        raw_args = fn.get("arguments", "{}")
+
+        try:
+            args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+        except (json.JSONDecodeError, TypeError):
+            args = {}
+
+        # ── Alias normalization ──
+        aliases = _TOOL_ARG_ALIASES.get(name)
+        if aliases and isinstance(args, dict):
+            changed = False
+            for alias_key, canonical_key in aliases.items():
+                if alias_key in args and canonical_key not in args:
+                    args[canonical_key] = args.pop(alias_key)
+                    changed = True
+                    _tc_logger.info(
+                        "[TOOL_COMPAT] %s req=%s | alias %s→%s applied",
+                        name, request_id[:8], alias_key, canonical_key,
+                    )
+            if changed:
+                fn["arguments"] = json.dumps(args, ensure_ascii=False)
+
+        # ── Required arg validation ──
+        required = _TOOL_REQUIRED_ARGS.get(name)
+        if required and isinstance(args, dict):
+            missing = [k for k in required if k not in args or not args[k]]
+            if missing:
+                _tc_logger.warning(
+                    "[TOOL_SANITIZE] %s req=%s | STRIPPED — missing required: %s "
+                    "(EOS mid-tool-call / argument dropping)",
+                    name, request_id[:8], missing,
+                )
+                stripped += 1
+                continue  # Don't add to sanitized list
+
+        sanitized.append(tc)
+
+    return sanitized, stripped
