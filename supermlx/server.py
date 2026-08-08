@@ -5172,6 +5172,10 @@ class APIHandler(BaseHTTPRequestHandler):
                     f"delta={cache_key_delta_chars} chars | normalized={prompt_was_normalized}")
                 _pipeline_log("CANON", request_id,
                     f"prompt_tokens={len(prompt_tokens)} | model_tokens={len(model_tokens)}")
+                _real_tok = len(model_tokens)
+                _delta_pct = ((_real_tok - _est_tok) / max(1, _est_tok)) * 100
+                _pipeline_log("TOKENS", request_id,
+                    f"estimated={_est_tok} | real={_real_tok} | delta={_delta_pct:+.1f}%")
                 if FEATURE_LOG_PROMPTS:
                     _pipeline_log("CANON", request_id, "prompts dumped to disk",
                         data={"model_prompt_len": len(prompt),
@@ -6304,7 +6308,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     full_response = openai_to_anthropic_response(
                         message_text, tool_calls, finish_reason,
                         self._anthropic_model,
-                        prompt_input_tokens=_est_tok,
+                        prompt_input_tokens=len(model_tokens),
                     )
                     self.wfile.write(json.dumps(full_response).encode("utf-8"))
                 else:
@@ -6384,7 +6388,7 @@ class APIHandler(BaseHTTPRequestHandler):
                             "id": _msg_id, "type": "message", "role": "assistant",
                             "model": self._anthropic_model, "content": [],
                             "stop_reason": None, "stop_sequence": None,
-                            "usage": {"input_tokens": _est_tok, "output_tokens": 0},
+                            "usage": {"input_tokens": len(model_tokens), "output_tokens": 0},
                         },
                     })
                     # Start with thinking block when thinking is enabled,
@@ -6809,7 +6813,7 @@ class APIHandler(BaseHTTPRequestHandler):
                         anthropic_events = build_anthropic_sse_events(
                             message_text, tool_calls, finish_reason,
                             self._anthropic_model,
-                            prompt_input_tokens=_est_tok,
+                            prompt_input_tokens=len(model_tokens),
                         )
                         try:
                             for ev in anthropic_events:
