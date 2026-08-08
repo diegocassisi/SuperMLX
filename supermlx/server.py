@@ -6256,11 +6256,10 @@ class APIHandler(BaseHTTPRequestHandler):
                 )
                 # TOOL_SANITIZE: normalize aliases + strip incomplete tool calls
                 if tool_calls:
-                    tool_calls, _stripped = _sanitize_tool_calls(tool_calls, request_id)
-                    if _stripped:
-                        _terminal_status("⚠️",
-                            f"TOOL_SANITIZE: stripped {_stripped} incomplete tool call(s)",
-                            indent=1)
+                    tool_calls, _alias_count = _sanitize_tool_calls(tool_calls, request_id)
+                    if _alias_count:
+                        _pipeline_log("TOOL_COMPAT", request_id,
+                            f"normalized {_alias_count} tool call(s) (alias remapping)")
                 # Hide <think> blocks from the client whenever reasoning was requested.
                 if enable_thinking:
                     message_text = _strip_thinking_from_content(message_text)
@@ -6751,11 +6750,10 @@ class APIHandler(BaseHTTPRequestHandler):
                 )
                 # TOOL_SANITIZE: normalize aliases + strip incomplete tool calls
                 if tool_calls:
-                    tool_calls, _stripped = _sanitize_tool_calls(tool_calls, request_id)
-                    if _stripped:
-                        _terminal_status("⚠️",
-                            f"TOOL_SANITIZE: stripped {_stripped} incomplete tool call(s)",
-                            indent=1)
+                    tool_calls, _alias_count = _sanitize_tool_calls(tool_calls, request_id)
+                    if _alias_count:
+                        _pipeline_log("TOOL_COMPAT", request_id,
+                            f"normalized {_alias_count} tool call(s) (alias remapping)")
                 # Hide <think> blocks from the client whenever reasoning was requested.
                 if enable_thinking:
                     message_text = _strip_thinking_from_content(message_text)
