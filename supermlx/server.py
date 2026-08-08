@@ -5218,6 +5218,23 @@ class APIHandler(BaseHTTPRequestHandler):
             max_tokens = 256
         is_streaming = body.get("stream", False)
 
+        # ── CONTEXT STATUS — unconditional, every turn ────────────────────
+        if not _is_embedded_agent:
+            _ctx_total = len(model_tokens)
+            _ctx_max = SETTINGS.max_kv_size
+            _ctx_pct = (_ctx_total / max(1, _ctx_max)) * 100
+            _ctx_headroom = max(0, _ctx_max - _ctx_total)
+            _ctx_ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+            _ctx_line = (
+                f"  📊 [CONTEXT STATUS] {_ctx_ts} req={request_id[:8]} | "
+                f"context={_ctx_total}/{_ctx_max} ({_ctx_pct:.1f}%) | "
+                f"output_budget={max_tokens} | headroom={_ctx_headroom}"
+            )
+            if _ctx_pct >= 50:
+                _ctx_line = f"{_ANSI_YELLOW}{_ctx_line}{_ANSI_RESET}"
+            with console_lock:
+                _console_emit(_ctx_line)
+
         acquired = False
         generated_tokens = []
         message_text = ""
