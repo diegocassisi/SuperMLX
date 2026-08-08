@@ -907,6 +907,38 @@ def _pipeline_log(
         _write_request_log(request_id, stage, data)
 
 
+def _fmt_tc_for_log(tool_calls: list) -> str:
+    """Format tool calls for logging with smart truncation.
+
+    Long arg values (>30 chars) are shown as: first10......last10
+    Short values are shown as-is.
+    """
+    parts = []
+    for tc in tool_calls:
+        fn = tc.get("function", {})
+        name = fn.get("name", "?")
+        raw_args = fn.get("arguments", "{}")
+        try:
+            args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+        except (json.JSONDecodeError, TypeError):
+            args = raw_args
+        if isinstance(args, dict):
+            fmt_args = {}
+            for k, v in args.items():
+                sv = str(v)
+                if len(sv) > 30:
+                    fmt_args[k] = f"{sv[:10]}......{sv[-10:]}"
+                else:
+                    fmt_args[k] = v
+            parts.append(f"{name}({json.dumps(fmt_args, ensure_ascii=False)})")
+        else:
+            s = str(args)
+            if len(s) > 60:
+                s = f"{s[:10]}......{s[-10:]}"
+            parts.append(f"{name}({s})")
+    return " | ".join(parts)
+
+
 def _write_request_log(request_id: str, stage: str, data: Any) -> None:
     """Write pipeline stage data to logs/requests/{request_id}/{stage}.json.
 
@@ -6254,12 +6286,19 @@ class APIHandler(BaseHTTPRequestHandler):
                 message_text, tool_calls = _extract_openai_tool_calls(
                     response_text, SETTINGS.model_family, allowed_tools=tools or []
                 )
-                # TOOL_SANITIZE: normalize aliases + strip incomplete tool calls
+                # TOOL_RAW: exactly what the model generated (pre-processing)
+                if tool_calls:
+                    _pipeline_log("TOOL_RAW", request_id,
+                        f"model_output: {_fmt_tc_for_log(tool_calls)}")
+                # TOOL_COMPAT: normalize aliases
                 if tool_calls:
                     tool_calls, _alias_count = _sanitize_tool_calls(tool_calls, request_id)
                     if _alias_count:
                         _pipeline_log("TOOL_COMPAT", request_id,
                             f"normalized {_alias_count} tool call(s) (alias remapping)")
+                    # TOOL_OUT: exactly what goes to Hermes (post-processing)
+                    _pipeline_log("TOOL_OUT", request_id,
+                        f"to_client: {_fmt_tc_for_log(tool_calls)}")
                 # Hide <think> blocks from the client whenever reasoning was requested.
                 if enable_thinking:
                     message_text = _strip_thinking_from_content(message_text)
@@ -6748,12 +6787,19 @@ class APIHandler(BaseHTTPRequestHandler):
                 message_text, tool_calls = _extract_openai_tool_calls(
                     full_text, SETTINGS.model_family, allowed_tools=tools or []
                 )
-                # TOOL_SANITIZE: normalize aliases + strip incomplete tool calls
+                # TOOL_RAW: exactly what the model generated (pre-processing)
+                if tool_calls:
+                    _pipeline_log("TOOL_RAW", request_id,
+                        f"model_output: {_fmt_tc_for_log(tool_calls)}")
+                # TOOL_COMPAT: normalize aliases
                 if tool_calls:
                     tool_calls, _alias_count = _sanitize_tool_calls(tool_calls, request_id)
                     if _alias_count:
                         _pipeline_log("TOOL_COMPAT", request_id,
                             f"normalized {_alias_count} tool call(s) (alias remapping)")
+                    # TOOL_OUT: exactly what goes to Hermes (post-processing)
+                    _pipeline_log("TOOL_OUT", request_id,
+                        f"to_client: {_fmt_tc_for_log(tool_calls)}")
                 # Hide <think> blocks from the client whenever reasoning was requested.
                 if enable_thinking:
                     message_text = _strip_thinking_from_content(message_text)
