@@ -5231,6 +5231,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 f"output_budget={max_tokens} | headroom={_ctx_headroom}"
             )
             if _ctx_pct >= 50:
+                _ctx_line = f"{_ANSI_RED}{_ctx_line}{_ANSI_RESET}"
+            else:
                 _ctx_line = f"{_ANSI_YELLOW}{_ctx_line}{_ANSI_RESET}"
             with console_lock:
                 _console_emit(_ctx_line)
