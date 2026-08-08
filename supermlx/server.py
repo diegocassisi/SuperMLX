@@ -483,10 +483,15 @@ TOOL_LOOP_MAX_RETRIES         = _env_int("TOOL_LOOP_MAX_RETRIES", 3)
 
 # Healing Store: restore <think> blocks stripped by clients back into assistant
 # messages so the KV cache matches the original generation.
-# DISABLE (HEALING=false) to test without healing — the Qwen3 template already
-# strips thinking from previous turns, so healing is likely unnecessary and
-# introduces tool_call format variance that destabilizes the cache.
+# With PRESERVE_THINKING=true, healing becomes essential: it restores thinking
+# that clients strip, and the template preserves it for the model to see.
 FEATURE_HEALING               = _env_bool("HEALING", True)
+
+# Preserve Thinking: pass preserve_thinking=True to apply_chat_template so
+# the Qwen3.6 template keeps <think> blocks from previous assistant turns.
+# Qwen3.6 was designed to see its own reasoning chain (preserve_thinking);
+# without it, the template strips thinking and the model loses coherence.
+FEATURE_PRESERVE_THINKING     = _env_bool("PRESERVE_THINKING", True)
 
 # Housekeeping Cache Borrow: when True, housekeeping requests USE the
 # conversation cache (good model quality) but RESTORE it afterwards
@@ -1720,6 +1725,7 @@ def _compute_msg_token_boundaries(
                     messages[: i + 1],
                     tokenize=True,
                     add_generation_prompt=False,
+                    preserve_thinking=FEATURE_PRESERVE_THINKING,
                 )
                 if isinstance(prefix_toks, list):
                     cur_len = len(prefix_toks)
@@ -1976,6 +1982,7 @@ def _vlm_prompt_and_inputs(
         template_kwargs["tools"] = tools
     if enable_thinking is not None:
         template_kwargs["enable_thinking"] = enable_thinking
+    template_kwargs["preserve_thinking"] = FEATURE_PRESERVE_THINKING
 
     template_processor = None
     if processor_any is not None and hasattr(processor_any, "apply_chat_template"):
@@ -2294,18 +2301,21 @@ def _start_prefill_progress(
     return done, t
 
 
-def _update_healing_store(raw_text: str, message_text: str, tool_calls: Optional[List]) -> None:
-    """Store raw response (without <think>) keyed by the stripped version's hash.
+def _update_healing_store(raw_text: str, message_text: str, tool_calls: Optional[List],
+                          user_context: str = "") -> None:
+    """Store raw response keyed by the stripped version's hash.
 
-    Thinking blocks are ephemeral — they don't persist between turns.
-    Storing them inflates the prompt when healed (e.g. 22K→72K observed),
-    triggering COMPACT GUARD rejection and session death.
+    With PRESERVE_THINKING=true, thinking blocks are kept in the store so
+    healing can restore them for the next turn. The template's
+    preserve_thinking flag ensures they're included in the prompt.
+    Without PRESERVE_THINKING, thinking is stripped to avoid prompt inflation.
     """
-    # Strip thinking blocks before storing — only tool_call markup needs healing
-    raw_text = _strip_thinking_from_content(raw_text)
+    if not FEATURE_PRESERVE_THINKING:
+        # Legacy behavior: strip thinking to avoid prompt inflation
+        raw_text = _strip_thinking_from_content(raw_text)
     if raw_text == message_text:
         return
-    h = _get_healing_hash(message_text, tool_calls)
+    h = _get_healing_hash(message_text, tool_calls, user_context)
     if not h:
         return
     with HEALING_STORE_LOCK:
@@ -2375,10 +2385,12 @@ def _prewarm_post_compact(
         model_prompt = tokenizer.apply_chat_template(
             original_msgs, tokenize=False, add_generation_prompt=True,
             tools=_LAST_MAIN_TOOLS, enable_thinking=enable_thinking,
+            preserve_thinking=FEATURE_PRESERVE_THINKING,
         )
         cache_prompt_raw = tokenizer.apply_chat_template(
             canonical_msgs, tokenize=False, add_generation_prompt=True,
             tools=_LAST_MAIN_TOOLS, enable_thinking=enable_thinking,
+            preserve_thinking=FEATURE_PRESERVE_THINKING,
         )
     else:
         _terminal_status("⚠️",
@@ -4123,6 +4135,7 @@ class SidecarHandler(BaseHTTPRequestHandler):
                     tokenize=False,
                     add_generation_prompt=True,
                     enable_thinking=_enable_thinking,
+                    preserve_thinking=FEATURE_PRESERVE_THINKING,
                 )
             else:
                 prompt = prepared[-1]["content"] if prepared else ""
@@ -4234,6 +4247,7 @@ class SidecarHandler(BaseHTTPRequestHandler):
                 tokenize=False,
                 add_generation_prompt=True,
                 enable_thinking=False,
+                preserve_thinking=FEATURE_PRESERVE_THINKING,
             )
             retry_tokens = _tokenize_prompt(retry_prompt)
             retry_cache = make_prompt_cache(model)
@@ -5130,6 +5144,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     add_generation_prompt=True,
                     tools=tools,
                     enable_thinking=enable_thinking,
+                    preserve_thinking=FEATURE_PRESERVE_THINKING,
                 )
                 cache_prompt_raw = tokenizer.apply_chat_template(
                     cache_messages,
@@ -5137,6 +5152,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     add_generation_prompt=True,
                     tools=tools,
                     enable_thinking=enable_thinking,
+                    preserve_thinking=FEATURE_PRESERVE_THINKING,
                 )
             else:
                 prompt = messages[-1]["content"] if messages else ""
@@ -5909,10 +5925,12 @@ class APIHandler(BaseHTTPRequestHandler):
                         prompt = tokenizer.apply_chat_template(
                             messages, tokenize=False, add_generation_prompt=True,
                             tools=tools, enable_thinking=enable_thinking,
+                            preserve_thinking=FEATURE_PRESERVE_THINKING,
                         )
                         cache_prompt_raw = tokenizer.apply_chat_template(
                             cache_messages, tokenize=False, add_generation_prompt=True,
                             tools=tools, enable_thinking=enable_thinking,
+                            preserve_thinking=FEATURE_PRESERVE_THINKING,
                         )
                     else:
                         prompt = messages[-1]["content"] if messages else ""
@@ -6253,7 +6271,14 @@ class APIHandler(BaseHTTPRequestHandler):
                     if _thinking_tracker.responding_count == 0 and _thinking_tracker.thinking_count > 0:
                         message_text = ""
 
-                    _update_healing_store(raw_response_text, message_text, tool_calls)
+                    # Extract last user message for healing hash context
+                    _heal_user_ctx = ""
+                    for _hm in reversed(raw_messages):
+                        if (_hm.get("role") or "").strip().lower() == "user":
+                            _hc = _hm.get("content", "")
+                            _heal_user_ctx = _hc if isinstance(_hc, str) else str(_hc)[:500]
+                            break
+                    _update_healing_store(raw_response_text, message_text, tool_calls, _heal_user_ctx)
 
                 finish_reason = "tool_calls" if tool_calls else "stop"
                 # LOOP BREAK ESCALATION: if LOOP_BREAK fired but model still
@@ -6958,7 +6983,14 @@ class APIHandler(BaseHTTPRequestHandler):
                 # the client time out. Now they run AFTER the response is
                 # fully delivered to the client.
                 if enable_thinking:
-                    _update_healing_store(raw_full_text, message_text, tool_calls)
+                    # Extract last user message for healing hash context
+                    _heal_user_ctx = ""
+                    for _hm in reversed(raw_messages):
+                        if (_hm.get("role") or "").strip().lower() == "user":
+                            _hc = _hm.get("content", "")
+                            _heal_user_ctx = _hc if isinstance(_hc, str) else str(_hc)[:500]
+                            break
+                    _update_healing_store(raw_full_text, message_text, tool_calls, _heal_user_ctx)
 
                 cache_key.extend(generated_tokens)
                 with prompt_cache_lock:

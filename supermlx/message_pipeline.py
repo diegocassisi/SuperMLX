@@ -67,15 +67,22 @@ class SessionContext:
 # ── Pure functions ───────────────────────────────────────────────────────────
 
 def _get_healing_hash(
-    text: str, tool_calls: Optional[List[Dict[str, Any]]] = None
+    text: str, tool_calls: Optional[List[Dict[str, Any]]] = None,
+    user_context: str = "",
 ) -> Optional[str]:
-    """Creates a robust SHA-256 hash of the assistant's output."""
+    """Creates a robust SHA-256 hash of the assistant's output + context.
+
+    Includes the preceding user message to prevent cross-conversation
+    collisions (e.g. two 'Done' responses to different questions).
+    """
     base = (text or "").strip()
     if tool_calls:
         try:
             base += json.dumps(tool_calls, sort_keys=True)
         except Exception:
             pass
+    if user_context:
+        base += "\x00" + user_context.strip()
     if not base:
         return None
     return hashlib.sha256(base.encode("utf-8")).hexdigest()
@@ -88,13 +95,18 @@ def _heal_messages(
 ) -> List[Dict[str, Any]]:
     """Swap stripped assistant messages back to full version (with <think>)."""
     healed = []
+    prev_user_content = ""
     for msg in messages:
         m = dict(msg)
-        if (m.get("role") or "").strip().lower() == "assistant":
+        role = (m.get("role") or "").strip().lower()
+        if role == "user":
+            c = m.get("content", "")
+            prev_user_content = c if isinstance(c, str) else str(c)[:500]
+        elif role == "assistant":
             content = m.get("content", "")
             tool_calls = m.get("tool_calls")
             if isinstance(content, str):
-                h = _get_healing_hash(content, tool_calls)
+                h = _get_healing_hash(content, tool_calls, prev_user_content)
                 if h:
                     with healing_store_lock:
                         if h in healing_store:
@@ -107,7 +119,7 @@ def _heal_messages(
                 for part in content:
                     if isinstance(part, dict) and part.get("type") == "text":
                         text_part = part.get("text") or part.get("content") or ""
-                        h = _get_healing_hash(text_part, tool_calls)
+                        h = _get_healing_hash(text_part, tool_calls, prev_user_content)
                         if h:
                             with healing_store_lock:
                                 if h in healing_store:
