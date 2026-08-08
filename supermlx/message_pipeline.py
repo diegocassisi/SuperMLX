@@ -153,17 +153,22 @@ def _inject_loop_stop(
     tool_name: str, count: int, mode: str, request_id: str,
     instruction: str, log_fn: Optional[Callable] = None,
 ) -> Tuple[List[Dict[str, Any]], int]:
-    """Inject a stop instruction into the last tool result to break the loop."""
+    """Inject a stop instruction as a separate user message after the tool result.
+
+    Previously this appended the instruction directly into the tool result's
+    content, contaminating tool data with system directives. Now the tool
+    result stays clean and the instruction goes in a separate message.
+    """
     messages = list(messages)
-    messages[tool_idx] = dict(messages[tool_idx])
-    original_content = str(messages[tool_idx].get("content", ""))
-    messages[tool_idx]["content"] = original_content + f"\n\n⚠️ SYSTEM LOOP BREAKER: {instruction}"
+    # Insert a user message AFTER the tool result — keeps tool content clean
+    stop_msg = {"role": "user", "content": instruction}
+    messages.insert(tool_idx + 1, stop_msg)
     if log_fn:
         log_fn(
             "LOOP_BREAK", request_id,
             f"ACTIVATED ({mode}) | tool='{tool_name}' | "
             f"consecutive_calls={count} | "
-            f"injected stop instruction at msg[{tool_idx}]",
+            f"injected stop instruction as user msg after msg[{tool_idx}]",
         )
     return messages, count
 
