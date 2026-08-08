@@ -4775,10 +4775,6 @@ class APIHandler(BaseHTTPRequestHandler):
                 f"| pass-through (no truncation)")
 
 
-        # Always estimate prompt tokens — needed for Anthropic usage reporting
-        # even when FEATURE_FULL_LOGGING is off.
-        _est_tok = _estimate_token_count(raw_messages_inbound)
-
         if FEATURE_FULL_LOGGING:
             _roles = _count_roles(raw_messages_inbound)
             _roles_str = ", ".join(f"{r}:{c}" for r, c in sorted(_roles.items()))
@@ -4799,7 +4795,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 f"stream={body.get('stream', False)} | model={body.get('model', '?')} | "
                 f"thinking={enable_thinking}")
             _pipeline_log("INBOUND", request_id,
-                f"estimated_tokens={_est_tok} | tools={len(tools) if tools else 0} | "
+                f"tools={len(tools) if tools else 0} | "
                 f"last_user_msg=\"{_last_user}\"")
             if FEATURE_LOG_PROMPTS:
                 _pipeline_log("INBOUND", request_id, "messages dumped to disk",
@@ -5172,10 +5168,6 @@ class APIHandler(BaseHTTPRequestHandler):
                     f"delta={cache_key_delta_chars} chars | normalized={prompt_was_normalized}")
                 _pipeline_log("CANON", request_id,
                     f"prompt_tokens={len(prompt_tokens)} | model_tokens={len(model_tokens)}")
-                _real_tok = len(model_tokens)
-                _delta_pct = ((_real_tok - _est_tok) / max(1, _est_tok)) * 100
-                _pipeline_log("TOKENS", request_id,
-                    f"estimated={_est_tok} | real={_real_tok} | delta={_delta_pct:+.1f}%")
                 if FEATURE_LOG_PROMPTS:
                     _pipeline_log("CANON", request_id, "prompts dumped to disk",
                         data={"model_prompt_len": len(prompt),
