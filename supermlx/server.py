@@ -3526,6 +3526,12 @@ if FEATURE_DIAGNOSTIC_HEADERS:
     _active_features.append("DiagHeaders")
 if FEATURE_FULL_LOGGING:
     _active_features.append("FullLog")
+if FEATURE_PRESERVE_THINKING:
+    _active_features.append("PreserveThinking")
+if FEATURE_HEALING:
+    _active_features.append("Healing")
+if FEATURE_TOOL_LOOP_BREAKER:
+    _active_features.append("LoopBreaker")
 _terminal_status(
     "🏁",
     f"Active features: [{', '.join(_active_features) if _active_features else 'BASE ONLY'}]"
