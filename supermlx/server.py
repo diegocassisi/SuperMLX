@@ -4592,18 +4592,12 @@ class APIHandler(BaseHTTPRequestHandler):
             body = anthropic_to_openai_body(raw, SETTINGS.proxy_model_id)
 
             if _hermes_compact_swapped:
-                # Compact invalidates the entire conversation cache.
-                # Evict BEFORE generation to free memory for the large compact
-                # prefill and ensure no stale entries survive.
-                with prompt_cache_lock:
-                    PROMPT_CACHE.evict_unpinned()
-                import gc; gc.collect()
-                _terminal_status("🧹",
-                    "COMPACT EVICTION: cleared PROMPT_CACHE — next request will rebuild via TPC warmup")
-                # Signal to _handle_chat_completion to skip cache store.
-                # The compact's cache (serialized conversation + instructions)
-                # is a one-off and must NOT be stored — only the RESULT matters,
-                # which Hermes will send as the next normal request.
+                # Signal to _handle_chat_completion to treat this as housekeeping.
+                # The HOUSEKEEPING_CACHE_BORROW mechanism will:
+                # 1. Snapshot the conversation cache before compact generation
+                # 2. Generate the summary (compact prompt)
+                # 3. Restore the conversation cache after generation
+                # This avoids the cold start that was caused by evicting here.
                 body["_supermlx_compact"] = True
 
             # Jump past the body-parse block that follows.
