@@ -147,10 +147,19 @@ def _heal_messages(
                                 f"first={_ct_first}"
                             )
                         else:
+                            _tc_miss_detail = ""
+                            if tool_calls:
+                                for _ti, _t in enumerate(tool_calls[:2]):
+                                    _fn = _t.get("function", {})
+                                    _tc_miss_detail += (
+                                        f" | tc[{_ti}]={{id={_t.get('id','')[:16]}, "
+                                        f"args_len={len(_fn.get('arguments',''))}}}"
+                                    )
                             _log_lines.append(
                                 f"  [HEAL_LOOKUP] idx={len(healed)} MISS | hash={h[:16]} | "
                                 f"content_len={len(_ct)} | tc={_tc_n} | user_ctx_len={_uc_n} | "
                                 f"first={_ct_first} | store_keys={[k[:16] for k in healing_store.keys()]}"
+                                + _tc_miss_detail
                             )
             elif isinstance(content, list):
                 new_content = []

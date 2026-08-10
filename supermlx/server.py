@@ -2379,12 +2379,27 @@ def _update_healing_store(raw_text: str, message_text: str, tool_calls: Optional
     _raw_n = len(raw_text) if raw_text else 0
     _mt_first = repr(_mt[:60]) if _mt else "''"
     _mt_last = repr(_mt[-40:]) if len(_mt) > 60 else ""
+    # Build tool_call detail for diagnostic
+    _tc_detail = ""
+    if tool_calls:
+        for _ti, _t in enumerate(tool_calls[:2]):  # max 2
+            _fn = _t.get("function", {})
+            _args_str = _fn.get("arguments", "")
+            try:
+                _akeys = list(json.loads(_args_str).keys())
+            except Exception:
+                _akeys = []
+            _tc_detail += (
+                f" | tc[{_ti}]={{id={_t.get('id','')[:16]}, fn={_fn.get('name','')}, "
+                f"args_len={len(_args_str)}, args_keys={_akeys}}}"
+            )
     with console_lock:
         _console_emit(
             f"  [HEAL_STORE] SAVE | hash={h[:16]} | "
             f"msg_text_len={len(_mt)} | tc={_tc_n} | user_ctx_len={_uc_n} | "
             f"raw_len={_raw_n} | first={_mt_first}"
             + (f" | last={_mt_last}" if _mt_last else "")
+            + _tc_detail
         )
     with HEALING_STORE_LOCK:
         HEALING_STORE[h] = raw_text
