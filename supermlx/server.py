@@ -3375,7 +3375,7 @@ else:
     _terminal_status("✅", "Model loaded (mlx-lm).")
 
     # ── OPT-IN: JIT compile model forward pass for fused ops ────────────
-    if os.environ.get("SUPERMLX_COMPILE_MODEL", "").strip() == "1":
+    if SETTINGS.compile_model:
         try:
             model = mx.compile(model)
             _terminal_status("⚡", "Model wrapped with mx.compile (SUPERMLX_COMPILE_MODEL=1)")
@@ -3926,7 +3926,7 @@ def _adaptive_prefill(
         model(chunk, cache=prompt_cache)
 
         # Materialize cache + free scratch
-        _eval_fn = mx.async_eval if os.environ.get("SUPERMLX_ASYNC_PREFILL", "").strip() == "1" else mx.eval
+        _eval_fn = mx.async_eval if SETTINGS.async_prefill else mx.eval
         for c in prompt_cache:
             if hasattr(c, "state"):
                 _eval_fn(c.state)
