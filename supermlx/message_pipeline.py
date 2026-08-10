@@ -78,7 +78,29 @@ def _get_healing_hash(
     base = (text or "").strip()
     if tool_calls:
         try:
-            base += json.dumps(tool_calls, sort_keys=True)
+            # Normalize arguments JSON: the arguments string undergoes
+            # String→Dict→String round-trips across server/client boundary
+            # (e.g. Go's json.Marshal sorts keys alphabetically), so the key
+            # order may differ between SAVE and LOOKUP. Parse and re-serialize
+            # with sorted keys to produce a canonical representation.
+            _normalized_tc = []
+            for tc in tool_calls:
+                tc_copy = dict(tc)
+                fn = tc_copy.get("function")
+                if isinstance(fn, dict):
+                    fn_copy = dict(fn)
+                    args_str = fn_copy.get("arguments", "")
+                    if isinstance(args_str, str) and args_str.strip():
+                        try:
+                            args_dict = json.loads(args_str)
+                            fn_copy["arguments"] = json.dumps(
+                                args_dict, sort_keys=True, ensure_ascii=False
+                            )
+                        except (json.JSONDecodeError, TypeError):
+                            pass  # Keep original if not valid JSON
+                    tc_copy["function"] = fn_copy
+                _normalized_tc.append(tc_copy)
+            base += json.dumps(_normalized_tc, sort_keys=True)
         except Exception:
             pass
     if user_context:
