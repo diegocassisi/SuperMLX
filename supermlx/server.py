@@ -2347,6 +2347,18 @@ def _update_healing_store(raw_text: str, message_text: str, tool_calls: Optional
         raw_text = _strip_thinking_from_content(raw_text)
     if raw_text == message_text:
         return
+    # FIX: _strip_thinking_from_content has a safety guard that refuses to return
+    # empty string. When the model generates thinking + </think> + tool_calls with
+    # no visible text, strip produces "" which the guard rejects, leaving the
+    # thinking text in message_text. But the CLIENT receives content="" (thinking
+    # was sent as a separate SSE block). Force-normalize so the hash matches.
+    if message_text and '</think>' in message_text:
+        _after_think = re.sub(
+            r'^.*?</think>\s*', '', message_text,
+            flags=re.DOTALL | re.IGNORECASE
+        ).strip()
+        if not _after_think:
+            message_text = ""
     h = _get_healing_hash(message_text, tool_calls, user_context)
     if not h:
         return
