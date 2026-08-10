@@ -2348,17 +2348,27 @@ def _update_healing_store(raw_text: str, message_text: str, tool_calls: Optional
     if raw_text == message_text:
         return
     # FIX: _strip_thinking_from_content has a safety guard that refuses to return
-    # empty string. When the model generates thinking + </think> + tool_calls with
-    # no visible text, strip produces "" which the guard rejects, leaving the
-    # thinking text in message_text. But the CLIENT receives content="" (thinking
-    # was sent as a separate SSE block). Force-normalize so the hash matches.
-    if message_text and '</think>' in message_text:
+    # empty string, and its line 190 may strip the </think> TAG while leaving
+    # the thinking TEXT. In both cases message_text has thinking residue that the
+    # client never sees (thinking is sent as a separate SSE block).
+    # Derive the client-visible portion directly from raw_text, which always
+    # preserves the </think> boundary marker.
+    if message_text and re.search(r'</think>', raw_text, re.IGNORECASE):
         _after_think = re.sub(
-            r'^.*?</think>\s*', '', message_text,
+            r'^.*?</think>\s*', '', raw_text,
+            flags=re.DOTALL | re.IGNORECASE
+        )
+        # Remove tool call blocks (already extracted into tool_calls param)
+        _after_think = re.sub(
+            r'<tool_call>.*?</tool_call>', '', _after_think,
             flags=re.DOTALL | re.IGNORECASE
         ).strip()
-        if not _after_think:
-            message_text = ""
+        # Strip residual orphan tags
+        _after_think = re.sub(
+            r'</(?:think|tool_call)>\s*', '', _after_think,
+            flags=re.IGNORECASE
+        ).strip()
+        message_text = _after_think
     h = _get_healing_hash(message_text, tool_calls, user_context)
     if not h:
         return
