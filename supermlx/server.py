@@ -36,7 +36,7 @@ warmup_manager.py handles DPC. rag_enricher.py handles RAG/Compressor.
       python SuperMLX.py
 
   Endpoints:
-    LiteLLM Proxy:  http://0.0.0.0:4000/v1/chat/completions  (point your framework here)
+   REMOVED!!! LiteLLM Proxy:  http://0.0.0.0:4000/v1/chat/completions  (point your framework here)
     MLX Direct:     http://0.0.0.0:8080/v1/chat/completions
     Sidecar:        http://0.0.0.0:8081/v1/chat/completions  (scripts, sensors)
 
@@ -2350,6 +2350,20 @@ def _update_healing_store(raw_text: str, message_text: str, tool_calls: Optional
     h = _get_healing_hash(message_text, tool_calls, user_context)
     if not h:
         return
+    # DIAGNOSTIC: log exactly what goes into the hash at storage time
+    _mt = (message_text or "").strip()
+    _tc_n = len(tool_calls) if tool_calls else 0
+    _uc_n = len(user_context.strip()) if user_context else 0
+    _raw_n = len(raw_text) if raw_text else 0
+    _mt_first = repr(_mt[:60]) if _mt else "''"
+    _mt_last = repr(_mt[-40:]) if len(_mt) > 60 else ""
+    with console_lock:
+        _console_emit(
+            f"  [HEAL_STORE] SAVE | hash={h[:16]} | "
+            f"msg_text_len={len(_mt)} | tc={_tc_n} | user_ctx_len={_uc_n} | "
+            f"raw_len={_raw_n} | first={_mt_first}"
+            + (f" | last={_mt_last}" if _mt_last else "")
+        )
     with HEALING_STORE_LOCK:
         HEALING_STORE[h] = raw_text
         HEALING_STORE.move_to_end(h, last=True)
@@ -4899,7 +4913,10 @@ class APIHandler(BaseHTTPRequestHandler):
         if is_vlm:
             raw_messages = body.get("messages", [])
             # --- APPLY STATELESS HEALING ---
-            healed_messages = _heal_messages(raw_messages, HEALING_STORE, HEALING_STORE_LOCK)
+            def _heal_log(line):
+                with console_lock:
+                    _console_emit(line)
+            healed_messages = _heal_messages(raw_messages, HEALING_STORE, HEALING_STORE_LOCK, log_fn=_heal_log)
 
             messages = _prepare_messages_for_vlm(healed_messages, tools=tools)
             images = _extract_images_from_messages(body.get("messages", []))
@@ -5124,7 +5141,10 @@ class APIHandler(BaseHTTPRequestHandler):
             # --- APPLY STATELESS HEALING ---
             _heal_t0 = time.time()
             if FEATURE_HEALING:
-                healed_messages = _heal_messages(raw_messages, HEALING_STORE, HEALING_STORE_LOCK)
+                def _heal_log_main(line):
+                    with console_lock:
+                        _console_emit(line)
+                healed_messages = _heal_messages(raw_messages, HEALING_STORE, HEALING_STORE_LOCK, log_fn=_heal_log_main)
             else:
                 healed_messages = list(raw_messages)
             _heal_ms = (time.time() - _heal_t0) * 1000
@@ -5946,7 +5966,10 @@ class APIHandler(BaseHTTPRequestHandler):
                     _pipeline_timings["emergency_compress"] = time.time()
 
                     # Re-heal, re-canonicalize, re-tokenize
-                    healed_messages = _heal_messages(raw_messages, HEALING_STORE, HEALING_STORE_LOCK)
+                    def _heal_log_emg(line):
+                        with console_lock:
+                            _console_emit(line)
+                    healed_messages = _heal_messages(raw_messages, HEALING_STORE, HEALING_STORE_LOCK, log_fn=_heal_log_emg)
                     original_messages, canonical_messages = _canonicalize_messages(healed_messages, SETTINGS.cache_canonicalize_tool_context)
                     original_messages = _hoist_system_messages(original_messages)
                     canonical_messages = _hoist_system_messages(canonical_messages)

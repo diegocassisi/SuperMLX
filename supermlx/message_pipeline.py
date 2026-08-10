@@ -92,9 +92,11 @@ def _heal_messages(
     messages: List[Dict[str, Any]],
     healing_store: OrderedDict,
     healing_store_lock,
+    log_fn: Optional[Callable[[str], None]] = None,
 ) -> List[Dict[str, Any]]:
     """Swap stripped assistant messages back to full version (with <think>)."""
     healed = []
+    _log_lines: List[str] = []
     prev_user_content = ""
     for msg in messages:
         m = dict(msg)
@@ -108,11 +110,26 @@ def _heal_messages(
             if isinstance(content, str):
                 h = _get_healing_hash(content, tool_calls, prev_user_content)
                 if h:
+                    _tc_n = len(tool_calls) if tool_calls else 0
+                    _uc_n = len(prev_user_content.strip()) if prev_user_content else 0
+                    _ct = content.strip()
+                    _ct_first = repr(_ct[:60]) if _ct else "''"
                     with healing_store_lock:
                         if h in healing_store:
                             m["content"] = healing_store[h]
                             m.pop("tool_calls", None)
                             healing_store.move_to_end(h, last=True)
+                            _log_lines.append(
+                                f"  [HEAL_LOOKUP] idx={len(healed)} HIT  | hash={h[:16]} | "
+                                f"content_len={len(_ct)} | tc={_tc_n} | user_ctx_len={_uc_n} | "
+                                f"first={_ct_first}"
+                            )
+                        else:
+                            _log_lines.append(
+                                f"  [HEAL_LOOKUP] idx={len(healed)} MISS | hash={h[:16]} | "
+                                f"content_len={len(_ct)} | tc={_tc_n} | user_ctx_len={_uc_n} | "
+                                f"first={_ct_first} | store_keys={[k[:16] for k in healing_store.keys()]}"
+                            )
             elif isinstance(content, list):
                 new_content = []
                 healed_any = False
@@ -132,6 +149,9 @@ def _heal_messages(
                 if healed_any:
                     m.pop("tool_calls", None)
         healed.append(m)
+    if log_fn and _log_lines:
+        for line in _log_lines:
+            log_fn(line)
     return healed
 
 
