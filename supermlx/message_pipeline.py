@@ -76,6 +76,11 @@ def _get_healing_hash(
     collisions (e.g. two 'Done' responses to different questions).
     """
     base = (text or "").strip()
+    # Normalize repeated punctuation: Hermes/OpenClaw duplicates trailing
+    # punctuation on each round-trip (e.g. "?" → "??" → "????").
+    # Collapse runs of the same punctuation to a single instance so the
+    # hash matches regardless of how many round-trips the text survived.
+    base = re.sub(r'([?!.])\1+', r'\1', base)
     if tool_calls:
         try:
             # Normalize arguments JSON: the arguments string undergoes
