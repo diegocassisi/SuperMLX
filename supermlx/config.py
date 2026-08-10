@@ -144,8 +144,6 @@ class Settings:
     moe_expert_profile: str           # Path to expert profile JSON for MoE pinning (""=none)
     moe_shallow_pin_layers: int       # Pin top experts in first N MoE layers (0=disabled)
     moe_shallow_pin_top: int          # How many experts to pin per shallow layer
-    compile_model: bool               # Wrap model with mx.compile for JIT op fusion
-    async_prefill: bool               # Use mx.async_eval in adaptive prefill loop
 
 
 def _normalize_model_family(value: Optional[str]) -> str:
@@ -273,6 +271,4 @@ def build_settings(script_dir: Path = Path(__file__).parent) -> Settings:
         moe_expert_profile=_env_str("MOE_EXPERT_PROFILE", ""),
         moe_shallow_pin_layers=_env_int("MOE_SHALLOW_PIN_LAYERS", 5),
         moe_shallow_pin_top=_env_int("MOE_SHALLOW_PIN_TOP", 6),
-        compile_model=_env_bool("SUPERMLX_COMPILE_MODEL", False),
-        async_prefill=_env_bool("SUPERMLX_ASYNC_PREFILL", False),
     )

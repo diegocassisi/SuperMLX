@@ -3373,17 +3373,6 @@ else:
         os.environ.pop("HF_HUB_OFFLINE", None)
         model, tokenizer = load(SETTINGS.model_path, **_load_kwargs)
     _terminal_status("✅", "Model loaded (mlx-lm).")
-
-    # ── OPT-IN: JIT compile model forward pass for fused ops ────────────
-    if SETTINGS.compile_model:
-        try:
-            model = mx.compile(model)
-            _terminal_status("⚡", "Model wrapped with mx.compile (SUPERMLX_COMPILE_MODEL=1)")
-        except Exception as _compile_err:
-            _terminal_status("⚠️", f"mx.compile failed ({_compile_err}) — using uncompiled model")
-    else:
-        _terminal_status("ℹ️", "mx.compile disabled (set SUPERMLX_COMPILE_MODEL=1 to enable)")
-
     _terminal_status("⚡", "Torch acceleration: N/A (text-only model).")
 
     # ── Resolve think token IDs (once, at load) ───────────────────────────
@@ -3926,15 +3915,11 @@ def _adaptive_prefill(
         model(chunk, cache=prompt_cache)
 
         # Materialize cache + free scratch
-        _eval_fn = mx.async_eval if SETTINGS.async_prefill else mx.eval
         for c in prompt_cache:
             if hasattr(c, "state"):
-                _eval_fn(c.state)
+                mx.eval(c.state)
             else:
-                _eval_fn(c)
-        # When async, force sync at chunk boundary to ensure cache is ready for next chunk
-        if _eval_fn is mx.async_eval:
-            mx.eval(prompt_cache[0].state if hasattr(prompt_cache[0], "state") else prompt_cache[0])
+                mx.eval(c)
         mx.clear_cache()
 
         # GPU yield: let other Metal clients (Chrome VideoToolbox) process between chunks
