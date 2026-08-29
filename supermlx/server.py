@@ -758,6 +758,7 @@ from .tool_parsing import (
     _sanitize_tool_calls,
 )
 from .thinking_tracker import ThinkingTracker, ThinkingEvent
+from .thinking_tracker_v2 import ThinkingTrackerV2
 from .tool_call_tracker import ToolCallTracker, ToolCallEvent
 # ── Message pipeline (extracted to message_pipeline.py) ──────────────────────
 from .message_pipeline import (
@@ -3382,12 +3383,29 @@ else:
     else:
         _terminal_status("ℹ️", "Think tokens: not found in vocab — using text-based detection")
     # ThinkingTracker: SSoT for thinking state — created once, reset() per request
-    _thinking_tracker = ThinkingTracker(
-        think_start_id=_think_start_id,
-        think_end_id=_think_end_id,
-        enable_thinking=SETTINGS.default_thinking,
-    )
-    _terminal_status("🧠", "ThinkingTracker initialized (SSoT for thinking state)")
+    if SETTINGS.thinking_budget_mode == "v2":
+        _forced_end_tokens = [_think_end_id] if _think_end_id is not None else []
+        if not _forced_end_tokens:
+            # Fallback: encode </think>
+            try:
+                _forced_end_tokens = list(tokenizer.encode("</think>", add_special_tokens=False))
+            except Exception:
+                _forced_end_tokens = []
+        _thinking_tracker = ThinkingTrackerV2(
+            think_start_id=_think_start_id,
+            think_end_id=_think_end_id,
+            enable_thinking=SETTINGS.default_thinking,
+            budget=SETTINGS.max_thinking_tokens,
+            forced_end_tokens=_forced_end_tokens,
+        )
+        _terminal_status("🧠", f"ThinkingTrackerV2 initialized (logits-forcing mode, budget={SETTINGS.max_thinking_tokens})")
+    else:
+        _thinking_tracker = ThinkingTracker(
+            think_start_id=_think_start_id,
+            think_end_id=_think_end_id,
+            enable_thinking=SETTINGS.default_thinking,
+        )
+        _terminal_status("🧠", "ThinkingTracker v1 initialized (break mode)")
     _tool_call_tracker = ToolCallTracker()
     _terminal_status("🔧", "ToolCallTracker initialized (SSoT for tool call streaming state)")
 
@@ -5306,6 +5324,13 @@ class APIHandler(BaseHTTPRequestHandler):
         rest_count = len(model_tokens)
         request_logger = None
         sampler, logits_processors, sampler_kwargs = _build_sampler(body)
+        # V2: inject reasoning budget logits processor
+        if isinstance(_thinking_tracker, ThinkingTrackerV2):
+            _budget_proc = _thinking_tracker.make_logits_processor()
+            if logits_processors is None:
+                logits_processors = [_budget_proc]
+            else:
+                logits_processors.append(_budget_proc)
         # Always use server DEFAULT_MAX_TOKENS — Claude Code sends max_tokens=8192
         # which truncates long code generation. We override it entirely.
         max_tokens = SETTINGS.default_max_tokens
@@ -5933,6 +5958,8 @@ class APIHandler(BaseHTTPRequestHandler):
                                 max_kv_size=SETTINGS.max_kv_size,
                                 kv_bits=getattr(SETTINGS, "kv_bits", None),
                                 enable_thinking=enable_thinking,
+                                model_path=SETTINGS.model_path,
+                                log_fn=_terminal_status,
                             )
                             if _pc_clone is not None and _ptoks:
                                 _ptok_len = len(_ptoks)
@@ -6291,8 +6318,9 @@ class APIHandler(BaseHTTPRequestHandler):
                     # if _thinking_tracker.is_looping:
                     #     ...
                     #     break
-                    # THINKING_LIMIT
-                    if _thinking_tracker.is_thinking and _max_thinking_ns > 0:
+                    # THINKING_LIMIT (v1 only — v2 handles via logits processor)
+                    if (not isinstance(_thinking_tracker, ThinkingTrackerV2)
+                            and _thinking_tracker.is_thinking and _max_thinking_ns > 0):
                         if _thinking_tracker.thinking_count >= _max_thinking_ns:
                             _terminal_status(
                                 "🛑",
@@ -6314,7 +6342,9 @@ class APIHandler(BaseHTTPRequestHandler):
                         )
                 # ── THINKING CLEANUP (non-stream) ─────────────────────────
                 # If generation ended while still in THINKING state, inject </think>.
-                if enable_thinking and _thinking_tracker.is_thinking and generated_parts:
+                # V2 doesn't need cleanup — </think> was generated via logits processor.
+                if (not isinstance(_thinking_tracker, ThinkingTrackerV2)
+                        and enable_thinking and _thinking_tracker.is_thinking and generated_parts):
                     _joined_tc = "".join(generated_parts)
                     _func_m = re.search(r'<?function=\w', _joined_tc, re.IGNORECASE)
                     if _func_m:
@@ -6645,7 +6675,9 @@ class APIHandler(BaseHTTPRequestHandler):
                                 f"{_think_event.name} at token {len(generated_tokens)} (stream)")
 
                         # THINKING_LIMIT: break if too many tokens in thinking
-                        if _thinking_tracker.is_thinking and _max_thinking > 0:
+                        # V1 only — v2 handles via logits processor (no break needed)
+                        if (not isinstance(_thinking_tracker, ThinkingTrackerV2)
+                                and _thinking_tracker.is_thinking and _max_thinking > 0):
                             if _thinking_tracker.thinking_count >= _max_thinking:
                                 _terminal_status(
                                     "🛑",
@@ -6780,7 +6812,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 # If generation ended while still in THINKING state (e.g. THINKING_LIMIT
                 # or NGRAM_LOOP broke mid-thinking), inject synthetic </think> and
                 # properly transition Anthropic SSE blocks.
-                if enable_thinking and _thinking_tracker.is_thinking and raw_parts:
+                if (not isinstance(_thinking_tracker, ThinkingTrackerV2)
+                        and enable_thinking and _thinking_tracker.is_thinking and raw_parts):
                     _joined_tc = "".join(raw_parts)
                     _func_m = re.search(r'<?function=\w', _joined_tc, re.IGNORECASE)
                     if _func_m:

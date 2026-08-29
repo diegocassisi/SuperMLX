@@ -57,15 +57,22 @@ def init(cache_persist_path: str) -> None:
     logger.info("[CONFIG] tool_prefix_cache dir=%s", _cache_dir)
 
 
-def compute_tools_hash(system_body: str, tools: List[Dict], kv_bits: Optional[int] = None) -> str:
+def compute_tools_hash(
+    system_body: str,
+    tools: List[Dict],
+    kv_bits: Optional[int] = None,
+    model_path: str = "",
+) -> str:
     """
-    Compute a stable MD5 hash over the system body + tool definitions + kv_bits.
+    Compute a stable MD5 hash over the system body + tool definitions + kv_bits + model_path.
 
     Args:
         system_body: System prompt text (billing header stripped).
         tools: Tool definition list from the inbound request.
         kv_bits: KV cache quantization bits (None, 4, or 8). Included in hash
                  so changing quantization invalidates the cached prefix.
+        model_path: Model identifier (e.g. "majentik/Qwen3.8-27B-MLX-3bit").
+                    Included in hash so changing model invalidates the cached prefix.
 
     Returns:
         Hex MD5 string.
@@ -74,6 +81,7 @@ def compute_tools_hash(system_body: str, tools: List[Dict], kv_bits: Optional[in
         system_body + "\x00"
         + json.dumps(tools, sort_keys=True, ensure_ascii=False) + "\x00"
         + str(kv_bits) + "\x00"
+        + str(model_path) + "\x00"
         + str(_TPC_CACHE_VERSION)
     )
     return hashlib.md5(payload.encode("utf-8")).hexdigest()
@@ -210,6 +218,7 @@ def compute_and_save(
     kv_bits: Optional[int],
     enable_thinking: bool = False,
     prefill_step_size: int = 512,
+    log_fn: Optional[Any] = None,
 ) -> bool:
     """
     Tokenize system_body + tools, run prefill-only forward pass, save KV to disk.
@@ -227,14 +236,17 @@ def compute_and_save(
         kv_bits: Bits for KV quantization (None = no quantization).
         enable_thinking: Whether to enable thinking mode in chat template.
         prefill_step_size: Chunk size for prefill progress.
+        log_fn: Optional callable(emoji, msg) for visible console logging.
 
     Returns:
         True on success, raises on failure.
     """
+    _log = log_fn or (lambda e, m: None)
     global _prefix_cache, _prefix_tokens, _prefix_hash
 
     t0 = time.time()
     logger.info("[INICIO] tool_prefix_cache.compute_and_save | kv_bits=%s", kv_bits)
+    _log("🔧", f"TPC: recomputing tool prefix KV cache (hash changed) | kv_bits={kv_bits}")
 
     # Build a minimal messages list: one system message with system_body only,
     # no user/assistant turns. Tools are injected via the tools= kwarg.
@@ -273,6 +285,7 @@ def compute_and_save(
         prefix_tokens = tokenizer.encode(system_body, add_special_tokens=True)
 
     logger.info("[DATA] prefix tokens=%d", len(prefix_tokens))
+    _log("🔧", f"TPC: prefilling {len(prefix_tokens)} tokens (this may take minutes for large models)...")
 
     # Create fresh KV cache
     prefix_prompt = mx.array(prefix_tokens)
@@ -298,6 +311,7 @@ def compute_and_save(
 
     elapsed_prefill = int((time.time() - t0) * 1000)
     logger.info("[CALC] prefill done | elapsed=%dms", elapsed_prefill)
+    _log("✅", f"TPC: prefill complete | {len(prefix_tokens)} tokens | {elapsed_prefill}ms")
 
     # Save to disk
     ok = save_cache(prefix_tokens, cache, _kv_path(), prefix_hash=tools_hash, log_fn=_log_fn)
@@ -328,6 +342,8 @@ def get_prefix_cache_clone(
     max_kv_size: Optional[int],
     kv_bits: Optional[int],
     enable_thinking: bool = False,
+    model_path: str = "",
+    log_fn: Optional[Any] = None,
 ) -> Tuple[Optional[List[Any]], Optional[List[int]], bool]:
     """
     Main entry point for server.py.
@@ -355,7 +371,7 @@ def get_prefix_cache_clone(
         logger.warning("[DECISION] tool_prefix_cache not initialized — skipping")
         return None, None, False
 
-    current_hash = compute_tools_hash(system_body, tools, kv_bits=kv_bits)
+    current_hash = compute_tools_hash(system_body, tools, kv_bits=kv_bits, model_path=model_path)
 
     if _prefix_hash != current_hash or _prefix_cache is None:
         reason = "hash_mismatch" if _prefix_cache is not None else "cold_start"
@@ -372,6 +388,7 @@ def get_prefix_cache_clone(
             max_kv_size=max_kv_size,
             kv_bits=kv_bits,
             enable_thinking=enable_thinking,
+            log_fn=log_fn,
         )
         was_recomputed = True
     else:

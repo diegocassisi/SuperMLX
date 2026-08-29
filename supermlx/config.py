@@ -122,6 +122,7 @@ class Settings:
     enable_request_logging: bool
     default_thinking: bool
     max_thinking_tokens: int            # Max tokens in <think> block before forcing transition (0=unlimited)
+    thinking_budget_mode: str            # "v1" (break+inject) | "v2" (logits forcing, KV-consistent)
     vlm_cache_debug: bool
     normalize_write_tool_content_for_prompt: bool
     cache_canonicalize_tool_context: bool
@@ -227,6 +228,7 @@ def build_settings(script_dir: Path = Path(__file__).parent) -> Settings:
         enable_request_logging=_env_bool("ENABLE_REQUEST_LOGGING", True),
         default_thinking=_env_bool("DEFAULT_THINKING", True),
         max_thinking_tokens=_env_int("MAX_THINKING_TOKENS", 4096),
+        thinking_budget_mode=_env_str("THINKING_BUDGET_MODE", "v1"),
         vlm_cache_debug=_env_bool("VLM_CACHE_DEBUG", False),
         normalize_write_tool_content_for_prompt=_env_bool(
             "NORMALIZE_WRITE_TOOL_CONTENT_FOR_PROMPT", False
