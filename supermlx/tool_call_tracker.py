@@ -165,6 +165,7 @@ class ToolCallTracker:
     def finalize(self) -> Optional[ToolCallEvent]:
         """Call when generation ends (EOS). Handles incomplete tool calls
         and flushes remaining pending text."""
+        self._flushable = ""
         if self._state == ToolCallState.BUFFERING:
             # Tool call never closed — mark as incomplete
             has_params = "<parameter" in self._tool_buffer
