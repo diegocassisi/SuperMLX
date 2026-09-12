@@ -6817,30 +6817,30 @@ class APIHandler(BaseHTTPRequestHandler):
                                 _n_gen >= _NGRAM_SIZE * 2
                                 and _n_gen % _NGRAM_CHECK_INTERVAL == 0
                             ):
-                            _tail = tuple(generated_tokens[-_NGRAM_SIZE:])
-                            _search_region = generated_tokens[:-_NGRAM_SIZE]
-                            # Limit search to recent window — real loops are nearby
-                            _window_start = max(0, len(_search_region) - _NGRAM_WINDOW)
-                            _search_region = _search_region[_window_start:]
-                            _repeat_count = 0
-                            for _si in range(len(_search_region) - _NGRAM_SIZE + 1):
-                                if tuple(_search_region[_si:_si + _NGRAM_SIZE]) == _tail:
-                                    _repeat_count += 1
-                                    if _repeat_count >= _NGRAM_MAX_REPEATS:
-                                        break
-                            if _repeat_count >= _NGRAM_MAX_REPEATS:
-                                _terminal_status(
-                                    "🛑",
-                                    f"NGRAM LOOP: {_NGRAM_SIZE}-token sequence repeated "
-                                    f"{_repeat_count + 1}x after {_n_gen} tokens. "
-                                    f"Forcing generation stop.",
-                                    indent=1,
-                                )
-                                _pipeline_log("GEN", request_id,
-                                    f"NGRAM_LOOP_BREAK: {_NGRAM_SIZE}-gram repeated "
-                                    f"{_repeat_count + 1}x at token {_n_gen}. "
-                                    f"Breaking generation loop.")
-                                break
+                                _tail = tuple(generated_tokens[-_NGRAM_SIZE:])
+                                _search_region = generated_tokens[:-_NGRAM_SIZE]
+                                # Limit search to recent window — real loops are nearby
+                                _window_start = max(0, len(_search_region) - _NGRAM_WINDOW)
+                                _search_region = _search_region[_window_start:]
+                                _repeat_count = 0
+                                for _si in range(len(_search_region) - _NGRAM_SIZE + 1):
+                                    if tuple(_search_region[_si:_si + _NGRAM_SIZE]) == _tail:
+                                        _repeat_count += 1
+                                        if _repeat_count >= _NGRAM_MAX_REPEATS:
+                                            break
+                                if _repeat_count >= _NGRAM_MAX_REPEATS:
+                                    _terminal_status(
+                                        "🛑",
+                                        f"NGRAM LOOP: {_NGRAM_SIZE}-token sequence repeated "
+                                        f"{_repeat_count + 1}x after {_n_gen} tokens. "
+                                        f"Forcing generation stop.",
+                                        indent=1,
+                                    )
+                                    _pipeline_log("GEN", request_id,
+                                        f"NGRAM_LOOP_BREAK: {_NGRAM_SIZE}-gram repeated "
+                                        f"{_repeat_count + 1}x at token {_n_gen}. "
+                                        f"Breaking generation loop.")
+                                    break
                         if response_text:
                             raw_parts.append(response_text)
                             # ── ANTHROPIC LIVE STREAMING (tracker-based) ────
