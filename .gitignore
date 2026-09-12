@@ -6,6 +6,11 @@ __pycache__/
 
 # === CONFIGURACIÓN LOCAL (secretos, paths locales) ===
 .env
+.env.*
+!.env.example
+*.swp
+*.bak*
+backup/
 
 # === RUNTIME (generado por el servidor) ===
 logs/

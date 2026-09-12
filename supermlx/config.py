@@ -1,8 +1,15 @@
 # SPDX-License-Identifier: MIT
 """
-SuperMLX configuration: environment helpers, Settings dataclass, model family detection.
-
-All functions are pure (read env → return value). No side effects.
+[AI_DIRECTIVE]
+ROL: SuperMLX configuration: environment helpers, Settings dataclass, model family detection.
+OBJETIVO: Cargar, validar y centralizar todas las variables de configuración del servidor desde .env y entorno.
+ENTRADAS: Variables de entorno del sistema operativo / archivo .env
+SALIDAS: Instancia inmutable Settings con tipado y valores por defecto calibrados
+REGLAS INVIOLABLES:
+- Prohibido hardcoding de rutas o números mágicos fuera de los defaults declarados
+- Prohibida la lógica con efectos secundarios; todas las funciones deben ser puras
+- Obligatorio mantener paridad de tipado estricto con Settings dataclass
+SSoT: Este módulo es la única fuente de verdad (SSoT) para la configuración del servidor.
 """
 import os
 from dataclasses import dataclass
@@ -111,6 +118,10 @@ class Settings:
     kv_quant_scheme: str
     quantized_kv_start: int
     default_temperature: float
+    thinking_temperature: float
+    response_temperature: float
+    tool_calling_temperature: float
+    compaction_temperature: float
     default_top_p: float
     default_top_k: int
     default_min_p: float
@@ -215,6 +226,10 @@ def build_settings(script_dir: Path = Path(__file__).parent) -> Settings:
         #cambiado por diego, original 50
         quantized_kv_start=_env_int("QUANTIZED_KV_START", 0),
         default_temperature=_env_float("DEFAULT_TEMPERATURE", 0.6),
+        thinking_temperature=_env_float("THINKING_TEMPERATURE", 0.50),
+        response_temperature=_env_float("RESPONSE_TEMPERATURE", 0.10),
+        tool_calling_temperature=_env_float("TOOL_CALLING_TEMPERATURE", 0.10),
+        compaction_temperature=_env_float("COMPACTION_TEMPERATURE", 0.20),
         default_top_p=_env_float("DEFAULT_TOP_P", 0.95),
         default_top_k=_env_int("DEFAULT_TOP_K", 20),
         default_min_p=_env_float("DEFAULT_MIN_P", 0.0),

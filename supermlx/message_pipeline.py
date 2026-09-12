@@ -400,10 +400,15 @@ def _is_slug_gen_request(messages: List[Dict[str, Any]]) -> bool:
 def _is_title_gen_request(messages: List[Dict[str, Any]]) -> bool:
     """Detects title generation auxiliary requests from Hermes or Claude Code.
 
-    Hermes signature (agent/title_generator.py):
+    Hermes old format (agent/title_generator.py):
       - 2 messages: system + user
       - System contains "descriptive title" and "3-7 words"
       - User starts with "User: " and contains "Assistant: "
+
+    Hermes new format (2026-08+):
+      - 2 messages: system + user
+      - System: "You name chat sessions... write a title" + "3-7 words"
+      - User: raw user message directly (no "User:/Assistant:" wrapper)
 
     Claude Code signature (OpenClaw):
       - 2 messages: system + user
@@ -423,14 +428,20 @@ def _is_title_gen_request(messages: List[Dict[str, Any]]) -> bool:
             user_msg = content
     if not sys_msg or not user_msg:
         return False
-    # Common: both formats require "3-7 words" in system prompt
-    if "3-7 words" not in sys_msg:
+    # Common: all title-gen formats mention a word-count constraint.
+    # Old format: "3-7 words" | New Hermes format: "3 to 7 words"
+    if "3-7 words" not in sys_msg and "3 to 7 words" not in sys_msg:
         return False
-    # Hermes: "descriptive title" + "User: ... Assistant: ..."
+    # Hermes (old format): "descriptive title" + "User: ... Assistant: ..."
     if "descriptive title" in sys_msg and user_msg.startswith("User: ") and "Assistant: " in user_msg:
         return True
     # Claude Code: "sentence-case title" + <session> tags
     if "sentence-case title" in sys_msg and "<session>" in user_msg:
+        return True
+    # Hermes (new format 2026-08+): "you name chat sessions" + "write a title" in system.
+    # User message is the raw conversation text — no "User:/Assistant:" wrapper.
+    # Both signals together are highly specific; false-positive risk is negligible.
+    if "you name chat" in sys_msg and "write a title" in sys_msg:
         return True
     return False
 

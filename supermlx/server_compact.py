@@ -31,6 +31,26 @@ def _env_int(key: str, default: int) -> int:
         return default
 
 
+def _env_float(key: str, default: float) -> float:
+    v = os.environ.get(key, "")
+    try:
+        return float(v)
+    except (ValueError, TypeError):
+        return default
+
+
+def _compact_temperature() -> float:
+    return _env_float("COMPACTION_TEMPERATURE", 0.20)
+
+
+def _compact_min_p() -> float:
+    return _env_float("DEFAULT_MIN_P", 0.04)
+
+
+def _compact_top_p() -> float:
+    return _env_float("DEFAULT_TOP_P", 1.0)
+
+
 # Max tokens for the compact call itself (conversation + prompt).
 # Must be below OOM threshold. Default 35K leaves room for the ~2K prompt.
 def _max_safe_compact_tokens() -> int:
@@ -43,12 +63,12 @@ def _compact_tail_count() -> int:
 
 
 # Max output tokens for the summary generation.
-COMPACT_MAX_OUTPUT_TOKENS = 4096
+COMPACT_MAX_OUTPUT_TOKENS = 8192
 
 
 # ── Compact Prompt (from Claude Code compact/prompt.ts) ───────────────────────
 
-COMPACT_PROMPT = """Your task is to create a detailed summary of the conversation so far, paying close attention to the user's explicit requests and your previous actions.
+COMPACT_PROMPT2 = """Your task is to create a detailed summary of the conversation so far, paying close attention to the user's explicit requests and your previous actions.
 This summary should be thorough in capturing technical details, code patterns, and architectural decisions that would be essential for continuing development work without losing context.
 
 Before providing your final summary, wrap your analysis in <analysis> tags to organize your thoughts and ensure you've covered all necessary points. In your analysis process:
@@ -83,6 +103,44 @@ CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.
 Your entire response must be an <analysis> block followed by a <summary> block.
 
 Please provide your summary based on the conversation so far, following this structure and ensuring precision and thoroughness in your response."""
+
+COMPACT_PROMPT = """Your task is to create a detailed summary of the conversation so far, paying close attention to the user's explicit requests and your previous actions.
+This summary should be thorough in capturing technical decisions, architectural patterns, and exact state needed to resume development without losing continuity.
+
+CRITICAL INSTRUCTIONS ON CODE AND FILES:
+- Files on disk are the Single Source of Truth (SSoT). Do NOT output full file contents or full code snippets for files that already exist on disk. Reference them by exact path, current status, and key function signatures/exports.
+- Ephemeral / unsaved code: If there is an in-progress draft, uncommitted snippet, or code that failed before being written to disk, DO preserve that specific snippet verbatim so work is not lost.
+- Active working frontier: For the file actively being modified right before this summary, specify: exact path, the specific function/section in progress, and the immediate next change needed.
+- Log clipping vs errors: Markers like "[payload omitted for context compaction — see file on disk]" or "...[tool output omitted for context compaction]" in tool call history are purely prompt length limits for this summary. They are NOT runtime errors, tool failures, or file corruptions. Never report a tool call as corrupted or failed simply because its serialized arguments were clipped for length.
+
+Before providing your final summary, use your internal reasoning to analyze the conversation and ensure you've covered all necessary points:
+
+1. Chronologically analyze each message and section of the conversation:
+   - The user's explicit requests, intents, and feedback
+   - Your approach to addressing the requests
+   - Key architectural decisions, concepts, and interfaces
+   - Files created or modified (paths and status)
+   - Real errors encountered (actual command failures or exceptions) and how they were resolved
+2. Double-check for technical accuracy and avoid assuming that clipped tool displays represent broken files.
+
+Your summary should include the following sections:
+
+1. Primary Request and Intent: Capture all of the user's explicit requests and intents in detail.
+2. Key Technical Concepts: List all important technical concepts, architectures, and conventions agreed upon.
+3. Files and Code Status:
+   - Existing files on disk: List exact paths, roles, and key exports/APIs. (NO full file bodies).
+   - In-flight / unsaved drafts: Include any pending code snippet that was NOT yet saved to disk.
+4. Errors and Fixes: List genuine errors encountered (compiler/runtime errors, test failures, user corrections) and their fixes. Do NOT invent errors from clipped tool arguments.
+5. All User Messages: List key user messages and corrections (critical for understanding changing intent).
+6. Pending Tasks: Outline tasks explicitly requested by the user that remain to be done.
+7. Current Work & Next Step:
+   - Active file and exact location of current work.
+   - Specific, concrete next action to resume immediately without asking clarifying questions.
+
+CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.
+Provide the summary directly under <summary>...</summary> tags. Do NOT output an <analysis> block; use your internal reasoning for analysis.
+
+Please provide your summary based on the conversation so far, following this structure."""
 
 
 COMPACT_USER_WRAPPER = """This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
@@ -126,7 +184,7 @@ def serialize_messages_to_text(messages: List[Dict[str, Any]], max_chars: int = 
                     args = json.dumps(args, ensure_ascii=False)
                 # Truncate very long args (file writes, etc.)
                 if len(args) > 500:
-                    args = args[:500] + "...[truncated]"
+                    args = args[:500] + "...[payload omitted for context compaction — see file on disk]"
                 lines.append(f"[{role}] Tool call: {name}({args})")
 
         if isinstance(content, list):
@@ -151,14 +209,14 @@ def serialize_messages_to_text(messages: List[Dict[str, Any]], max_chars: int = 
         if content:
             # Truncate very long individual messages (tool results, file reads)
             if len(content) > 2000 and role == "tool":
-                content = content[:2000] + "\n...[truncated tool output]"
+                content = content[:2000] + "\n...[tool output omitted for context compaction]"
             lines.append(f"[{role}] {content}")
 
     full_text = "\n\n".join(lines)
 
     # Truncate from HEAD if too long
     if len(full_text) > max_chars:
-        full_text = "[earlier conversation truncated]\n\n" + full_text[-max_chars:]
+        full_text = "[earlier turns omitted for context compaction]\n\n" + full_text[-max_chars:]
 
     return full_text
 
@@ -252,15 +310,21 @@ def compact_conversation(
         if log_fn:
             log_fn("🔄", f"COMPACT: generating summary... | req={request_id[:8]}")
 
-        # Use mlx_lm generate
+        # Use mlx_lm generate with calibrated compaction sampler
+        from mlx_lm.sample_utils import make_sampler
         from mlx_lm.utils import GenerationResponse
+
+        compact_sampler = make_sampler(
+            temp=_compact_temperature(),
+            top_p=_compact_top_p(),
+            min_p=_compact_min_p(),
+        )
         tokens_generated = []
         for response in generate_step(
             prompt=prompt_tokens,
             model=model,
             max_tokens=COMPACT_MAX_OUTPUT_TOKENS,
-            temp=0.3,
-            top_p=0.95,
+            sampler=compact_sampler,
         ):
             if isinstance(response, GenerationResponse):
                 token = response.token

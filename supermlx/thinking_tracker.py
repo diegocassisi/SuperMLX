@@ -1,6 +1,6 @@
 """
 [AI_DIRECTIVE]
-ROL: State machine centralizada para detección de bloques <think>...</think>
+ROL: Thinkingtracker V1 State machine centralizada para detección de bloques <think>...</think>
 OBJETIVO: SSoT para thinking detection en todo SuperMLX (sidecar, non-stream, stream)
 ENTRADAS: Token IDs y texto de cada token generado
 SALIDAS: ThinkingEvent (ENTER_THINKING, EXIT_THINKING, NONE) + estado actual

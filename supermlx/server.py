@@ -1,13 +1,15 @@
 # SPDX-License-Identifier: MIT
 """
-SuperMLX — Production-Grade MLX Inference Server for Agentic AI
-
-OpenAI-compatible inference server on Apple Silicon (MLX). Serves agentic AI
-requests with persistent KV cache, multi-agent isolation, and OOM protection,
-maximizing cache hits to minimize TTFT.
-
-This file is the single source of inference logic.
-warmup_manager.py handles DPC. rag_enricher.py handles RAG/Compressor.
+[AI_DIRECTIVE]
+ROL: SuperMLX — Production-Grade MLX Inference Server for Agentic AI
+OBJETIVO: Servidor de inferencia OpenAI/Anthropic compatible con soporte MoE, KV cache persistente, Dual-Phase Sampling y protección OOM
+ENTRADAS: Solicitudes HTTP (/v1/chat/completions, /v1/messages) con prompts, herramientas y tokens
+SALIDAS: Streaming de eventos SSE o payloads JSON de inferencia con tokens, razonamiento y tool calls
+REGLAS INVIOLABLES:
+- Prohibido modificar KV cache o pesos fuera del model_lock
+- Prohibido try/except silencioso sin logger
+- Obligatorio Dual-Phase Sampling con conmutación dinámica de temperatura según estado del tracker
+SSoT: server.py es la única fuente de verdad (SSoT) para la ejecución de inferencia en SuperMLX.
 ═══════════════════════════════════════════════════════════════════════════════
 
 ─── MULTI-MODEL SUPPORT ──────────────────────────────────────────────────────
@@ -352,6 +354,40 @@ FEATURE_LOG_RESP           = True   # Response normalization, tool extraction, t
 # Captures KV offset, key-tail hash, recurrent state fingerprint, and divergence detection.
 # Overhead: ~1ms per cache operation. Set FEATURE_CACHE_DIAG=false to disable.
 FEATURE_CACHE_DIAG         = _env_bool("FEATURE_CACHE_DIAG", True)
+
+# Tool call audit log: raw model XML → extracted args → delivered JSON.
+# Writes logs/requests/<req_id>/tool_audit.jsonl for debugging pipeline transforms.
+# Off by default — enable only when investigating tool call corruption.
+FEATURE_TOOL_AUDIT_LOG     = _env_bool("TOOL_AUDIT_LOG", False)
+
+# Expert Routing Logger: standalone diagnostic that records which experts are activated
+# per layer, per request. Purely observational — zero impact on model output or cache.
+# When disabled, the class is defined but attach() is never called: zero runtime overhead.
+# Output: logs/expert_routing.json. Env: EXPERT_ROUTING_LOG=true
+FEATURE_EXPERT_ROUTING_LOG = _env_bool("EXPERT_ROUTING_LOG", False)
+
+
+def _tool_audit_write(request_id: str, stage: str, data: dict) -> None:
+    """Append one audit entry to <log_root>/requests/<req_id>/tool_audit.jsonl.
+
+    Uses _PIPELINE_LOG_DIR (absolute Path) — same directory as inbound.json.
+    Best-effort: never raises.
+    """
+    if not FEATURE_TOOL_AUDIT_LOG:
+        return
+    entry = {"ts": datetime.now().isoformat(), "req": request_id[:8], "stage": stage}
+    entry.update(data)
+    try:
+        _req_dir = _PIPELINE_LOG_DIR / request_id
+        _req_dir.mkdir(parents=True, exist_ok=True)
+        _audit_path = _req_dir / "tool_audit.jsonl"
+        with open(_audit_path, "a", encoding="utf-8") as _af:
+            _af.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception as _ae:
+        _pipeline_log("TOOL_AUDIT", request_id, f"write failed: {_ae}")
+# Expert Routing Logger: enabled via EXPERT_ROUTING_LOG=true in .env.
+# Implementation lives in expert_cache.py (start_expert_routing/end_expert_routing/save_routing_stats).
+# No attach/detach needed — routing state is module-level inside expert_cache.
 
 # Compressor: config (env-var driven above, these are runtime defaults for rag_enricher)
 FEATURE_COMPRESSION_THRESHOLD = _env_int("COMPRESSION_THRESHOLD", 6000)
@@ -3201,46 +3237,52 @@ def _capture_hybrid_checkpoint_before_generation(
 
 
 
-def _build_sampler(body):
+from .sampling import DualPhaseSampler, safe_make_sampler, build_dual_phase_sampler
+
+
+def _build_sampler(body: dict, enable_thinking: Optional[bool] = None, tracker: Any = None):
     """
     Build a sampler and logits processors with anti-loop defaults.
-    Sampler handles: temp, top_p, top_k, min_p (token selection).
+    Sampler handles: Dual-Phase (think_temp -> resp_temp), top_p, top_k, min_p.
     Logits processors handle: repetition_penalty, presence_penalty (penalty application).
     Returns (sampler, logits_processors, applied_kwargs).
     """
-    temperature = body.get("temperature", SETTINGS.default_temperature)
-    if not isinstance(temperature, (int, float)):
-        temperature = 0.1
-    if temperature < 0.01:
-        temperature = 0
+    # ── Sampler params ────────────────────────────────────────────────────
+    top_p = body.get("top_p", SETTINGS.default_top_p)
+    top_k = body.get("top_k", SETTINGS.default_top_k)
+    min_p = body.get("min_p", SETTINGS.default_min_p)
 
-    # ── Sampler params (token selection) ──────────────────────────────────
-    sampler_kwargs = {
-        "temp": temperature,
-        "top_p": body.get("top_p", SETTINGS.default_top_p),
-        "top_k": body.get("top_k", SETTINGS.default_top_k),
-        "min_p": body.get("min_p", SETTINGS.default_min_p),
-    }
+    has_tools = bool(body.get("tools"))
+    body_temp = body.get("temperature")
 
-    # Build sampler with progressive fallback for compatibility
-    kwargs = dict(sampler_kwargs)
-    sampler = None
-    while True:
-        try:
-            sampler = make_sampler(**kwargs)
-            break
-        except TypeError as e:
-            msg = str(e)
-            removed = False
-            for key in list(kwargs.keys()):
-                if f"'{key}'" in msg:
-                    kwargs.pop(key, None)
-                    removed = True
-                    break
-            if not removed:
-                sampler = make_sampler(temp=temperature)
-                kwargs = {"temp": temperature}
-                break
+    # Determine temperatures for thinking and response phases
+    if body_temp is not None and isinstance(body_temp, (int, float)):
+        # Client specified an explicit temperature
+        think_temp = float(body_temp)
+        resp_temp = min(float(body_temp), SETTINGS.response_temperature)
+    else:
+        think_temp = SETTINGS.thinking_temperature
+        resp_temp = (
+            SETTINGS.tool_calling_temperature
+            if has_tools
+            else SETTINGS.response_temperature
+        )
+
+    # Determine active tracker
+    active_tracker = tracker if tracker is not None else globals().get("_thinking_tracker")
+
+    # Resolve whether thinking is active for this generation
+    thinking_active = enable_thinking if enable_thinking is not None else SETTINGS.default_thinking
+
+    sampler, applied_kwargs = build_dual_phase_sampler(
+        think_temp=think_temp,
+        resp_temp=resp_temp,
+        top_p=top_p,
+        top_k=top_k,
+        min_p=min_p,
+        enable_thinking=thinking_active,
+        tracker=active_tracker,
+    )
 
     # ── Logits processors (penalty application) ───────────────────────────
     _rep_penalty = body.get("repetition_penalty", SETTINGS.default_repetition_penalty)
@@ -3262,8 +3304,6 @@ def _build_sampler(body):
     except (ImportError, TypeError):
         logits_processors = None  # mlx_lm version without make_logits_processors
 
-    # Combined kwargs for logging
-    applied_kwargs = dict(kwargs)
     applied_kwargs["repetition_penalty"] = _rep_penalty
     applied_kwargs["repetition_context_size"] = _rep_ctx
     applied_kwargs["presence_penalty"] = _pres_penalty
@@ -3470,6 +3510,12 @@ except ImportError:
     pass  # expert_cache not available — dense model, no action needed
 except Exception as _moe_err:
     _terminal_status("⚠️", f"MoE Expert Cache failed: {_moe_err}")
+
+# ── Expert Routing Logger: enabled in expert_cache.py natively — no attach needed ──
+if FEATURE_EXPERT_ROUTING_LOG and _moe_stats.get("moe_layers", 0) > 0:
+    _terminal_status("🔬", "Expert Routing Logger: active (output: logs/expert_routing.json)")
+elif FEATURE_EXPERT_ROUTING_LOG:
+    _terminal_status("⚠️", "Expert Routing Logger: EXPERT_ROUTING_LOG=true but no MoE layers found")
 
 # Two-stage expert loading: expand after first successful response
 _moe_expand_pending = (
@@ -3932,7 +3978,7 @@ def _adaptive_prefill(
         chunk = prompt_array[processed : processed + n][None]  # (1, n)
         model(chunk, cache=prompt_cache)
 
-        # Materialize cache + free scratch
+        # Materialize cache + free scratch memory
         for c in prompt_cache:
             if hasattr(c, "state"):
                 mx.eval(c.state)
@@ -4259,7 +4305,7 @@ class SidecarHandler(BaseHTTPRequestHandler):
         )
 
         # ── BUILD SAMPLER ──────────────────────────────────────────────────
-        sampler, logits_processors, _ = _build_sampler(body)
+        sampler, logits_processors, _ = _build_sampler(body, enable_thinking=_enable_thinking)
 
         # ── GENERATE (under model_lock) ────────────────────────────────────
         acquired = False
@@ -5323,7 +5369,7 @@ class APIHandler(BaseHTTPRequestHandler):
         cache_selection_source = "none"
         rest_count = len(model_tokens)
         request_logger = None
-        sampler, logits_processors, sampler_kwargs = _build_sampler(body)
+        sampler, logits_processors, sampler_kwargs = _build_sampler(body, enable_thinking=enable_thinking)
         # V2: inject reasoning budget logits processor
         if isinstance(_thinking_tracker, ThinkingTrackerV2):
             _budget_proc = _thinking_tracker.make_logits_processor()
@@ -6250,6 +6296,13 @@ class APIHandler(BaseHTTPRequestHandler):
                 f"session={session_ctx.session_id[:16]} ({cache_selection_source}) | family={SETTINGS.model_family}",
                 request_id=request_id, stage="GEN",
             )
+            # Expert Routing: start tracking this request (non-streaming path)
+            if FEATURE_EXPERT_ROUTING_LOG:
+                try:
+                    from .expert_cache import start_expert_routing
+                    start_expert_routing(request_id)
+                except (ImportError, Exception):
+                    pass
             if FEATURE_FULL_LOGGING:
                 _pipeline_log("PRE_GEN", request_id,
                     f"entering generation | rest={rest_count} | stream={is_streaming} | "
@@ -6644,6 +6697,14 @@ class APIHandler(BaseHTTPRequestHandler):
 
                 raw_parts = []
 
+                # Expert Routing: start tracking this request (streaming path)
+                if FEATURE_EXPERT_ROUTING_LOG:
+                    try:
+                        from .expert_cache import start_expert_routing
+                        start_expert_routing(request_id)
+                    except (ImportError, Exception):
+                        pass
+
                 progress_last_at = time.time()
                 try:
                     for response in _stream_generate_unified(
@@ -6884,6 +6945,24 @@ class APIHandler(BaseHTTPRequestHandler):
                 if tool_calls:
                     _pipeline_log("TOOL_RAW", request_id,
                         f"model_output: {_fmt_tc_for_log(tool_calls)}")
+                # Audit stage 2: extracted args
+                if FEATURE_TOOL_AUDIT_LOG and tool_calls:
+                    import hashlib as _hl
+                    for _atc in tool_calls:
+                        _afn = _atc.get("function", {})
+                        try:
+                            _aargs = json.loads(_afn.get("arguments", "{}"))
+                        except Exception:
+                            _aargs = {}
+                        _aarg_lens = {k: len(str(v)) for k, v in _aargs.items()}
+                        _aargs_json = _afn.get("arguments", "")
+                        _tool_audit_write(request_id, "extracted", {
+                            "tool": _afn.get("name", "?"),
+                            "args_keys": list(_aargs.keys()),
+                            "arg_lens": _aarg_lens,
+                            "args_json_len": len(_aargs_json),
+                            "args_json_hash": _hl.md5(_aargs_json.encode()).hexdigest()[:8],
+                        })
                 # TOOL_COMPAT: normalize aliases
                 if tool_calls:
                     tool_calls, _alias_count = _sanitize_tool_calls(tool_calls, request_id)
@@ -6966,13 +7045,30 @@ class APIHandler(BaseHTTPRequestHandler):
                                         "name": func.get("name", ""), "input": {},
                                     },
                                 }))
-                                _closing_events.append(_sse_event("content_block_delta", {
-                                    "type": "content_block_delta", "index": _tc_idx,
-                                    "delta": {
-                                        "type": "input_json_delta",
-                                        "partial_json": json.dumps(tc_input, ensure_ascii=False),
-                                    },
-                                }))
+                                # Emit input_json_delta in 512-char chunks.
+                                # The real Anthropic API streams tool inputs incrementally.
+                                # Sending one huge delta for large write_file content (>5KB JS)
+                                # gets fragmented by TCP and can be cut by the client SDK buffer.
+                                _tc_json = json.dumps(tc_input, ensure_ascii=False)
+                                # Audit stage 3: delivered JSON to Hermes
+                                if FEATURE_TOOL_AUDIT_LOG:
+                                    import hashlib as _hl
+                                    _tool_audit_write(request_id, "delivered", {
+                                        "tool": func.get("name", "?"),
+                                        "delivered_json_len": len(_tc_json),
+                                        "delivered_json_hash": _hl.md5(_tc_json.encode()).hexdigest()[:8],
+                                        "delivered_keys": list(tc_input.keys()),
+                                        "delivered_arg_lens": {k: len(str(v)) for k, v in tc_input.items()},
+                                    })
+                                _TC_CHUNK = 512
+                                for _jc_start in range(0, max(1, len(_tc_json)), _TC_CHUNK):
+                                    _closing_events.append(_sse_event("content_block_delta", {
+                                        "type": "content_block_delta", "index": _tc_idx,
+                                        "delta": {
+                                            "type": "input_json_delta",
+                                            "partial_json": _tc_json[_jc_start:_jc_start + _TC_CHUNK],
+                                        },
+                                    }))
                                 _closing_events.append(_sse_event("content_block_stop", {
                                     "type": "content_block_stop", "index": _tc_idx,
                                 }))
@@ -7375,6 +7471,25 @@ class APIHandler(BaseHTTPRequestHandler):
                         _terminal_status("⚠️", f"Expert expansion failed: {_exp_err}")
                     _moe_expand_pending = False
 
+                # ── Expert Frequency Flush (Full Residency support) ──────────────
+                # Drains _indices_buffer → session_frequency AND → _routing_data.
+                # MUST run before end_expert_routing() so _routing_label is still set.
+                try:
+                    from .expert_cache import flush_frequency_only
+                    flush_frequency_only(model)
+                except ImportError:
+                    pass  # dense model — no expert cache
+                except Exception as _flush_err:
+                    _terminal_status("⚠️", f"Expert frequency flush failed: {_flush_err}")
+
+                # Expert Routing: end tracking AFTER flush (label must be set during flush)
+                if FEATURE_EXPERT_ROUTING_LOG:
+                    try:
+                        from .expert_cache import end_expert_routing
+                        end_expert_routing()
+                    except (ImportError, Exception):
+                        pass
+
                 model_lock.release()
 
 
@@ -7439,9 +7554,24 @@ def run():
             from .expert_cache import save_frequency_stats
             _stats_path = os.path.join("logs", "expert_stats.json")
             save_frequency_stats(model, _stats_path)
-            print(f"[SHUTDOWN] Expert frequency stats saved to {_stats_path}")
+            if os.path.exists(_stats_path):
+                print(f"[SHUTDOWN] Expert frequency stats saved to {_stats_path}")
+            else:
+                print("[SHUTDOWN] Expert frequency stats: nothing to save (session_frequency empty)")
         except Exception as _save_err:
             print(f"[SHUTDOWN] Expert frequency stats FAILED: {_save_err}")
+        # Expert Routing: save per-request routing data on shutdown
+        if FEATURE_EXPERT_ROUTING_LOG:
+            try:
+                from .expert_cache import save_routing_stats, end_expert_routing
+                end_expert_routing()  # Safety: clear any open label
+                _erl_path = os.path.join("logs", "expert_routing.json")
+                if save_routing_stats(_erl_path):
+                    print(f"[SHUTDOWN] Expert routing log saved to {_erl_path}")
+                else:
+                    print("[SHUTDOWN] Expert routing log: nothing to save")
+            except Exception as _erl_shutdown_err:
+                print(f"[SHUTDOWN] Expert routing log FAILED: {_erl_shutdown_err}")
         if sidecar_httpd:
             sidecar_httpd.shutdown()
 

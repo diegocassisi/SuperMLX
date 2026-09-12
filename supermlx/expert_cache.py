@@ -691,6 +691,104 @@ def dynamic_cache_needed(model: nn.Module) -> bool:
     return config.get("capacity", 0) < config.get("num_experts", 1)
 
 
+def flush_frequency_only(model: nn.Module) -> int:
+    """Drain _indices_buffer and update session_frequency (and routing stats if active).
+
+    Used in Full Residency mode where dynamic_cache_needed() returns False
+    and dynamic_cache_update() is never called.  Safe to call even when
+    dynamic_cache_update() is active (buffer already drained per-token → no-op).
+
+    Also populates _routing_data[_routing_label] when routing is active
+    (see start_expert_routing / end_expert_routing).
+
+    Returns number of layers where at least one expert was seen.
+    """
+    import numpy as np
+    flushed = 0
+    routing_label = _routing_label  # snapshot — may be None
+    for i, layer in enumerate(model.layers):
+        switch, _ = _find_switch_mlp(layer, i)
+        if switch is None:
+            continue
+        proj = getattr(switch, "up_proj", None)
+        if not isinstance(proj, PredictiveCachedSwitchLinear):
+            continue
+        cache = proj._cache
+        if not cache._indices_buffer:
+            continue
+        to_process = list(cache._indices_buffer)
+        cache._indices_buffer.clear()
+        all_requested: set = set()
+        for indices in to_process:
+            flat = np.asarray(indices.reshape(-1))
+            all_requested |= set(int(x) for x in np.unique(flat))
+        cache.step += 1
+        for eid in all_requested:
+            cache.frequency[eid] = cache.frequency.get(eid, 0) + 1
+            cache.session_frequency[eid] = cache.session_frequency.get(eid, 0) + 1
+            cache.last_active[eid] = cache.step
+        # Expert routing: count actual token-level activations per expert
+        # np.unique(return_counts=True) gives real per-token frequencies, not just presence
+        if routing_label is not None:
+            layer_bucket = _routing_data.setdefault(routing_label, {}).setdefault(i, {})
+            for indices in to_process:
+                flat = np.asarray(indices.reshape(-1))
+                uniq, cnts = np.unique(flat, return_counts=True)
+                for eid, cnt in zip(uniq.tolist(), cnts.tolist()):
+                    layer_bucket[int(eid)] = layer_bucket.get(int(eid), 0) + int(cnt)
+        flushed += 1
+    if flushed > 0:
+        logger.info("[MOE] flush_frequency_only: %d layers flushed into session_frequency", flushed)
+    return flushed
+
+
+# ── Expert Routing Stats (per-request diagnostic) ───────────────────────────────────
+# Tracks which experts are activated per layer, per request label.
+# Zero overhead when routing is disabled (_routing_label is None).
+# Format: {label: {layer_idx: {expert_id: count}}}
+_routing_label: Optional[str] = None
+_routing_data: Dict[str, Dict[int, Dict[int, int]]] = {}
+
+
+def start_expert_routing(label: str) -> None:
+    """Begin attributing expert activations to a named label (e.g. request_id)."""
+    global _routing_label
+    _routing_label = label
+    if label not in _routing_data:
+        _routing_data[label] = {}
+
+
+def end_expert_routing() -> None:
+    """Stop attributing activations to the current label."""
+    global _routing_label
+    _routing_label = None
+
+
+def save_routing_stats(path: str) -> bool:
+    """Write per-request routing data to path in expert_routing.json format.
+
+    Format: {"version": 1, "prompts": {label: {layer_str: {expert_str: count}}}}
+    Returns True if written, False if nothing to save.
+    """
+    if not _routing_data:
+        logger.info("[MOE] save_routing_stats: nothing to save")
+        return False
+    serializable = {
+        label: {
+            str(layer_idx): {str(eid): cnt for eid, cnt in experts.items()}
+            for layer_idx, experts in layers.items()
+        }
+        for label, layers in _routing_data.items()
+    }
+    from pathlib import Path
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with open(p, "w") as f:
+        json.dump({"version": 1, "prompts": serializable}, f, indent=1)
+    logger.info("[MOE] save_routing_stats: %d prompts saved to %s", len(_routing_data), path)
+    return True
+
+
 def dynamic_cache_update(
     model: nn.Module,
     max_layer_updates: int = 12,

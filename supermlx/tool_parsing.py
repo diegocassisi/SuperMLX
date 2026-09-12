@@ -521,12 +521,31 @@ def _extract_openai_tool_calls(text, model_family, allowed_tools=None):
             fn_body = bare_match.group(2)
         if not tool_name:
             return None
+        # Positional parameter extraction: robust against </parameter> inside content.
+        # Instead of non-greedy regex (which stops at the FIRST </parameter>, even
+        # if it's inside JavaScript), we find each <parameter=NAME> opening tag and
+        # define its content as everything until the NEXT <parameter= or end-of-body.
+        # Then strip the trailing </parameter> from each chunk.
         args = {}
-        for key, value in QWEN_PARAMETER_PATTERN.findall(fn_body):
-            param_key = key.strip()
+        _PARAM_OPEN = re.compile(r"<parameter=([^>\s]+)>", re.IGNORECASE)
+        param_starts = list(_PARAM_OPEN.finditer(fn_body))
+        for i, m in enumerate(param_starts):
+            param_key = m.group(1).strip()
             if not param_key:
                 continue
-            args[param_key] = _coerce_arg_value(value)
+            content_start = m.end()
+            # Content extends to the next <parameter= opening or end of fn_body
+            if i + 1 < len(param_starts):
+                content_end = param_starts[i + 1].start()
+            else:
+                content_end = len(fn_body)
+            raw_content = fn_body[content_start:content_end]
+            # Strip trailing </parameter> (the LAST one in this chunk, not the first)
+            last_close = raw_content.rfind("</parameter>")
+            if last_close >= 0:
+                raw_content = raw_content[:last_close]
+            raw_content = raw_content.strip()
+            args[param_key] = _coerce_arg_value(raw_content)
         return {
             "id": f"call_{uuid.uuid4().hex[:24]}",
             "type": "function",
