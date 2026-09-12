@@ -2700,6 +2700,12 @@ def _post_generation_cache_update(
             prompt_cache.__model_offset__ = hybrid_checkpoint.model_offset
         except (TypeError, AttributeError):
             pass  # list subclasses or frozen objects — skip silently
+        if prompt_cache and hasattr(prompt_cache[0], "__dict__"):
+            try:
+                prompt_cache[0].__model_prefix_hash__ = hybrid_checkpoint.model_prefix_hash
+                prompt_cache[0].__model_offset__ = hybrid_checkpoint.model_offset
+            except (TypeError, AttributeError):
+                pass
 
 
     if not is_embedded_agent:
@@ -2881,9 +2887,47 @@ def _insert_cache_entries(
     if generated_tokens and len(cache_key) > len(generated_tokens):
         _diag_pre_insert = _cache_diag.snapshot(prompt_cache, cache_key, "before_insert_trim")
         if can_trim_prompt_cache(prompt_cache):
-            # All layers trimmable (pure KVCache model)
-            if SETTINGS.prompt_cache_max_entries_global >= 2 and (tool_calls or is_vlm):
-                # Multi-slot: deepcopy for a prompt-only checkpoint
+            # All layers trimmable (pure KVCache or Marconi hybrid)
+            if tool_calls:
+                # ── TOOL CALL TURN: PRESERVE FULL KV CACHE ───────────────────
+                # In agentic workflows (Hermes, Claude Code), a tool call is ALWAYS
+                # followed by the client executing the tool and returning the tool_result.
+                # Preserving the generated tool call in the KV cache allows the next turn
+                # to hit >98% cache instead of discarding 8K-15K tokens and re-prefilling
+                # for 35+ seconds.
+                _full_kv_off = _kv_cache_offset(prompt_cache)
+                if _full_kv_off is not None:
+                    _prefix_hash = hash(tuple(cache_key[:_full_kv_off]))
+                    try:
+                        prompt_cache.__model_offset__ = _full_kv_off
+                        prompt_cache.__model_prefix_hash__ = _prefix_hash
+                    except (TypeError, AttributeError):
+                        pass
+                    if prompt_cache and hasattr(prompt_cache[0], "__dict__"):
+                        try:
+                            prompt_cache[0].__model_offset__ = _full_kv_off
+                            prompt_cache[0].__model_prefix_hash__ = _prefix_hash
+                        except (TypeError, AttributeError):
+                            pass
+
+                if SETTINGS.prompt_cache_max_entries_global >= 2:
+                    # Multi-slot: also deepcopy a prompt-only checkpoint into a secondary slot
+                    try:
+                        prompt_only_cache = copy.deepcopy(prompt_cache)
+                        trim_prompt_cache(prompt_only_cache, len(generated_tokens))
+                        prompt_only_key = cache_key[: -len(generated_tokens)]
+                        _store.insert_cache(model_name, prompt_only_key, prompt_only_cache)
+                        SESSION_INDEX.register_cache_key(session_ctx, prompt_only_key)
+                    except Exception:
+                        pass
+
+                _terminal_status(
+                    "💾",
+                    f"Cache preserved for tool turn: {_full_kv_off} tokens "
+                    f"(retained {len(generated_tokens)} response/tool tokens | hash verified)",
+                )
+            elif SETTINGS.prompt_cache_max_entries_global >= 2 and is_vlm:
+                # Multi-slot VLM: deepcopy for a prompt-only checkpoint
                 try:
                     prompt_only_cache = copy.deepcopy(prompt_cache)
                     trim_prompt_cache(prompt_only_cache, len(generated_tokens))
@@ -2893,7 +2937,8 @@ def _insert_cache_entries(
                 except Exception:
                     pass
             else:
-                # Single-slot: trim in-place
+                # Conversational non-tool turn (or single-slot without tools):
+                # Trim response tokens to keep prompt-only baseline clean.
                 try:
                     _pre_off = _kv_cache_offset(prompt_cache)
                     trim_prompt_cache(prompt_cache, len(generated_tokens))
@@ -5878,8 +5923,9 @@ class APIHandler(BaseHTTPRequestHandler):
                             # Normal continuation — _kv_off ≤ _trim_to.
                             # Defense-in-depth: verify model prefix hash if metadata
                             # was attached by a previous checkpoint.
-                            _stored_hash = getattr(prompt_cache, '__model_prefix_hash__', None)
-                            _stored_off = getattr(prompt_cache, '__model_offset__', None)
+                            _first_layer = prompt_cache[0] if (prompt_cache and isinstance(prompt_cache, (list, tuple)) and len(prompt_cache) > 0) else None
+                            _stored_hash = getattr(prompt_cache, '__model_prefix_hash__', getattr(_first_layer, '__model_prefix_hash__', None))
+                            _stored_off = getattr(prompt_cache, '__model_offset__', getattr(_first_layer, '__model_offset__', None))
                             if (_stored_hash is not None
                                     and _stored_off is not None
                                     and _stored_off == _kv_off):
