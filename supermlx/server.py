@@ -6805,23 +6805,18 @@ class APIHandler(BaseHTTPRequestHandler):
                         #     break
 
                         # ── N-GRAM LOOP DETECTION ────────────────────────
-                        # Detect verbatim phrase repetition in generated output.
-                        # Every _NGRAM_CHECK_INTERVAL tokens, check if the last
-                        # _NGRAM_SIZE tokens appeared earlier in RECENT output.
-                        # Uses a proximity window to avoid false positives on
-                        # code generation where identical patterns (HTML tags,
-                        # repeated function signatures) appear far apart.
-                        # Real infinite loops repeat every ~20-40 tokens;
-                        # a 300-token window catches those easily.
-                        _NGRAM_SIZE = 20         # tokens per n-gram
-                        _NGRAM_MAX_REPEATS = 3   # max allowed repeats before break
-                        _NGRAM_CHECK_INTERVAL = 32  # check every N tokens
-                        _NGRAM_WINDOW = 300      # only search this far back for repeats
-                        _n_gen = len(generated_tokens)
-                        if (
-                            _n_gen >= _NGRAM_SIZE * 2
-                            and _n_gen % _NGRAM_CHECK_INTERVAL == 0
-                        ):
+                        # Controlled via SETTINGS (SSoT): disabled by default (false)
+                        # to prevent false positives on repetitive code/matrices/JSON.
+                        if SETTINGS.ngram_loop_detection:
+                            _NGRAM_SIZE = SETTINGS.ngram_size
+                            _NGRAM_MAX_REPEATS = SETTINGS.ngram_max_repeats
+                            _NGRAM_CHECK_INTERVAL = SETTINGS.ngram_check_interval
+                            _NGRAM_WINDOW = SETTINGS.ngram_window
+                            _n_gen = len(generated_tokens)
+                            if (
+                                _n_gen >= _NGRAM_SIZE * 2
+                                and _n_gen % _NGRAM_CHECK_INTERVAL == 0
+                            ):
                             _tail = tuple(generated_tokens[-_NGRAM_SIZE:])
                             _search_region = generated_tokens[:-_NGRAM_SIZE]
                             # Limit search to recent window — real loops are nearby

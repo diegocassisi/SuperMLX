@@ -156,6 +156,11 @@ class Settings:
     moe_expert_profile: str           # Path to expert profile JSON for MoE pinning (""=none)
     moe_shallow_pin_layers: int       # Pin top experts in first N MoE layers (0=disabled)
     moe_shallow_pin_top: int          # How many experts to pin per shallow layer
+    ngram_loop_detection: bool        # Enable verbatim n-gram repetition loop detector
+    ngram_max_repeats: int            # Max allowed repeats before breaking generation
+    ngram_size: int                   # Tokens per n-gram pattern
+    ngram_window: int                 # Search window size in tokens
+    ngram_check_interval: int         # Interval in tokens between loop checks
 
 
 def _normalize_model_family(value: Optional[str]) -> str:
@@ -288,4 +293,9 @@ def build_settings(script_dir: Path = Path(__file__).parent) -> Settings:
         moe_expert_profile=_env_str("MOE_EXPERT_PROFILE", ""),
         moe_shallow_pin_layers=_env_int("MOE_SHALLOW_PIN_LAYERS", 5),
         moe_shallow_pin_top=_env_int("MOE_SHALLOW_PIN_TOP", 6),
+        ngram_loop_detection=_env_bool("NGRAM_LOOP_DETECTION", False),
+        ngram_max_repeats=_env_int("NGRAM_MAX_REPEATS", 12),
+        ngram_size=_env_int("NGRAM_SIZE", 35),
+        ngram_window=_env_int("NGRAM_WINDOW", 400),
+        ngram_check_interval=_env_int("NGRAM_CHECK_INTERVAL", 32),
     )
