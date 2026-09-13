@@ -3285,7 +3285,12 @@ def _capture_hybrid_checkpoint_before_generation(
 from .sampling import DualPhaseSampler, safe_make_sampler, build_dual_phase_sampler
 
 
-def _build_sampler(body: dict, enable_thinking: Optional[bool] = None, tracker: Any = None):
+def _build_sampler(
+    body: dict,
+    enable_thinking: Optional[bool] = None,
+    tracker: Any = None,
+    is_compact: bool = False,
+):
     """
     Build a sampler and logits processors with anti-loop defaults.
     Sampler handles: Dual-Phase (think_temp -> resp_temp), top_p, top_k, min_p.
@@ -3301,7 +3306,10 @@ def _build_sampler(body: dict, enable_thinking: Optional[bool] = None, tracker: 
     body_temp = body.get("temperature")
 
     # Determine temperatures for thinking and response phases
-    if body_temp is not None and isinstance(body_temp, (int, float)):
+    if is_compact:
+        think_temp = SETTINGS.compaction_temperature
+        resp_temp = SETTINGS.compaction_temperature
+    elif body_temp is not None and isinstance(body_temp, (int, float)):
         # Client specified an explicit temperature
         think_temp = float(body_temp)
         resp_temp = min(float(body_temp), SETTINGS.response_temperature)
@@ -3317,7 +3325,10 @@ def _build_sampler(body: dict, enable_thinking: Optional[bool] = None, tracker: 
     active_tracker = tracker if tracker is not None else globals().get("_thinking_tracker")
 
     # Resolve whether thinking is active for this generation
-    thinking_active = enable_thinking if enable_thinking is not None else SETTINGS.default_thinking
+    if is_compact:
+        thinking_active = False
+    else:
+        thinking_active = enable_thinking if enable_thinking is not None else SETTINGS.default_thinking
 
     sampler, applied_kwargs = build_dual_phase_sampler(
         think_temp=think_temp,
@@ -4709,12 +4720,16 @@ class APIHandler(BaseHTTPRequestHandler):
                         _last_hermes_context["_hash"] = _new_hash
                         _save_hermes_context()
 
+                _is_compact_request = False
                 # Claude Code compact: detect by user message phrase
-                if raw.get("tools") and "CRITICAL: Respond with TEXT ONLY" in _last_user[:200]:
-                    _compact_stripped_tools = len(raw["tools"])
-                    raw["tools"] = []
-                    _terminal_status("🪶",
-                        f"COMPACT TOOL STRIP: removed {_compact_stripped_tools} tool definitions from compact request")
+                if (raw.get("tools") or raw.get("messages")) and "CRITICAL: Respond with TEXT ONLY" in _last_user[:200]:
+                    if raw.get("tools"):
+                        _compact_stripped_tools = len(raw["tools"])
+                        raw["tools"] = []
+                        _terminal_status("🪶",
+                            f"COMPACT TOOL STRIP: removed {_compact_stripped_tools} tool definitions from compact request")
+                    raw.pop("thinking", None)
+                    _is_compact_request = True
 
                 # Hermes compact: detect by user message OR system prompt phrase
                 # Hermes sends compact as a single user message (no system msg).
@@ -4727,18 +4742,16 @@ class APIHandler(BaseHTTPRequestHandler):
                     if raw.get("tools"):
                         _compact_stripped_tools = len(raw["tools"])
                         raw["tools"] = []
+                    raw.pop("thinking", None)
                     # Prepend Claude Code's structured COMPACT_PROMPT to the user message
                     # Hermes already serialized the conversation as user content — keep it,
                     # just replace the generic instruction with the structured one.
-                    from .server_compact import COMPACT_PROMPT as _CC_COMPACT_PROMPT
+                    from .server_compact import COMPACT_PROMPT as _CC_COMPACT_PROMPT, extract_hermes_compact_content
                     for _m in reversed(raw.get("messages", [])):
                         if _m.get("role") == "user":
                             _original = _m.get("content", "")
                             if isinstance(_original, str):
-                                # Strip Hermes's generic instruction, keep conversation data
-                                # The conversation data typically starts after the first newline block
-                                _conv_start = _original.find("\n\n")
-                                _conv_data = _original[_conv_start:] if _conv_start > 0 else "\n\n" + _original
+                                _conv_data = extract_hermes_compact_content(_original)
                                 _m["content"] = _CC_COMPACT_PROMPT + _conv_data
                             break
 
@@ -4761,13 +4774,14 @@ class APIHandler(BaseHTTPRequestHandler):
                         _tpc_injected_into_compact = True
 
                     _hermes_compact_swapped = True
+                    _is_compact_request = True
                     _terminal_status("🪶",
                         f"HERMES COMPACT SWAP: replaced prompt + stripped {_compact_stripped_tools} tools"
                         f" | TPC context injected={_tpc_injected_into_compact}")
 
             body = anthropic_to_openai_body(raw, SETTINGS.proxy_model_id)
 
-            if _hermes_compact_swapped:
+            if _hermes_compact_swapped or _is_compact_request:
                 # Signal to _handle_chat_completion to treat this as housekeeping.
                 # The HOUSEKEEPING_CACHE_BORROW mechanism will:
                 # 1. Snapshot the conversation cache before compact generation
@@ -4775,6 +4789,9 @@ class APIHandler(BaseHTTPRequestHandler):
                 # 3. Restore the conversation cache after generation
                 # This avoids the cold start that was caused by evicting here.
                 body["_supermlx_compact"] = True
+                body["enable_thinking"] = False
+                body["temperature"] = SETTINGS.compaction_temperature
+                body.pop("thinking", None)
 
             # Jump past the body-parse block that follows.
             self._handle_chat_completion(body)
@@ -4958,17 +4975,17 @@ class APIHandler(BaseHTTPRequestHandler):
                 f"COMPACT_RUNNER: detected (system-prompt keywords + 0 tools) — routed to PROMPT_CACHE_COMPACT")
 
         _is_housekeeping = _is_hermes_housekeeping_request(_raw_messages_for_detect)
-        _is_compact = body.pop("_supermlx_compact", False)
+        _is_compact = bool(body.pop("_supermlx_compact", False))
         if _is_compact:
             _is_housekeeping = True  # reuse same skip_cache_store path
             _pipeline_log("CACHE", request_id,
-                "HERMES_COMPACT: cache store will be skipped — cache was evicted pre-generation")
+                f"HERMES_COMPACT: cache store will be skipped — compact mode active (enable_thinking=False, temp={SETTINGS.compaction_temperature:.2f})")
         elif _is_housekeeping:
             _pipeline_log("CACHE", request_id,
                 "HERMES_HOUSEKEEPING: detected — cache store will be skipped to avoid contaminating conversation cache")
 
         reasoning_control = _extract_enable_thinking(body, default_thinking=SETTINGS.default_thinking)
-        enable_thinking = reasoning_control["enable_thinking"]
+        enable_thinking = False if _is_compact else reasoning_control["enable_thinking"]
 
         # ── PIPELINE LOG: INBOUND ──────────────────────────────────────────
         _pipeline_t0 = time.time()
@@ -5429,8 +5446,10 @@ class APIHandler(BaseHTTPRequestHandler):
         matched_prefix_len = 0
         cache_selection_source = "none"
         rest_count = len(model_tokens)
-        sampler, logits_processors, sampler_kwargs = _build_sampler(body, enable_thinking=enable_thinking)
-        if SETTINGS.adaptive_temperature_enabled and hasattr(sampler, "update_response_temperature"):
+        sampler, logits_processors, sampler_kwargs = _build_sampler(
+            body, enable_thinking=enable_thinking, is_compact=_is_compact
+        )
+        if not _is_compact and SETTINGS.adaptive_temperature_enabled and hasattr(sampler, "update_response_temperature"):
             try:
                 from .domain_classifier import register_request_sampler
                 _has_client_temp = body.get("temperature") is not None and isinstance(body.get("temperature"), (int, float))

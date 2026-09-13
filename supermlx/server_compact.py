@@ -113,9 +113,9 @@ CRITICAL INSTRUCTIONS ON CODE AND FILES:
 - Active working frontier: For the file actively being modified right before this summary, specify: exact path, the specific function/section in progress, and the immediate next change needed.
 - Log clipping vs errors: Markers like "[payload omitted for context compaction — see file on disk]" or "...[tool output omitted for context compaction]" in tool call history are purely prompt length limits for this summary. They are NOT runtime errors, tool failures, or file corruptions. Never report a tool call as corrupted or failed simply because its serialized arguments were clipped for length.
 
-Before providing your final summary, use your internal reasoning to analyze the conversation and ensure you've covered all necessary points:
+Before providing your final summary, ensure you cover all necessary points directly:
 
-1. Chronologically analyze each message and section of the conversation:
+1. Analyze each message and section of the conversation:
    - The user's explicit requests, intents, and feedback
    - Your approach to addressing the requests
    - Key architectural decisions, concepts, and interfaces
@@ -137,8 +137,7 @@ Your summary should include the following sections:
    - Active file and exact location of current work.
    - Specific, concrete next action to resume immediately without asking clarifying questions.
 
-CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.
-Provide the summary directly under <summary>...</summary> tags. Do NOT output an <analysis> block; use your internal reasoning for analysis.
+CRITICAL: Respond with TEXT ONLY directly inside <summary>...</summary> tags. Do NOT call any tools. Do NOT output <think>, reasoning, or analysis tags.
 
 Please provide your summary based on the conversation so far, following this structure."""
 
@@ -163,6 +162,63 @@ def format_compact_summary(raw_text: str) -> str:
     # Clean whitespace
     text = re.sub(r"\n\n+", "\n\n", text)
     return text.strip()
+
+
+def extract_hermes_compact_content(original: str) -> str:
+    """Extract conversation turns and previous summary from Hermes compaction request,
+    stripping all Hermes template instructions (## Historical Task, ## Goal, etc.)
+    so they do not conflict with COMPACT_PROMPT."""
+    if not isinstance(original, str) or not original:
+        return ""
+
+    focus_part = ""
+    focus_idx = original.find("\nFOCUS TOPIC:")
+    if focus_idx == -1:
+        focus_idx = original.find("FOCUS TOPIC:")
+    if focus_idx != -1:
+        focus_part = "\n\n" + original[focus_idx:].strip()
+        body_text = original[:focus_idx]
+    else:
+        body_text = original
+
+    if "PREVIOUS SUMMARY:" in body_text and "NEW TURNS TO INCORPORATE:" in body_text:
+        ps_idx = body_text.find("PREVIOUS SUMMARY:")
+        nt_idx = body_text.find("NEW TURNS TO INCORPORATE:")
+        prev_summary_part = body_text[ps_idx:nt_idx].strip()
+        after_nt = body_text[nt_idx:]
+        end_markers = [
+            "\n\nUpdate the summary using",
+            "\n\n## Historical Task",
+            "\n\n## Goal",
+            "\n\nUse this exact structure:",
+        ]
+        end_pos = len(after_nt)
+        for m in end_markers:
+            p = after_nt.find(m)
+            if p != -1 and p < end_pos:
+                end_pos = p
+        turns_part = after_nt[:end_pos].strip()
+        return f"\n\n{prev_summary_part}\n\n{turns_part}{focus_part}"
+
+    if "TURNS TO SUMMARIZE:" in body_text:
+        ts_idx = body_text.find("TURNS TO SUMMARIZE:")
+        after_ts = body_text[ts_idx:]
+        end_markers = [
+            "\n\nUse this exact structure:",
+            "\n\n## Historical Task",
+            "\n\n## Goal",
+            "\n\nUpdate the summary using",
+        ]
+        end_pos = len(after_ts)
+        for m in end_markers:
+            p = after_ts.find(m)
+            if p != -1 and p < end_pos:
+                end_pos = p
+        turns_part = after_ts[:end_pos].strip()
+        return f"\n\n{turns_part}{focus_part}"
+
+    conv_start = original.find("\n\n")
+    return original[conv_start:] if conv_start > 0 else "\n\n" + original
 
 
 def serialize_messages_to_text(messages: List[Dict[str, Any]], max_chars: int = 140000) -> str:
