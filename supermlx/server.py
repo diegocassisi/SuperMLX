@@ -4746,13 +4746,25 @@ class APIHandler(BaseHTTPRequestHandler):
                     # Prepend Claude Code's structured COMPACT_PROMPT to the user message
                     # Hermes already serialized the conversation as user content — keep it,
                     # just replace the generic instruction with the structured one.
-                    from .server_compact import COMPACT_PROMPT as _CC_COMPACT_PROMPT, extract_hermes_compact_content
+                    from .server_compact import (
+                        COMPACT_PROMPT as _CC_COMPACT_PROMPT,
+                        extract_hermes_compact_parts,
+                        _max_frozen_summary_chars,
+                    )
+                    _frozen_hermes_summary = ""
                     for _m in reversed(raw.get("messages", [])):
                         if _m.get("role") == "user":
                             _original = _m.get("content", "")
                             if isinstance(_original, str):
-                                _conv_data = extract_hermes_compact_content(_original)
-                                _m["content"] = _CC_COMPACT_PROMPT + _conv_data
+                                _prev_sum, _turns_data = extract_hermes_compact_parts(_original, log_fn=_terminal_status)
+                                if _prev_sum and len(_prev_sum) <= _max_frozen_summary_chars():
+                                    _frozen_hermes_summary = _prev_sum
+                                    _m["content"] = _CC_COMPACT_PROMPT + "\n\n" + _turns_data
+                                    _terminal_status("🪶", f"HERMES COMPACT: frozen summary preserved ({len(_prev_sum)} chars) — summarizing new turns only")
+                                else:
+                                    if _prev_sum:
+                                        _terminal_status("⚠️", f"HERMES COMPACT: frozen summary ({len(_prev_sum)} chars) exceeds cap -> consolidating")
+                                    _m["content"] = _CC_COMPACT_PROMPT + (f"\n\n{_prev_sum}\n\n{_turns_data}" if _prev_sum else f"\n\n{_turns_data}")
                             break
 
                     # ── TPC REUSE: inject saved system+tools into compact ──
@@ -4789,6 +4801,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 # 3. Restore the conversation cache after generation
                 # This avoids the cold start that was caused by evicting here.
                 body["_supermlx_compact"] = True
+                body["_frozen_summary"] = _frozen_hermes_summary if _hermes_compact_swapped else ""
                 body["enable_thinking"] = False
                 body["temperature"] = SETTINGS.compaction_temperature
                 body.pop("thinking", None)
@@ -4976,6 +4989,7 @@ class APIHandler(BaseHTTPRequestHandler):
 
         _is_housekeeping = _is_hermes_housekeeping_request(_raw_messages_for_detect)
         _is_compact = bool(body.pop("_supermlx_compact", False))
+        _frozen_summary = str(body.pop("_frozen_summary", "") or "")
         if _is_compact:
             _is_housekeeping = True  # reuse same skip_cache_store path
             _pipeline_log("CACHE", request_id,
@@ -6621,6 +6635,9 @@ class APIHandler(BaseHTTPRequestHandler):
                     finally:
                         _breathing_active = False
 
+                if _frozen_summary:
+                    message_text = f"{_frozen_summary}\n\n---\n\n{message_text}"
+
                 if self._is_anthropic:
                     full_response = openai_to_anthropic_response(
                         message_text, tool_calls, finish_reason,
@@ -6724,6 +6741,16 @@ class APIHandler(BaseHTTPRequestHandler):
                     self.wfile.write(_block_start.encode("utf-8"))
                     self.wfile.flush()
                     _pipeline_log("WIRE", request_id, f"ANTHROPIC SSE: sent message_start + content_block_start (thinking={enable_thinking})")
+                    if _frozen_summary:
+                        _frozen_prefix = f"{_frozen_summary}\n\n---\n\n"
+                        _delta_evt = _sse_event("content_block_delta", {
+                            "type": "content_block_delta",
+                            "index": _anthropic_block_idx,
+                            "delta": {"type": "text_delta", "text": _frozen_prefix},
+                        })
+                        self.wfile.write(_delta_evt.encode("utf-8"))
+                        self.wfile.flush()
+                        _anthropic_streamed_text.append(_frozen_prefix)
                 else:
                     role_chunk = {
                         "id": response_id,
@@ -6743,6 +6770,23 @@ class APIHandler(BaseHTTPRequestHandler):
                     self.wfile.write(_wire_payload.encode("utf-8"))
                     self.wfile.flush()
                     _pipeline_log("WIRE", request_id, "FLUSH role_chunk OK")
+                    if _frozen_summary:
+                        _frozen_prefix = f"{_frozen_summary}\n\n---\n\n"
+                        _chunk = {
+                            "id": response_id,
+                            "object": "chat.completion.chunk",
+                            "created": int(time.time()),
+                            "model": SETTINGS.proxy_model_id,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {"content": _frozen_prefix},
+                                    "finish_reason": None,
+                                }
+                            ],
+                        }
+                        self.wfile.write(f"data: {json.dumps(_chunk)}\n\n".encode("utf-8"))
+                        self.wfile.flush()
 
                 # --- SSE KEEPALIVE THREAD ---
                 # During prefill (~58s) and decode, no SSE events are sent because

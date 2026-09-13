@@ -62,6 +62,11 @@ def _compact_tail_count() -> int:
     return _env_int("COMPACT_PRESERVE_TAIL", 4)
 
 
+# Maximum characters for accumulated frozen summary before forcing consolidation (~4K tokens)
+def _max_frozen_summary_chars() -> int:
+    return _env_int("MAX_FROZEN_SUMMARY_CHARS", 16000)
+
+
 # Max output tokens for the summary generation.
 COMPACT_MAX_OUTPUT_TOKENS = 8192
 
@@ -164,12 +169,12 @@ def format_compact_summary(raw_text: str) -> str:
     return text.strip()
 
 
-def extract_hermes_compact_content(original: str) -> str:
-    """Extract conversation turns and previous summary from Hermes compaction request,
+def extract_hermes_compact_parts(original: str, log_fn: Optional[Callable] = None) -> Tuple[str, str]:
+    """Extract (previous_summary, turns_to_summarize) from Hermes compaction request,
     stripping all Hermes template instructions (## Historical Task, ## Goal, etc.)
     so they do not conflict with COMPACT_PROMPT."""
     if not isinstance(original, str) or not original:
-        return ""
+        return ("", "")
 
     focus_part = ""
     focus_idx = original.find("\nFOCUS TOPIC:")
@@ -198,7 +203,7 @@ def extract_hermes_compact_content(original: str) -> str:
             if p != -1 and p < end_pos:
                 end_pos = p
         turns_part = after_nt[:end_pos].strip()
-        return f"\n\n{prev_summary_part}\n\n{turns_part}{focus_part}"
+        return (prev_summary_part, f"{turns_part}{focus_part}".strip())
 
     if "TURNS TO SUMMARIZE:" in body_text:
         ts_idx = body_text.find("TURNS TO SUMMARIZE:")
@@ -215,10 +220,24 @@ def extract_hermes_compact_content(original: str) -> str:
             if p != -1 and p < end_pos:
                 end_pos = p
         turns_part = after_ts[:end_pos].strip()
-        return f"\n\n{turns_part}{focus_part}"
+        return ("", f"{turns_part}{focus_part}".strip())
 
+    msg = "Hermes format fallback triggered — markers not found, formato pudo haber cambiado"
+    if log_fn:
+        log_fn("⚠️", msg)
+    else:
+        logger.warning("[FALLBACK] %s", msg)
     conv_start = original.find("\n\n")
-    return original[conv_start:] if conv_start > 0 else "\n\n" + original
+    raw_fallback = original[conv_start:] if conv_start > 0 else original
+    return ("", raw_fallback.strip())
+
+
+def extract_hermes_compact_content(original: str, log_fn: Optional[Callable] = None) -> str:
+    """Retrocompatible wrapper returning combined string for callers expecting a single string."""
+    prev_part, turns_part = extract_hermes_compact_parts(original, log_fn=log_fn)
+    if prev_part and turns_part:
+        return f"\n\n{prev_part}\n\n{turns_part}"
+    return f"\n\n{prev_part or turns_part}"
 
 
 def serialize_messages_to_text(messages: List[Dict[str, Any]], max_chars: int = 140000) -> str:
@@ -312,6 +331,33 @@ def compact_conversation(
         if log_fn:
             log_fn("⚠️", f"COMPACT: too few messages to compact ({n}). Skipping. | req={request_id[:8]}")
         return None
+
+    # ── DETECCIÓN DE RESUMEN PREVIO CONGELADO (Anti-degradación recursiva) ──
+    _WRAPPER_TRIGGER = "This session is being continued from a previous conversation"
+    _WRAPPER_MID = "The summary below covers the earlier portion of the conversation.\n\n"
+    _WRAPPER_TAIL = "\n\nContinue the conversation from where it left off"
+
+    frozen_summary = ""
+    max_frozen_limit = _max_frozen_summary_chars()
+    if body_msgs and isinstance(body_msgs[0].get("content"), str):
+        first_content = body_msgs[0]["content"]
+        if _WRAPPER_TRIGGER in first_content:
+            start_idx = first_content.find(_WRAPPER_MID)
+            end_idx = first_content.find(_WRAPPER_TAIL)
+            extracted = ""
+            if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+                extracted = first_content[start_idx + len(_WRAPPER_MID):end_idx].strip()
+            elif start_idx != -1:
+                extracted = first_content[start_idx + len(_WRAPPER_MID):].strip()
+
+            if len(extracted) > max_frozen_limit:
+                if log_fn:
+                    log_fn("⚠️", f"COMPACT: frozen summary exceeds cap ({len(extracted)} > {max_frozen_limit} chars). Consolidating via model.")
+                frozen_summary = ""
+            else:
+                frozen_summary = extracted
+                body_msgs = body_msgs[1:]
+                n = len(body_msgs)
 
     tail_msgs = body_msgs[n - tail_count:]
     summarize_msgs = body_msgs[:n - tail_count]
@@ -420,10 +466,16 @@ def compact_conversation(
             log_fn("⚠️", f"COMPACT: summary too short or empty. Skipping. | req={request_id[:8]}")
         return None
 
+    # Concatenate frozen summary with new summary without re-processing
+    if frozen_summary:
+        combined_summary = f"{frozen_summary}\n\n---\n\n{formatted_summary}"
+    else:
+        combined_summary = formatted_summary
+
     # Build compacted message list
     summary_user_msg = {
         "role": "user",
-        "content": COMPACT_USER_WRAPPER.format(summary=formatted_summary),
+        "content": COMPACT_USER_WRAPPER.format(summary=combined_summary),
     }
 
     result = system_msgs + [summary_user_msg] + tail_msgs
