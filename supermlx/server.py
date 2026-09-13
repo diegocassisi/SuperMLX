@@ -3530,6 +3530,11 @@ try:
             f"loaded={_moe_stats.get('expert_tensors_loaded', 0)}, "
             f"mem={_moe_stats.get('active_memory_gb', 0):.1f}GB",
         )
+        try:
+            from .router_tracer import attach_router_tracer
+            attach_router_tracer(model)
+        except Exception as _rt_err:
+            _terminal_status("⚠️", f"Prefill tap init error: {_rt_err}")
         # ── Qwen3.6 full-residency guard ─────────────────────────────────
         # Qwen3.6-35B-A3B MUST run with all 256 experts resident.
         # Partial capacity causes severe quality degradation and hallucinations.
@@ -4349,8 +4354,19 @@ class SidecarHandler(BaseHTTPRequestHandler):
             indent=2,
         )
 
-        # ── BUILD SAMPLER ──────────────────────────────────────────────────
         sampler, logits_processors, _ = _build_sampler(body, enable_thinking=_enable_thinking)
+        if SETTINGS.adaptive_temperature_enabled and hasattr(sampler, "update_response_temperature"):
+            try:
+                from .domain_classifier import register_request_sampler
+                _has_client_temp = body.get("temperature") is not None and isinstance(body.get("temperature"), (int, float))
+                register_request_sampler(
+                    sampler=sampler,
+                    request_id=request_id,
+                    client_specified_temp=_has_client_temp,
+                    log_fn=_terminal_status,
+                )
+            except Exception:
+                pass
 
         # ── GENERATE (under model_lock) ────────────────────────────────────
         acquired = False
@@ -5413,8 +5429,19 @@ class APIHandler(BaseHTTPRequestHandler):
         matched_prefix_len = 0
         cache_selection_source = "none"
         rest_count = len(model_tokens)
-        request_logger = None
         sampler, logits_processors, sampler_kwargs = _build_sampler(body, enable_thinking=enable_thinking)
+        if SETTINGS.adaptive_temperature_enabled and hasattr(sampler, "update_response_temperature"):
+            try:
+                from .domain_classifier import register_request_sampler
+                _has_client_temp = body.get("temperature") is not None and isinstance(body.get("temperature"), (int, float))
+                register_request_sampler(
+                    sampler=sampler,
+                    request_id=request_id,
+                    client_specified_temp=_has_client_temp,
+                    log_fn=_terminal_status,
+                )
+            except Exception:
+                pass
         # V2: inject reasoning budget logits processor
         if isinstance(_thinking_tracker, ThinkingTrackerV2):
             _budget_proc = _thinking_tracker.make_logits_processor()
@@ -7467,6 +7494,12 @@ class APIHandler(BaseHTTPRequestHandler):
                         ),
                         indent=1,
                     )
+            try:
+                from .router_tracer import flush_request_trace
+                _prompt_preview = str(locals().get("_last_user", locals().get("last_user_msg", locals().get("prompt", ""))))
+                flush_request_trace(request_id, prompt_preview=_prompt_preview)
+            except Exception:
+                pass
             # On normal exit or Python exception, release the lock. On process abort (e.g. Metal
             # "uncommitted encoder" crash), finally may not run, so the "leaked semaphore" warning
             # at shutdown is expected; fixing the Metal crash resolves it.

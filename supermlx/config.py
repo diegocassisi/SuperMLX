@@ -161,6 +161,13 @@ class Settings:
     ngram_size: int                   # Tokens per n-gram pattern
     ngram_window: int                 # Search window size in tokens
     ngram_check_interval: int         # Interval in tokens between loop checks
+    adaptive_temperature_enabled: bool # Enable prefill domain-adaptive temperature
+    adaptive_temperature_layer: int    # Layer to tap for domain classification (default: 20)
+    adaptive_temperature_prosa: float  # Response temperature for prose domain
+    adaptive_temperature_codigo_mate: float # Response temperature for code/math domain
+    adaptive_temperature_default: float # Fallback response temperature
+    adaptive_markers_prosa: str        # Comma-separated expert IDs for prose
+    adaptive_markers_codigo_mate: str  # Comma-separated expert IDs for code/math
 
 
 def _normalize_model_family(value: Optional[str]) -> str:
@@ -298,4 +305,11 @@ def build_settings(script_dir: Path = Path(__file__).parent) -> Settings:
         ngram_size=_env_int("NGRAM_SIZE", 35),
         ngram_window=_env_int("NGRAM_WINDOW", 400),
         ngram_check_interval=_env_int("NGRAM_CHECK_INTERVAL", 32),
+        adaptive_temperature_enabled=_env_bool("FEATURE_ADAPTIVE_TEMPERATURE", True),
+        adaptive_temperature_layer=_env_int("ADAPTIVE_TEMP_LAYER", 20),
+        adaptive_temperature_prosa=_env_float("ADAPTIVE_TEMP_PROSA", 0.85),
+        adaptive_temperature_codigo_mate=_env_float("ADAPTIVE_TEMP_CODIGO_MATE", 0.10),
+        adaptive_temperature_default=_env_float("ADAPTIVE_TEMP_DEFAULT", 0.40),
+        adaptive_markers_prosa=_env_str("ADAPTIVE_MARKERS_PROSA", "19"),
+        adaptive_markers_codigo_mate=_env_str("ADAPTIVE_MARKERS_CODIGO_MATE", "72,133,23,148,42,130,161,198,226"),
     )

@@ -57,6 +57,21 @@ FACTUAL_PROMPTS = [
         "category": "CONTROL_DETERMINISTIC",
         "id": "control_code",
         "prompt": "Escribí una función en Python para invertir una lista enlazada simple de forma iterativa."
+    },
+    {
+        "category": "CROSS_DOMAIN_EPISTEMIC",
+        "id": "boltzmann_poincare",
+        "prompt": "En la controversia de finales del siglo XIX entre Ludwig Boltzmann y Ernst Zermelo sobre la paradoja de recurrencia de Poincaré en termodinámica estadística, ¿cuál fue el contraargumento cinético de Boltzmann respecto al tiempo de recurrencia frente a la edad del universo?"
+    },
+    {
+        "category": "ADVERSARIAL_CROSS_SYNTAX",
+        "id": "llvm_arm64_vector",
+        "prompt": "En el backend de LLVM para ARM64 / Apple Silicon, ¿cuál es la diferencia técnica entre las instrucciones LDNP y LDP al vectorizar bucles y cómo afecta el hardware prefetcher L1?"
+    },
+    {
+        "category": "LOW_FREQUENCY_GEO_HISTORY",
+        "id": "arbitraje_1902",
+        "prompt": "En el Laudo Arbitral británico de 1902 entre Argentina y Chile presidido por Thomas Holdich, ¿qué solución se adoptó específicamente para la disputa de la divisoria de aguas en el Lago Lácar?"
     }
 ]
 
@@ -81,13 +96,13 @@ def run_benchmark():
         payload = {
             "model": "claude-3-5-sonnet-latest",
             "messages": [{"role": "user", "content": item["prompt"]}],
-            "max_tokens": 300,
-            "temperature": 0.1,  # Temperatura determinista de respuesta para evaluar factualidad
+            "max_tokens": 400,
+            "temperature": 0.1,  # Mantenemos determinismo factual para aislar el routing
             "stream": False
         }
         t0 = time.time()
         try:
-            r = requests.post(URL, json=payload, timeout=90)
+            r = requests.post(URL, json=payload, timeout=180)
             elapsed = time.time() - t0
             if r.status_code == 200:
                 resp_json = r.json()
