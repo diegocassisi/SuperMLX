@@ -162,19 +162,48 @@ class MTPSpeculativeEngine:
         top_p: float = 1.0,
         min_p: float = 0.0,
         top_k: int = 0,
+        sampler: Optional[Any] = None,
+        adaptive_temperature: bool = False,
     ) -> None:
         self.model = model
         self.temperature = temperature
         self.top_p = top_p
         self.min_p = min_p
         self.top_k = top_k
+        self.sampler = sampler
+        self.adaptive_temperature = adaptive_temperature
         logger.info(
-            "[CONFIG] MTPSpeculativeEngine inicializado: temp=%.2f, top_p=%.2f, min_p=%.2f, top_k=%d",
+            "[CONFIG] MTPSpeculativeEngine inicializado: temp=%.2f, top_p=%.2f, min_p=%.2f, top_k=%d, adaptive_temp=%s",
             self.temperature,
             self.top_p,
             self.min_p,
             self.top_k,
+            self.adaptive_temperature,
         )
+
+    def _get_sampling_params(self) -> Tuple[float, float, float, int]:
+        """
+        Resuelve (temp, top_p, min_p, top_k) dinámicamente según la fase del sampler
+        (DualPhaseSampler / FEATURE_ADAPTIVE_TEMPERATURE) o el modo estático.
+        """
+        if not self.adaptive_temperature or self.sampler is None:
+            return self.temperature, self.top_p, self.min_p, self.top_k
+
+        # 1. Temperatura activa según la fase (thinking vs response)
+        temp = self.temperature
+        if hasattr(self.sampler, "tracker") and getattr(self.sampler.tracker, "is_thinking", False):
+            temp = getattr(self.sampler, "think_temp", self.temperature)
+        elif hasattr(self.sampler, "resp_temp"):
+            temp = getattr(self.sampler, "resp_temp", self.temperature)
+        elif hasattr(self.sampler, "temp"):
+            temp = getattr(self.sampler, "temp", self.temperature)
+
+        # 2. Filtros de sampling del sampler activo
+        top_p = getattr(self.sampler, "top_p", self.top_p)
+        min_p = getattr(self.sampler, "min_p", self.min_p)
+        top_k = getattr(self.sampler, "top_k", self.top_k)
+
+        return temp, top_p, min_p, top_k
 
     def generate(
         self,
@@ -205,12 +234,13 @@ class MTPSpeculativeEngine:
         logits, pre_norm = self.model.forward_with_hidden(prompt_tokens, cache=cache)
         mx.eval(logits, pre_norm)
 
+        curr_temp, curr_top_p, curr_min_p, curr_top_k = self._get_sampling_params()
         token_t1, p1_probs = _sample_token(
             logits[0, -1],
-            temperature=self.temperature,
-            top_p=self.top_p,
-            min_p=self.min_p,
-            top_k=self.top_k,
+            temperature=curr_temp,
+            top_p=curr_top_p,
+            min_p=curr_min_p,
+            top_k=curr_top_k,
         )
 
         tokens_generated = 1
@@ -242,12 +272,13 @@ class MTPSpeculativeEngine:
         )
         mx.eval(mtp_logits)
 
+        curr_temp, curr_top_p, curr_min_p, curr_top_k = self._get_sampling_params()
         draft_tok, q2_probs = _sample_token(
             mtp_logits[0, -1],
-            temperature=self.temperature,
-            top_p=self.top_p,
-            min_p=self.min_p,
-            top_k=self.top_k,
+            temperature=curr_temp,
+            top_p=curr_top_p,
+            min_p=curr_min_p,
+            top_k=curr_top_k,
         )
 
         while tokens_generated < max_tokens:
@@ -264,19 +295,20 @@ class MTPSpeculativeEngine:
             verify_logits = target_logits[0, 0]
             bonus_logits = target_logits[0, 1]
 
+            curr_temp, curr_top_p, curr_min_p, curr_top_k = self._get_sampling_params()
             verify_pred, p_probs = _sample_token(
                 verify_logits,
-                temperature=self.temperature,
-                top_p=self.top_p,
-                min_p=self.min_p,
-                top_k=self.top_k,
+                temperature=curr_temp,
+                top_p=curr_top_p,
+                min_p=curr_min_p,
+                top_k=curr_top_k,
             )
 
             is_accepted, committed_token = _verify_draft_token(
                 draft_token=draft_tok,
                 p_probs=p_probs,
                 q_probs=q2_probs,
-                temperature=self.temperature,
+                temperature=curr_temp,
             )
             drafts_attempted += 1
 
@@ -305,10 +337,10 @@ class MTPSpeculativeEngine:
                 # Muestrear y emitir bonus token proyectado por el trunk en posición 1
                 bonus_tok, _ = _sample_token(
                     bonus_logits,
-                    temperature=self.temperature,
-                    top_p=self.top_p,
-                    min_p=self.min_p,
-                    top_k=self.top_k,
+                    temperature=curr_temp,
+                    top_p=curr_top_p,
+                    min_p=curr_min_p,
+                    top_k=curr_top_k,
                 )
                 tokens_generated += 1
                 yield {
@@ -334,12 +366,13 @@ class MTPSpeculativeEngine:
                     mtp_cache=mtp_cache,
                 )
                 mx.eval(mtp_logits)
+                next_temp, next_top_p, next_min_p, next_top_k = self._get_sampling_params()
                 next_draft_tok, q2_probs = _sample_token(
                     mtp_logits[0, -1],
-                    temperature=self.temperature,
-                    top_p=self.top_p,
-                    min_p=self.min_p,
-                    top_k=self.top_k,
+                    temperature=next_temp,
+                    top_p=next_top_p,
+                    min_p=next_min_p,
+                    top_k=next_top_k,
                 )
                 confirmed_token = bonus_tok
                 draft_tok = next_draft_tok
@@ -374,12 +407,13 @@ class MTPSpeculativeEngine:
                     mtp_cache=mtp_cache,
                 )
                 mx.eval(mtp_logits)
+                next_temp, next_top_p, next_min_p, next_top_k = self._get_sampling_params()
                 next_draft_tok, q2_probs = _sample_token(
                     mtp_logits[0, -1],
-                    temperature=self.temperature,
-                    top_p=self.top_p,
-                    min_p=self.min_p,
-                    top_k=self.top_k,
+                    temperature=next_temp,
+                    top_p=next_top_p,
+                    min_p=next_min_p,
+                    top_k=next_top_k,
                 )
                 confirmed_token = committed_token
                 draft_tok = next_draft_tok
@@ -407,14 +441,23 @@ def stream_generate_mtp(
     sampler: Optional[Any] = None,
     prompt_cache: Optional[List[Any]] = None,
     mtp_cache: Optional[List[Any]] = None,
+    adaptive_temperature: Optional[bool] = None,
     **kwargs,
 ) -> Generator[Any, None, None]:
     """
     Generador compatible con stream_generate() de mlx_lm para integración transparente en SuperMLX.
     Produce instancias GenerationResponse con .text, .token, .from_draft y métricas de generación.
+    Soporta sincronización dinámica con DualPhaseSampler y FEATURE_ADAPTIVE_TEMPERATURE.
     """
     from mlx_lm.generate import GenerationResponse
     from mlx_lm.tokenizer_utils import TokenizerWrapper
+
+    if adaptive_temperature is None:
+        try:
+            from supermlx.config import SETTINGS
+            adaptive_temperature = getattr(SETTINGS, "mtp_adaptive_temperature", True)
+        except Exception:
+            adaptive_temperature = True
 
     if not isinstance(tokenizer, TokenizerWrapper):
         tokenizer = TokenizerWrapper(tokenizer)
@@ -427,8 +470,8 @@ def stream_generate_mtp(
             prompt = tokenizer.encode(prompt, add_special_tokens=add_special_tokens)
         prompt = mx.array(prompt)
 
-    # Extraer parámetros de sampling del sampler si están presentes
-    temp = getattr(sampler, "temp", 0.0) if sampler is not None else 0.0
+    # Extraer parámetros de sampling base del sampler si están presentes
+    temp = getattr(sampler, "temp", getattr(sampler, "resp_temp", 0.0)) if sampler is not None else 0.0
     min_p = getattr(sampler, "min_p", 0.0) if sampler is not None else 0.0
     top_p = getattr(sampler, "top_p", 1.0) if sampler is not None else 1.0
     top_k = getattr(sampler, "top_k", 0) if sampler is not None else 0
@@ -439,6 +482,8 @@ def stream_generate_mtp(
         top_p=top_p,
         min_p=min_p,
         top_k=top_k,
+        sampler=sampler,
+        adaptive_temperature=adaptive_temperature,
     )
 
     detokenizer = tokenizer.detokenizer
