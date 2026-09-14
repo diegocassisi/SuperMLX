@@ -181,6 +181,8 @@ class MTPSpeculativeEngine:
         prompt_tokens: mx.array,
         max_tokens: int = 512,
         eos_token_id: Optional[int] = None,
+        prompt_cache: Optional[List[Any]] = None,
+        mtp_cache: Optional[List[Any]] = None,
     ) -> Generator[Dict[str, Any], None, None]:
         """
         Ejecuta el bucle de generación especulativa MTP rindiendo tokens y telemetría en tiempo real.
@@ -192,8 +194,9 @@ class MTPSpeculativeEngine:
         # 1. Inicialización de KV caches (trunk + cabeza MTP)
         from mlx_lm.models.cache import make_prompt_cache
 
-        cache = make_prompt_cache(self.model)
-        mtp_cache = self.model.make_mtp_cache()
+        cache = prompt_cache if prompt_cache is not None else make_prompt_cache(self.model)
+        if mtp_cache is None:
+            mtp_cache = self.model.make_mtp_cache()
 
         # 2. Prefill inicial del prompt
         if prompt_tokens.ndim == 1:
@@ -380,3 +383,87 @@ class MTPSpeculativeEngine:
             drafts_accepted,
             drafts_attempted,
         )
+
+
+def stream_generate_mtp(
+    model: Any,
+    tokenizer: Any,
+    prompt: Union[str, mx.array, List[int]],
+    max_tokens: int = 512,
+    sampler: Optional[Any] = None,
+    prompt_cache: Optional[List[Any]] = None,
+    mtp_cache: Optional[List[Any]] = None,
+    **kwargs,
+) -> Generator[Any, None, None]:
+    """
+    Generador compatible con stream_generate() de mlx_lm para integración transparente en SuperMLX.
+    Produce instancias GenerationResponse con .text, .token, .from_draft y métricas de generación.
+    """
+    from mlx_lm.generate import GenerationResponse
+    from mlx_lm.tokenizer_utils import TokenizerWrapper
+
+    if not isinstance(tokenizer, TokenizerWrapper):
+        tokenizer = TokenizerWrapper(tokenizer)
+
+    if not isinstance(prompt, mx.array):
+        if isinstance(prompt, str):
+            add_special_tokens = tokenizer.bos_token is None or not prompt.startswith(
+                tokenizer.bos_token
+            )
+            prompt = tokenizer.encode(prompt, add_special_tokens=add_special_tokens)
+        prompt = mx.array(prompt)
+
+    # Extraer parámetros de sampling del sampler si están presentes
+    temp = getattr(sampler, "temp", 0.0) if sampler is not None else 0.0
+    min_p = getattr(sampler, "min_p", 0.0) if sampler is not None else 0.0
+    top_p = getattr(sampler, "top_p", 1.0) if sampler is not None else 1.0
+    top_k = getattr(sampler, "top_k", 0) if sampler is not None else 0
+
+    engine = MTPSpeculativeEngine(
+        model=model,
+        temperature=temp,
+        top_p=top_p,
+        min_p=min_p,
+        top_k=top_k,
+    )
+
+    detokenizer = tokenizer.detokenizer
+    detokenizer.reset()
+
+    eos_ids = getattr(tokenizer, "eos_token_ids", set())
+    primary_eos = getattr(tokenizer, "eos_token_id", None)
+
+    tic = time.perf_counter()
+    tokens_yielded = 0
+
+    for step in engine.generate(
+        prompt_tokens=prompt,
+        max_tokens=max_tokens,
+        eos_token_id=primary_eos,
+        prompt_cache=prompt_cache,
+        mtp_cache=mtp_cache,
+    ):
+        token_id = int(step["token"])
+        detokenizer.add_token(token_id)
+        tokens_yielded += 1
+
+        is_eos = (token_id in eos_ids) or (token_id == primary_eos)
+        finish_reason = "stop" if is_eos else ("length" if tokens_yielded >= max_tokens else None)
+
+        yield GenerationResponse(
+            text=detokenizer.last_segment,
+            token=token_id,
+            logprobs=None,
+            from_draft=step.get("is_speculative", False),
+            prompt_tokens=prompt.size,
+            prompt_tps=0.0,
+            generation_tokens=tokens_yielded,
+            generation_tps=tokens_yielded / max(time.perf_counter() - tic, 1e-6),
+            peak_memory=mx.get_peak_memory() / 1e9,
+            finish_reason=finish_reason,
+        )
+
+        if finish_reason is not None:
+            break
+
+    detokenizer.finalize()

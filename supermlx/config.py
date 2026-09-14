@@ -168,6 +168,8 @@ class Settings:
     adaptive_temperature_default: float # Fallback response temperature
     adaptive_markers_prosa: str        # Comma-separated expert IDs for prose
     adaptive_markers_codigo_mate: str  # Comma-separated expert IDs for code/math
+    enable_mtp: bool                   # Multi-Token Prediction (MTP) speculative decoding
+    mtp_weights_path: str              # Local directory containing MTP weights and config
 
 
 def _normalize_model_family(value: Optional[str]) -> str:
@@ -312,4 +314,11 @@ def build_settings(script_dir: Path = Path(__file__).parent) -> Settings:
         adaptive_temperature_default=_env_float("ADAPTIVE_TEMP_DEFAULT", 0.40),
         adaptive_markers_prosa=_env_str("ADAPTIVE_MARKERS_PROSA", "19"),
         adaptive_markers_codigo_mate=_env_str("ADAPTIVE_MARKERS_CODIGO_MATE", "72,133,23,148,42,130,161,198,226"),
+        enable_mtp=_env_bool("ENABLE_MTP", False),
+        mtp_weights_path=_env_str("MTP_WEIGHTS_PATH", "models/Qwen3.6-35B-A3B-MTP-MLX"),
     )
+
+
+# Default global Settings instance
+SETTINGS = build_settings()
+

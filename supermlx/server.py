@@ -170,6 +170,7 @@ torch.backends.mps.is_built = lambda: False
 import mlx.core as mx
 from mlx_lm import load, stream_generate
 from mlx_lm.sample_utils import make_sampler
+from supermlx.mtp import stream_generate_mtp
 from mlx_lm.models.cache import (
     make_prompt_cache,
     can_trim_prompt_cache,
@@ -3463,6 +3464,9 @@ else:
     if _is_moe_path:
         _load_kwargs["lazy"] = True
         _terminal_status("🔧", "MoE model detected — loading with lazy=True (experts as placeholders)")
+    if SETTINGS.enable_mtp:
+        from supermlx.mtp import install_qwen3_5_mtp_trunk_shim, inject_qwen3_5_mtp_support, validate_qwen3_5_mtp_support
+        install_qwen3_5_mtp_trunk_shim()
     try:
         model, tokenizer = load(SETTINGS.model_path, **_load_kwargs)
     except Exception as _offline_err:
@@ -3471,6 +3475,21 @@ else:
         model, tokenizer = load(SETTINGS.model_path, **_load_kwargs)
     _terminal_status("✅", "Model loaded (mlx-lm).")
     _terminal_status("⚡", "Torch acceleration: N/A (text-only model).")
+
+    if SETTINGS.enable_mtp:
+        _mtp_dir = Path(SETTINGS.mtp_weights_path)
+        _mtp_cfg_path = _mtp_dir / "config.json"
+        if _mtp_cfg_path.exists():
+            import json as _json
+            with open(_mtp_cfg_path) as _f:
+                _mtp_cfg = _json.load(_f)
+            _injected = inject_qwen3_5_mtp_support(model, _mtp_dir, _mtp_cfg)
+            if _injected and validate_qwen3_5_mtp_support(model):
+                _terminal_status("🚀", f"MTP Speculative Decoding enabled ({_mtp_dir.name})")
+            else:
+                _terminal_status("⚠️", "MTP injection failed — falling back to standard autoregressive")
+        else:
+            _terminal_status("⚠️", f"MTP config not found at {_mtp_cfg_path} — running standard autoregressive")
 
     # ── Resolve think token IDs (once, at load) ───────────────────────────
     _think_start_id, _think_end_id = get_think_token_ids(tokenizer)
@@ -4181,7 +4200,12 @@ def _stream_generate_unified(
             _dcu_func = None
             _dcu_policy = None
 
-        for resp in stream_generate(
+        _stream_gen_fn = (
+            stream_generate_mtp
+            if (SETTINGS.enable_mtp and getattr(model, "mtp", None) is not None)
+            else stream_generate
+        )
+        for resp in _stream_gen_fn(
             **_stream_generate_kwargs(rest_tokens, max_tokens, sampler, prompt_cache, logits_processors=logits_processors)
         ):
             yield resp
@@ -4532,7 +4556,12 @@ class SidecarHandler(BaseHTTPRequestHandler):
         # ThinkingTracker: SSoT — starts in THINKING when enable_thinking=True
         _thinking_tracker.reset(enable_thinking=True)
 
-        for resp in stream_generate(
+        _sidecar_gen_fn = (
+            stream_generate_mtp
+            if (SETTINGS.enable_mtp and getattr(model, "mtp", None) is not None)
+            else stream_generate
+        )
+        for resp in _sidecar_gen_fn(
             **_stream_generate_kwargs(prompt_tokens, max_tokens, sampler, ephemeral_cache, logits_processors=logits_processors)
         ):
             token_count += 1

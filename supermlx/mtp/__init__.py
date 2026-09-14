@@ -15,11 +15,12 @@ from .qwen_mtp_shim import (
     inject_qwen3_5_mtp_support,
     validate_qwen3_5_mtp_support,
 )
-from .speculative_engine import MTPSpeculativeEngine
+from .speculative_engine import MTPSpeculativeEngine, stream_generate_mtp
 
 __all__ = [
     "install_qwen3_5_mtp_trunk_shim",
     "inject_qwen3_5_mtp_support",
     "validate_qwen3_5_mtp_support",
     "MTPSpeculativeEngine",
+    "stream_generate_mtp",
 ]
