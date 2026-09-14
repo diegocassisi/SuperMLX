@@ -131,7 +131,7 @@ def on_prefill_routed(inds: mx.array) -> Tuple[str, float]:
     try:
         # inds tiene forma (..., K) en prefill
         mx.eval(inds)
-        unique_experts = set(mx.unique(inds).tolist())
+        unique_experts = set(inds.reshape(-1).tolist())
 
         domain, temp = _domain_classifier.classify(unique_experts)
         _thread_context.domain_classified = True
