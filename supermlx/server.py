@@ -2756,6 +2756,7 @@ def _build_timing_dict(
     generation_started_at: Optional[float],
     rest_count: int,
     generated_tokens: List[int],
+    mtp_stats: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Build the prefill/decode timing dict used by request_logger and telemetry."""
     timing: Dict[str, Any] = {}
@@ -2770,6 +2771,10 @@ def _build_timing_dict(
             len(generated_tokens) / timing["decode_seconds"]
             if timing["decode_seconds"] > 0 else None
         )
+    if mtp_stats and mtp_stats.get("attempted", 0) > 0:
+        timing["mtp_alpha"] = mtp_stats["alpha"]
+        timing["mtp_accepted"] = mtp_stats["accepted"]
+        timing["mtp_attempted"] = mtp_stats["attempted"]
     return timing
 
 
@@ -2797,9 +2802,12 @@ def _log_generation_telemetry(
 
     if FEATURE_LOG_GENERATION:
         _gen_ms = (time.time() - generation_started_at) * 1000
+        _mtp_telemetry = ""
+        if timing.get("mtp_alpha") is not None:
+            _mtp_telemetry = f" | α={timing['mtp_alpha']:.1f}% ({timing['mtp_accepted']}/{timing['mtp_attempted']})"
         _pipeline_log("GEN", request_id,
             f"finished: {len(generated_tokens)} tokens in {_gen_ms/1000:.2f}s "
-            f"({timing.get('decode_tps', 0):.1f} tok/s decode)")
+            f"({timing.get('decode_tps', 0):.1f} tok/s decode){_mtp_telemetry}")
         _pipeline_log("GEN", request_id,
             f"thinking_tokens={_reas} | output_tokens={_non_reas}")
         # DIAGNOSTIC: model skipped thinking and reasoned in visible text
@@ -6445,6 +6453,8 @@ class APIHandler(BaseHTTPRequestHandler):
             _mem_profiler.snapshot(request_id, "PRE_PREFILL", is_anthropic=self._is_anthropic, rest_tokens=rest_count, kv_cache_offset=_kv_off)
             _mem_profiler.reset_peak()
 
+            _mtp_stats: Optional[Dict[str, Any]] = None
+
             if not is_streaming:
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -6490,6 +6500,13 @@ class APIHandler(BaseHTTPRequestHandler):
                 ):
                     generated_parts.append(response.text)
                     generated_tokens.append(int(response.token))
+                    if hasattr(response, "drafts_attempted") and response.drafts_attempted > 0:
+                        _mtp_stats = {
+                            "alpha": response.alpha,
+                            "accepted": response.drafts_accepted,
+                            "attempted": response.drafts_attempted,
+                            "draft_accepted": getattr(response, "draft_accepted", True),
+                        }
                     if _GPU_YIELD_SECONDS > 0:
                         time.sleep(_GPU_YIELD_SECONDS)
                     if first_token_at is None:
@@ -6523,9 +6540,14 @@ class APIHandler(BaseHTTPRequestHandler):
                     ):
                         progress_last_at = time.time()
                         _decode_tps = len(generated_tokens) / (time.time() - first_token_at) if first_token_at else 0
+                        _mtp_str = (
+                            f" | α={_mtp_stats['alpha']:.1f}% ({_mtp_stats['accepted']}/{_mtp_stats['attempted']})"
+                            if _mtp_stats and _mtp_stats.get("attempted", 0) > 0
+                            else ""
+                        )
                         _terminal_status(
                             "⏳",
-                            f"generated_tokens={len(generated_tokens)} | {_decode_tps:.1f} tok/s | {_metal_mem_str()}",
+                            f"generated_tokens={len(generated_tokens)} | {_decode_tps:.1f} tok/s{_mtp_str} | {_metal_mem_str()}",
                             request_id=request_id, stage="DECODE",
                         )
                 # ── THINKING CLEANUP (non-stream) ─────────────────────────
@@ -6697,7 +6719,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     if tool_calls:
                         full_response["choices"][0]["message"]["tool_calls"] = tool_calls
                     self.wfile.write(json.dumps(full_response).encode("utf-8"))
-                timing = _build_timing_dict(first_token_at, generation_started_at, rest_count, generated_tokens)
+                timing = _build_timing_dict(first_token_at, generation_started_at, rest_count, generated_tokens, mtp_stats=_mtp_stats)
                 if request_logger:
                     _think_log = _extract_thinking_text(raw_response_text)
                     request_logger.log(
@@ -6884,6 +6906,13 @@ class APIHandler(BaseHTTPRequestHandler):
                         logits_processors=logits_processors,
                     ):
                         generated_tokens.append(int(response.token))
+                        if hasattr(response, "drafts_attempted") and response.drafts_attempted > 0:
+                            _mtp_stats = {
+                                "alpha": response.alpha,
+                                "accepted": response.drafts_accepted,
+                                "attempted": response.drafts_attempted,
+                                "draft_accepted": getattr(response, "draft_accepted", True),
+                            }
                         if _GPU_YIELD_SECONDS > 0:
                             time.sleep(_GPU_YIELD_SECONDS)
                         if first_token_at is None:
@@ -7019,9 +7048,14 @@ class APIHandler(BaseHTTPRequestHandler):
                         ):
                             progress_last_at = time.time()
                             _decode_tps = len(generated_tokens) / (time.time() - first_token_at) if first_token_at else 0
+                            _mtp_str = (
+                                f" | α={_mtp_stats['alpha']:.1f}% ({_mtp_stats['accepted']}/{_mtp_stats['attempted']})"
+                                if _mtp_stats and _mtp_stats.get("attempted", 0) > 0
+                                else ""
+                            )
                             _terminal_status(
                                 "⏳",
-                                f"generated_tokens={len(generated_tokens)} | {_decode_tps:.1f} tok/s | {_metal_mem_str()}",
+                                f"generated_tokens={len(generated_tokens)} | {_decode_tps:.1f} tok/s{_mtp_str} | {_metal_mem_str()}",
                                 request_id=request_id, stage="DECODE",
                             )
                 finally:
@@ -7341,7 +7375,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     except BrokenPipeError:
                         _pipeline_log("WIRE", request_id, "❌ BROKEN PIPE on final_chunk — client disconnected before receiving response")
                         raise
-                timing = _build_timing_dict(first_token_at, generation_started_at, rest_count, generated_tokens)
+                timing = _build_timing_dict(first_token_at, generation_started_at, rest_count, generated_tokens, mtp_stats=_mtp_stats)
                 if request_logger:
                     _think_log = _extract_thinking_text(raw_full_text)
                     request_logger.log(
@@ -7549,11 +7583,17 @@ class APIHandler(BaseHTTPRequestHandler):
                     prefill_tps = (
                         rest_count / prefill_seconds if prefill_seconds > 0 else 0.0
                     )
+                    _mtp_suffix = ""
+                    if _mtp_stats and _mtp_stats.get("attempted", 0) > 0:
+                        _mtp_suffix = (
+                            f" | mtp_alpha={_mtp_stats['alpha']:.1f}% "
+                            f"({_mtp_stats['accepted']}/{_mtp_stats['attempted']})"
+                        )
                     _req_log = (
                             f"Request {request_id} finished | output_tokens={token_breakdown} | "
                             f"elapsed={elapsed:.2f}s | tok/s={speed:.2f} | "
                             f"prefill={prefill_seconds:.2f}s ({prefill_tps:.0f} tok/s) | "
-                            f"decode={decode_seconds:.2f}s ({decode_tps:.1f} tok/s)"
+                            f"decode={decode_seconds:.2f}s ({decode_tps:.1f} tok/s){_mtp_suffix}"
                     )
                     # Append MoE stats if active
                     _moe_suffix = ""

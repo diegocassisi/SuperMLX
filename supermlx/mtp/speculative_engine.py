@@ -222,6 +222,9 @@ class MTPSpeculativeEngine:
             "is_speculative": False,
             "accepted": True,
             "tokens_generated": tokens_generated,
+            "drafts_accepted": drafts_accepted,
+            "drafts_attempted": drafts_attempted,
+            "alpha": 0.0,
         }
 
         if eos_token_id is not None and token_t1 == eos_token_id:
@@ -280,6 +283,7 @@ class MTPSpeculativeEngine:
             if is_accepted:
                 _clear_draft_rollback(cache)
                 drafts_accepted += 1
+                curr_alpha = (drafts_accepted / max(drafts_attempted, 1)) * 100.0
 
                 # Emitir draft token confirmado
                 tokens_generated += 1
@@ -288,6 +292,9 @@ class MTPSpeculativeEngine:
                     "is_speculative": True,
                     "accepted": True,
                     "tokens_generated": tokens_generated,
+                    "drafts_accepted": drafts_accepted,
+                    "drafts_attempted": drafts_attempted,
+                    "alpha": curr_alpha,
                 }
                 if eos_token_id is not None and draft_tok == eos_token_id:
                     logger.info("[DECISION] EOS token alcanzado por draft. Finalizando.")
@@ -309,6 +316,9 @@ class MTPSpeculativeEngine:
                     "is_speculative": False,
                     "accepted": True,
                     "tokens_generated": tokens_generated,
+                    "drafts_accepted": drafts_accepted,
+                    "drafts_attempted": drafts_attempted,
+                    "alpha": curr_alpha,
                 }
                 if eos_token_id is not None and bonus_tok == eos_token_id:
                     logger.info("[DECISION] EOS token alcanzado por bonus token. Finalizando.")
@@ -337,14 +347,18 @@ class MTPSpeculativeEngine:
             else:
                 # RECHAZO: Rollback simétrico en trunk y en cabezal MTP
                 _rollback_draft_caches(cache, mtp_cache=mtp_cache)
+                curr_alpha = (drafts_accepted / max(drafts_attempted, 1)) * 100.0
 
                 # Emitir el token corregido
                 tokens_generated += 1
                 yield {
                     "token": committed_token,
-                    "is_speculative": True,
+                    "is_speculative": False,
                     "accepted": False,
                     "tokens_generated": tokens_generated,
+                    "drafts_accepted": drafts_accepted,
+                    "drafts_attempted": drafts_attempted,
+                    "alpha": curr_alpha,
                 }
                 if eos_token_id is not None and committed_token == eos_token_id:
                     logger.info("[DECISION] EOS token alcanzado por token corregido. Finalizando.")
@@ -450,7 +464,7 @@ def stream_generate_mtp(
         is_eos = (token_id in eos_ids) or (token_id == primary_eos)
         finish_reason = "stop" if is_eos else ("length" if tokens_yielded >= max_tokens else None)
 
-        yield GenerationResponse(
+        response = GenerationResponse(
             text=detokenizer.last_segment,
             token=token_id,
             logprobs=None,
@@ -462,6 +476,12 @@ def stream_generate_mtp(
             peak_memory=mx.get_peak_memory() / 1e9,
             finish_reason=finish_reason,
         )
+        response.drafts_accepted = step.get("drafts_accepted", 0)
+        response.drafts_attempted = step.get("drafts_attempted", 0)
+        response.alpha = step.get("alpha", 0.0)
+        response.draft_accepted = step.get("accepted", True)
+
+        yield response
 
         if finish_reason is not None:
             break
