@@ -3314,21 +3314,27 @@ def _build_sampler(
     has_tools = bool(body.get("tools"))
     body_temp = body.get("temperature")
 
-    # Determine temperatures for thinking and response phases
-    if is_compact:
+    # Determine temperatures for thinking and response phases:
+    # think_temp MUST remain shielded from generic client body.get("temperature") (e.g. 1.0 default)
+    body_thinking_temp = body.get("thinking_temperature")
+    if body_thinking_temp is not None and isinstance(body_thinking_temp, (int, float)):
+        think_temp = float(body_thinking_temp)
+    elif is_compact:
         think_temp = SETTINGS.compaction_temperature
-        resp_temp = SETTINGS.compaction_temperature
-    elif body_temp is not None and isinstance(body_temp, (int, float)):
-        # Client specified an explicit temperature
-        think_temp = float(body_temp)
-        resp_temp = min(float(body_temp), SETTINGS.response_temperature)
     else:
         think_temp = SETTINGS.thinking_temperature
+
+    if is_compact:
+        resp_temp = SETTINGS.compaction_temperature
+    elif body_temp is not None and isinstance(body_temp, (int, float)):
+        resp_temp = min(float(body_temp), SETTINGS.response_temperature)
+    else:
         resp_temp = (
             SETTINGS.tool_calling_temperature
             if has_tools
             else SETTINGS.response_temperature
         )
+
 
     # Determine active tracker
     active_tracker = tracker if tracker is not None else globals().get("_thinking_tracker")
@@ -4398,18 +4404,6 @@ class SidecarHandler(BaseHTTPRequestHandler):
         )
 
         sampler, logits_processors, _ = _build_sampler(body, enable_thinking=_enable_thinking)
-        if SETTINGS.adaptive_temperature_enabled and hasattr(sampler, "update_response_temperature"):
-            try:
-                from .domain_classifier import register_request_sampler
-                _has_client_temp = body.get("temperature") is not None and isinstance(body.get("temperature"), (int, float))
-                register_request_sampler(
-                    sampler=sampler,
-                    request_id=request_id,
-                    client_specified_temp=_has_client_temp,
-                    log_fn=_terminal_status,
-                )
-            except Exception:
-                pass
 
         # ── GENERATE (under model_lock) ────────────────────────────────────
         acquired = False
@@ -5500,18 +5494,6 @@ class APIHandler(BaseHTTPRequestHandler):
         sampler, logits_processors, sampler_kwargs = _build_sampler(
             body, enable_thinking=enable_thinking, is_compact=_is_compact
         )
-        if not _is_compact and SETTINGS.adaptive_temperature_enabled and hasattr(sampler, "update_response_temperature"):
-            try:
-                from .domain_classifier import register_request_sampler
-                _has_client_temp = body.get("temperature") is not None and isinstance(body.get("temperature"), (int, float))
-                register_request_sampler(
-                    sampler=sampler,
-                    request_id=request_id,
-                    client_specified_temp=_has_client_temp,
-                    log_fn=_terminal_status,
-                )
-            except Exception:
-                pass
         # V2: inject reasoning budget logits processor
         if isinstance(_thinking_tracker, ThinkingTrackerV2):
             _budget_proc = _thinking_tracker.make_logits_processor()
@@ -6454,6 +6436,7 @@ class APIHandler(BaseHTTPRequestHandler):
             _mem_profiler.reset_peak()
 
             _mtp_stats: Optional[Dict[str, Any]] = None
+            _task_detector: Any = None
 
             if not is_streaming:
                 self.send_response(200)
@@ -6487,6 +6470,18 @@ class APIHandler(BaseHTTPRequestHandler):
                 _thinking_tracker.reset(enable_thinking=enable_thinking)
                 _max_thinking_ns = 128 if _is_embedded_agent else SETTINGS.max_thinking_tokens
                 progress_last_at = time.time()
+
+                from .sampling import DynamicTaskDetector
+                _client_has_custom_temp = body.get("temperature") is not None and isinstance(body.get("temperature"), (int, float))
+                _task_detector = DynamicTaskDetector(
+                    sampler=sampler,
+                    request_id=request_id,
+                    client_has_custom_temp=_client_has_custom_temp,
+                    client_temp=float(body.get("temperature")) if _client_has_custom_temp else None,
+                    log_fn=_terminal_status,
+                    pipeline_log_fn=_pipeline_log if FEATURE_FULL_LOGGING else None,
+                )
+
                 for response in _stream_generate_unified(
                     rest_tokens,
                     max_tokens,
@@ -6514,6 +6509,7 @@ class APIHandler(BaseHTTPRequestHandler):
                         _prefill_done.set()  # Stop prefill progress
                     # Feed token to tracker (SSoT)
                     _ns_event = _thinking_tracker.feed(int(response.token), response.text)
+                    _task_detector.feed(response.text, _thinking_tracker.is_responding)
                     if _ns_event != ThinkingEvent.NONE:
                         _pipeline_log("THINK", request_id,
                             f"{_ns_event.name} at token {len(generated_tokens)} (non-stream)")
@@ -6545,9 +6541,18 @@ class APIHandler(BaseHTTPRequestHandler):
                             if _mtp_stats and _mtp_stats.get("attempted", 0) > 0
                             else ""
                         )
+                        if _is_compact:
+                            _stage_str = f"T={getattr(sampler, 'resp_temp', 0.0):.2f} [COMPACT]"
+                        elif _thinking_tracker and getattr(_thinking_tracker, "is_thinking", False):
+                            _stage_str = f"T={getattr(sampler, 'think_temp', 0.50):.2f} (THINK)"
+                        elif locals().get("_tool_call_tracker") and getattr(_tool_call_tracker, "is_buffering", False):
+                            _stage_str = f"T={getattr(sampler, 'resp_temp', 0.10):.2f} [TOOLS]"
+                        else:
+                            _tag = getattr(_task_detector, "tag", "DEFAULT") if _task_detector else "DEFAULT"
+                            _stage_str = f"T={getattr(sampler, 'resp_temp', getattr(sampler, 'temp', 0.30)):.2f} [{_tag}]"
                         _terminal_status(
                             "⏳",
-                            f"generated_tokens={len(generated_tokens)} | {_decode_tps:.1f} tok/s{_mtp_str} | {_metal_mem_str()}",
+                            f"generated_tokens={len(generated_tokens)} | {_decode_tps:.1f} tok/s | {_stage_str}{_mtp_str} | {_metal_mem_str()}",
                             request_id=request_id, stage="DECODE",
                         )
                 # ── THINKING CLEANUP (non-stream) ─────────────────────────
@@ -6893,6 +6898,17 @@ class APIHandler(BaseHTTPRequestHandler):
                         pass
 
                 progress_last_at = time.time()
+                from .sampling import DynamicTaskDetector
+                _client_has_custom_temp = body.get("temperature") is not None and isinstance(body.get("temperature"), (int, float))
+                _task_detector = DynamicTaskDetector(
+                    sampler=sampler,
+                    request_id=request_id,
+                    client_has_custom_temp=_client_has_custom_temp,
+                    client_temp=float(body.get("temperature")) if _client_has_custom_temp else None,
+                    log_fn=_terminal_status,
+                    pipeline_log_fn=_pipeline_log if FEATURE_FULL_LOGGING else None,
+                )
+
                 try:
                     for response in _stream_generate_unified(
                         rest_tokens,
@@ -6925,6 +6941,7 @@ class APIHandler(BaseHTTPRequestHandler):
                         # It detects <think>/<\/think> transitions, counts tokens,
                         # and detects thinking loops (repeated </think>).
                         _think_event = _thinking_tracker.feed(int(response.token), response_text)
+                        _task_detector.feed(response_text, _thinking_tracker.is_responding)
                         if _think_event != ThinkingEvent.NONE:
                             _pipeline_log("THINK", request_id,
                                 f"{_think_event.name} at token {len(generated_tokens)} (stream)")
@@ -7053,9 +7070,18 @@ class APIHandler(BaseHTTPRequestHandler):
                                 if _mtp_stats and _mtp_stats.get("attempted", 0) > 0
                                 else ""
                             )
+                            if _is_compact:
+                                _stage_str = f"T={getattr(sampler, 'resp_temp', 0.0):.2f} [COMPACT]"
+                            elif _thinking_tracker and getattr(_thinking_tracker, "is_thinking", False):
+                                _stage_str = f"T={getattr(sampler, 'think_temp', 0.50):.2f} (THINK)"
+                            elif locals().get("_tool_call_tracker") and getattr(_tool_call_tracker, "is_buffering", False):
+                                _stage_str = f"T={getattr(sampler, 'resp_temp', 0.10):.2f} [TOOLS]"
+                            else:
+                                _tag = getattr(_task_detector, "tag", "DEFAULT") if _task_detector else "DEFAULT"
+                                _stage_str = f"T={getattr(sampler, 'resp_temp', getattr(sampler, 'temp', 0.30)):.2f} [{_tag}]"
                             _terminal_status(
                                 "⏳",
-                                f"generated_tokens={len(generated_tokens)} | {_decode_tps:.1f} tok/s{_mtp_str} | {_metal_mem_str()}",
+                                f"generated_tokens={len(generated_tokens)} | {_decode_tps:.1f} tok/s | {_stage_str}{_mtp_str} | {_metal_mem_str()}",
                                 request_id=request_id, stage="DECODE",
                             )
                 finally:
@@ -7589,11 +7615,14 @@ class APIHandler(BaseHTTPRequestHandler):
                             f" | mtp_alpha={_mtp_stats['alpha']:.1f}% "
                             f"({_mtp_stats['accepted']}/{_mtp_stats['attempted']})"
                         )
+                    _final_tag = getattr(_task_detector, "tag", "DEFAULT") if _task_detector else "DEFAULT"
+                    _final_temp = getattr(sampler, "resp_temp", getattr(sampler, "temp", 0.30)) if sampler else 0.30
                     _req_log = (
                             f"Request {request_id} finished | output_tokens={token_breakdown} | "
                             f"elapsed={elapsed:.2f}s | tok/s={speed:.2f} | "
                             f"prefill={prefill_seconds:.2f}s ({prefill_tps:.0f} tok/s) | "
-                            f"decode={decode_seconds:.2f}s ({decode_tps:.1f} tok/s){_mtp_suffix}"
+                            f"decode={decode_seconds:.2f}s ({decode_tps:.1f} tok/s) | "
+                            f"task={_final_tag} | temp={_final_temp:.2f}{_mtp_suffix}"
                     )
                     # Append MoE stats if active
                     _moe_suffix = ""
@@ -7618,11 +7647,14 @@ class APIHandler(BaseHTTPRequestHandler):
                         pass
                     _terminal_status("✅", _req_log + _moe_suffix + _mem_suffix, indent=1)
                 else:
+                    _final_tag = getattr(_task_detector, "tag", "DEFAULT") if _task_detector else "DEFAULT"
+                    _final_temp = getattr(sampler, "resp_temp", getattr(sampler, "temp", 0.30)) if sampler else 0.30
                     _terminal_status(
                         "✅",
                         (
                             f"Request {request_id} finished | output_tokens={token_breakdown} | "
-                            f"elapsed={elapsed:.2f}s | tok/s={speed:.2f}"
+                            f"elapsed={elapsed:.2f}s | tok/s={speed:.2f} | "
+                            f"task={_final_tag} | temp={_final_temp:.2f}"
                         ),
                         indent=1,
                     )
