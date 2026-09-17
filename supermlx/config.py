@@ -191,6 +191,13 @@ class Settings:
     enable_mtp: bool                   # Multi-Token Prediction (MTP) speculative decoding
     mtp_weights_path: str              # Local directory containing MTP weights and config
     mtp_adaptive_temperature: bool     # Sync MTP speculative sampling temperature with model (DualPhase / Domain-Adaptive)
+    thinking_thermal_spark: bool       # Enable Thermal Spark (re-heating pulse) in thinking mode
+    spark_min_tokens_threshold: int    # Minimum thinking tokens before sparks are allowed
+    spark_periodic_interval: int       # Interval in tokens for periodic heartbeat sparks
+    spark_pulse_duration: int          # Duration of the spark in tokens
+    spark_temperature: float           # Temperature during thermal spark
+    spark_min_p: float                 # min_p safety filter during thermal spark
+    spark_cooldown_tokens: int         # Minimum tokens between consecutive sparks
 
 
 def _normalize_model_family(value: Optional[str]) -> str:
@@ -352,6 +359,13 @@ def build_settings(script_dir: Path = Path(__file__).parent) -> Settings:
         enable_mtp=_env_bool("ENABLE_MTP", False),
         mtp_weights_path=_env_str("MTP_WEIGHTS_PATH", "models/Qwen3.6-35B-A3B-MTP-MLX"),
         mtp_adaptive_temperature=_env_bool("MTP_ADAPTIVE_TEMPERATURE", True),
+        thinking_thermal_spark=_env_bool("FEATURE_THINKING_THERMAL_SPARK", True),
+        spark_min_tokens_threshold=_env_int("SPARK_MIN_TOKENS_THRESHOLD", 1200),
+        spark_periodic_interval=_env_int("SPARK_PERIODIC_INTERVAL", 1500),
+        spark_pulse_duration=_env_int("SPARK_PULSE_DURATION", 35),
+        spark_temperature=_env_float("SPARK_TEMPERATURE", 0.88),
+        spark_min_p=_env_float("SPARK_MIN_P", 0.05),
+        spark_cooldown_tokens=_env_int("SPARK_COOLDOWN_TOKENS", 250),
     )
 
 

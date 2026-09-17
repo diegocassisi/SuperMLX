@@ -104,12 +104,20 @@ class ThinkingSchedule:
         return self.minimum + (self.initial - self.minimum) * (1.0 - progress) ** self.exponent
 
 
-def parse_thinking_schedule(schedule_str: str) -> List[Tuple[int, float]]:
-    """Parsea una cadena de schedule tipo '0:0.80,256:0.60,1024:0.35,3000:0.10'.
+def parse_thinking_schedule(schedule_str: Any) -> List[Tuple[int, float]]:
+    """Parsea una cadena de schedule tipo '0:0.80,256:0.60,1024:0.35,3000:0.10'
+    o un objeto ThinkingSchedule.
 
     Retorna una lista ordenada de tuplas (min_tokens, temperature) para los buckets.
     """
-    if not schedule_str or not schedule_str.strip():
+    if isinstance(schedule_str, ThinkingSchedule):
+        return [
+            (0, schedule_str.temperature(0)),
+            (int(schedule_str.budget * 0.1), schedule_str.temperature(int(schedule_str.budget * 0.1))),
+            (int(schedule_str.budget * 0.25), schedule_str.temperature(int(schedule_str.budget * 0.25))),
+            (int(schedule_str.budget * 0.5), schedule_str.minimum),
+        ]
+    if not schedule_str or not isinstance(schedule_str, str) or not schedule_str.strip():
         return []
     buckets: List[Tuple[int, float]] = []
     pairs = [p.strip() for p in schedule_str.split(",") if p.strip()]
@@ -129,6 +137,104 @@ def parse_thinking_schedule(schedule_str: str) -> List[Tuple[int, float]]:
     if buckets and buckets[0][0] > 0:
         buckets.insert(0, (0, buckets[0][1]))
     return buckets
+
+
+SPARK_TRIGGER_PATTERN = re.compile(
+    r"\b(reconsider|different\s+angle|recheck|from\s+scratch|can't\s+be\s+right|start\s+over|think\s+about\s+this\s+differently)\b",
+    re.IGNORECASE,
+)
+
+
+class ThermalSparkController:
+    """Controlador de Shock Térmico (Thermal Spark) para Thinking Time.
+
+    Monitorea tokens emitidos durante la fase de reasoning (<think>) y dispara
+    un pulso estocástico de alta temperatura cuando detecta:
+    1. Triggers semánticos de vacilación/duda (ej: 'reconsider', 'different angle').
+    2. Triggers periódicos (heartbeat cada N tokens para prevenir estancamiento mudo).
+
+    Al dispararse, mantiene la temperatura en spark_temperature durante pulse_duration tokens,
+    respetando una ventana de enfriamiento (cooldown) entre disparos.
+    """
+
+    def __init__(
+        self,
+        min_tokens: int = 1200,
+        periodic_interval: int = 1500,
+        pulse_duration: int = 35,
+        spark_temp: float = 0.88,
+        spark_min_p: float = 0.05,
+        cooldown_tokens: int = 250,
+        enabled: bool = True,
+        log_fn: Optional[Callable[..., Any]] = None,
+    ) -> None:
+        self.min_tokens = max(0, min_tokens)
+        self.periodic_interval = max(1, periodic_interval)
+        self.pulse_duration = max(1, pulse_duration)
+        self.spark_temp = _validate_temperature(spark_temp)
+        self.spark_min_p = max(0.0, min(1.0, float(spark_min_p)))
+        self.cooldown_tokens = max(0, cooldown_tokens)
+        self.enabled = bool(enabled)
+        self.log_fn = log_fn
+
+        self.spark_remaining_tokens: int = 0
+        self.last_spark_token: int = -999999
+        self.buffer: str = ""
+        self.last_cause: str = ""
+
+    @property
+    def is_spark_active(self) -> bool:
+        return self.enabled and self.spark_remaining_tokens > 0
+
+    def feed_text(self, text: str, current_token_count: int) -> bool:
+        """Procesa texto reciente y decide si debe gatillar un pulso térmico."""
+        if not self.enabled or not text:
+            return False
+
+        # Actualizar buffer circular de los últimos 128 caracteres asegurando separación léxica
+        if self.buffer and not self.buffer[-1].isspace() and not text.startswith(" "):
+            self.buffer = (self.buffer + " " + text)[-128:]
+        else:
+            self.buffer = (self.buffer + text)[-128:]
+
+        # Si ya hay un pulso activo o estamos en cooldown o no alcanzamos el umbral mínimo:
+        if self.spark_remaining_tokens > 0:
+            return False
+        if current_token_count < self.min_tokens:
+            return False
+        if (current_token_count - self.last_spark_token) < self.cooldown_tokens:
+            return False
+
+        trigger_cause: Optional[str] = None
+
+        # 1. Trigger Semántico
+        match = SPARK_TRIGGER_PATTERN.search(self.buffer)
+        if match:
+            trigger_cause = f"semantic:{match.group(0)}"
+        # 2. Trigger Periódico (Heartbeat cada N tokens superado min_tokens)
+        elif (current_token_count - self.min_tokens) % self.periodic_interval < 5:
+            trigger_cause = f"periodic:{current_token_count}"
+
+        if trigger_cause:
+            self.spark_remaining_tokens = self.pulse_duration
+            self.last_spark_token = current_token_count
+            self.last_cause = trigger_cause
+            self.buffer = ""  # Limpiar buffer tras disparar para evitar re-gatillo residual
+            msg = (
+                f"[SPARK] ⚡ Thermal Spark activado (causa={trigger_cause}) -> "
+                f"Temp={self.spark_temp:.2f}, Duración={self.pulse_duration} tok (tok={current_token_count})"
+            )
+            logger.info(msg)
+            if self.log_fn:
+                self.log_fn("⚡", msg)
+            return True
+
+        return False
+
+    def step_token(self) -> None:
+        """Decrementa la duración del pulso activo tras cada token muestreado."""
+        if self.spark_remaining_tokens > 0:
+            self.spark_remaining_tokens -= 1
 
 
 class TaskHeaderFilter:
@@ -310,8 +416,9 @@ class DualPhaseSampler:
 
     Routes token selection to think_sampler while tracker.is_thinking is True,
     and switches to resp_sampler as soon as tracker transitions to responding.
-    Supports dynamic adaptation of response temperature during generation and
-    pre-instantiated bucketized thinking temperature schedules.
+    Supports dynamic adaptation of response temperature during generation,
+    pre-instantiated bucketized thinking temperature schedules, and
+    Thermal Spark pulses for escaping attractors/loops.
     """
 
     def __init__(
@@ -325,6 +432,7 @@ class DualPhaseSampler:
         top_k: int = -1,
         min_p: float = 0.0,
         think_buckets: Optional[List[Tuple[int, Callable[[mx.array], mx.array], float]]] = None,
+        spark_controller: Optional[ThermalSparkController] = None,
     ) -> None:
         self.think_sampler = think_sampler
         self.resp_sampler = resp_sampler
@@ -335,10 +443,22 @@ class DualPhaseSampler:
         self.top_k = top_k
         self.min_p = min_p
         self.think_buckets = think_buckets or []
+        self.spark_controller = spark_controller
+        if self.spark_controller and self.spark_controller.enabled:
+            self.spark_sampler, _ = safe_make_sampler(
+                self.spark_controller.spark_temp,
+                self.top_p,
+                self.top_k,
+                self.spark_controller.spark_min_p,
+            )
+        else:
+            self.spark_sampler = None
 
     @property
     def think_temp(self) -> float:
-        """Returns the active thinking temperature (reads bucket if scheduled)."""
+        """Returns the active thinking temperature (reads spark or bucket if scheduled)."""
+        if self.spark_controller and self.spark_controller.is_spark_active:
+            return self.spark_controller.spark_temp
         if self.think_buckets and self.tracker is not None:
             count = getattr(self.tracker, "thinking_count", 0)
             selected_temp = self.think_buckets[0][2]
@@ -354,6 +474,13 @@ class DualPhaseSampler:
     def think_temp(self, value: float) -> None:
         self._think_temp = _validate_temperature(value)
 
+    def feed_thinking_text(self, text: str) -> bool:
+        """Alimenta texto generado para detección de triggers de Thermal Spark."""
+        if self.spark_controller and self.tracker is not None and getattr(self.tracker, "is_thinking", False):
+            count = getattr(self.tracker, "thinking_count", 0)
+            return self.spark_controller.feed_text(text, count)
+        return False
+
     def update_response_temperature(self, new_temp: float) -> None:
         """Dynamically adapts the response temperature without interrupting generation."""
         new_temp = _validate_temperature(new_temp)
@@ -364,6 +491,10 @@ class DualPhaseSampler:
 
     def __call__(self, logits: mx.array) -> mx.array:
         if self.tracker is not None and getattr(self.tracker, "is_thinking", False):
+            if self.spark_controller and self.spark_controller.is_spark_active:
+                self.spark_controller.step_token()
+                if self.spark_sampler is not None:
+                    return self.spark_sampler(logits)
             if self.think_buckets:
                 count = getattr(self.tracker, "thinking_count", 0)
                 active_sampler = self.think_buckets[0][1]
@@ -424,7 +555,10 @@ def build_dual_phase_sampler(
     min_p: float,
     enable_thinking: bool = True,
     tracker: Any = None,
-    schedule: Optional[str] = None,
+    schedule: Optional[Any] = None,
+    spark_controller: Optional[ThermalSparkController] = None,
+    enable_thermal_spark: Optional[bool] = None,
+    **kwargs: Any,
 ) -> Tuple[Callable[[mx.array], mx.array], Dict[str, Any]]:
     """Builds a dual-phase sampler or single-phase sampler based on configuration."""
     think_temp = _validate_temperature(think_temp)
@@ -455,6 +589,24 @@ def build_dual_phase_sampler(
             initial_think_temp = think_temp
             think_sampler, _ = safe_make_sampler(initial_think_temp, top_p, top_k, min_p)
 
+        effective_spark_controller = spark_controller
+        if effective_spark_controller is None:
+            spark_active = (
+                enable_thermal_spark
+                if enable_thermal_spark is not None
+                else getattr(SETTINGS, "thinking_thermal_spark", True)
+            )
+            if spark_active:
+                effective_spark_controller = ThermalSparkController(
+                    min_tokens=getattr(SETTINGS, "spark_min_tokens_threshold", 1200),
+                    periodic_interval=getattr(SETTINGS, "spark_periodic_interval", 1500),
+                    pulse_duration=getattr(SETTINGS, "spark_pulse_duration", 35),
+                    spark_temp=getattr(SETTINGS, "spark_temperature", 0.88),
+                    spark_min_p=getattr(SETTINGS, "spark_min_p", 0.05),
+                    cooldown_tokens=getattr(SETTINGS, "spark_cooldown_tokens", 250),
+                    enabled=True,
+                )
+
         sampler = DualPhaseSampler(
             think_sampler,
             resp_sampler,
@@ -465,6 +617,7 @@ def build_dual_phase_sampler(
             top_k=top_k,
             min_p=min_p,
             think_buckets=think_buckets,
+            spark_controller=effective_spark_controller,
         )
         applied_kwargs = {
             "mode": "dual_phase",
@@ -475,7 +628,10 @@ def build_dual_phase_sampler(
             "min_p": min_p,
         }
         if think_buckets and effective_schedule:
-            applied_kwargs["thinking_schedule"] = effective_schedule
+            applied_kwargs["thinking_schedule"] = str(effective_schedule)
+        if effective_spark_controller and effective_spark_controller.enabled:
+            applied_kwargs["thermal_spark"] = True
+            applied_kwargs["spark_temp"] = effective_spark_controller.spark_temp
     else:
         sampler = resp_sampler
         applied_kwargs = {

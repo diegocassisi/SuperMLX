@@ -4470,6 +4470,8 @@ class SidecarHandler(BaseHTTPRequestHandler):
         ):
             full_text += resp.text
             token_count += 1
+            if hasattr(sampler, "feed_thinking_text") and resp.text:
+                sampler.feed_thinking_text(resp.text)
 
         # ── STRIP THINKING from response ──────────────────────────────────
         # Only apply think-stripping when thinking was enabled.
@@ -7009,6 +7011,8 @@ class APIHandler(BaseHTTPRequestHandler):
                                     break
                         if response_text:
                             raw_parts.append(response_text)
+                            if hasattr(sampler, "feed_thinking_text"):
+                                sampler.feed_thinking_text(response_text)
                             # ── ANTHROPIC LIVE STREAMING (tracker-based) ────
                             if _anthropic_streaming:
                                 if _think_event == ThinkingEvent.EXIT_THINKING:

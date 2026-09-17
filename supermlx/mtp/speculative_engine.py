@@ -201,6 +201,13 @@ class MTPSpeculativeEngine:
         min_p = getattr(self.sampler, "min_p", self.min_p)
         top_k = getattr(self.sampler, "top_k", self.top_k)
 
+        # Sincronizar min_p durante pulso de Thermal Spark si está activo
+        if (
+            hasattr(self.sampler, "spark_controller")
+            and getattr(self.sampler.spark_controller, "is_spark_active", False)
+        ):
+            min_p = getattr(self.sampler.spark_controller, "spark_min_p", min_p)
+
         return temp, top_p, min_p, top_k
 
     def generate(
@@ -523,6 +530,9 @@ def stream_generate_mtp(
 
         detokenizer.add_token(token_id)
         tokens_yielded += 1
+
+        if hasattr(sampler, "feed_thinking_text") and detokenizer.last_segment:
+            sampler.feed_thinking_text(detokenizer.last_segment)
 
         if tokens_yielded >= max_tokens:
             break
