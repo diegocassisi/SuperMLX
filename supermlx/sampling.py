@@ -444,6 +444,7 @@ class DualPhaseSampler:
         self.min_p = min_p
         self.think_buckets = think_buckets or []
         self.spark_controller = spark_controller
+        self._token_stepped_by_call: bool = False
         if self.spark_controller and self.spark_controller.enabled:
             self.spark_sampler, _ = safe_make_sampler(
                 self.spark_controller.spark_temp,
@@ -477,6 +478,10 @@ class DualPhaseSampler:
     def feed_thinking_text(self, text: str) -> bool:
         """Alimenta texto generado para detección de triggers de Thermal Spark."""
         if self.spark_controller and self.tracker is not None and getattr(self.tracker, "is_thinking", False):
+            if self.spark_controller.is_spark_active:
+                if not self._token_stepped_by_call:
+                    self.spark_controller.step_token()
+                self._token_stepped_by_call = False
             count = getattr(self.tracker, "thinking_count", 0)
             return self.spark_controller.feed_text(text, count)
         return False
@@ -493,6 +498,7 @@ class DualPhaseSampler:
         if self.tracker is not None and getattr(self.tracker, "is_thinking", False):
             if self.spark_controller and self.spark_controller.is_spark_active:
                 self.spark_controller.step_token()
+                self._token_stepped_by_call = True
                 if self.spark_sampler is not None:
                     return self.spark_sampler(logits)
             if self.think_buckets:
