@@ -16,6 +16,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
 
+try:
+    from dotenv import load_dotenv
+    _dotenv_path = Path(__file__).resolve().parent.parent / ".env"
+    if _dotenv_path.exists():
+        load_dotenv(dotenv_path=_dotenv_path, override=False)
+except ImportError:
+    pass
+
 
 def _env_str(name: str, default: str) -> str:
     value = os.getenv(name)
@@ -119,9 +127,21 @@ class Settings:
     quantized_kv_start: int
     default_temperature: float
     thinking_temperature: float
+    thinking_schedule_enabled: bool
+    thinking_temp_schedule: str
+    thinking_temperature_min: float
+    thinking_cooling_exponent: float
+    thinking_cooling_fraction: float
+    temp_resp_precise: float
+    temp_resp_explain: float
+    temp_resp_explore: float
     response_temperature: float
     tool_calling_temperature: float
     compaction_temperature: float
+    temp_resp_code: float
+    temp_resp_tech: float
+    temp_resp_prose: float
+    temp_resp_creative: float
     default_top_p: float
     default_top_k: int
     default_min_p: float
@@ -242,9 +262,23 @@ def build_settings(script_dir: Path = Path(__file__).parent) -> Settings:
         quantized_kv_start=_env_int("QUANTIZED_KV_START", 0),
         default_temperature=_env_float("DEFAULT_TEMPERATURE", 0.6),
         thinking_temperature=_env_float("THINKING_TEMPERATURE", 0.50),
-        response_temperature=_env_float("RESPONSE_TEMPERATURE", 0.10),
+        thinking_schedule_enabled=_env_bool("THINKING_SCHEDULE_ENABLED", False),
+        thinking_temp_schedule=_env_str(
+            "THINKING_TEMP_SCHEDULE", "0:0.80,256:0.60,1024:0.35,3000:0.10"
+        ),
+        thinking_temperature_min=_env_float("THINKING_TEMPERATURE_MIN", 0.10),
+        thinking_cooling_exponent=_env_float("THINKING_COOLING_EXPONENT", 3.0),
+        thinking_cooling_fraction=_env_float("THINKING_COOLING_FRACTION", 0.25),
+        temp_resp_precise=_env_float("TEMP_RESP_PRECISE", 0.10),
+        temp_resp_explain=_env_float("TEMP_RESP_EXPLAIN", 0.50),
+        temp_resp_explore=_env_float("TEMP_RESP_EXPLORE", 0.85),
+        response_temperature=_env_float("RESPONSE_TEMPERATURE", 0.30),
         tool_calling_temperature=_env_float("TOOL_CALLING_TEMPERATURE", 0.10),
         compaction_temperature=_env_float("COMPACTION_TEMPERATURE", 0.20),
+        temp_resp_code=_env_float("TEMP_RESP_CODE", 0.10),
+        temp_resp_tech=_env_float("TEMP_RESP_TECH", 0.30),
+        temp_resp_prose=_env_float("TEMP_RESP_PROSE", 0.65),
+        temp_resp_creative=_env_float("TEMP_RESP_CREATIVE", 0.85),
         default_top_p=_env_float("DEFAULT_TOP_P", 0.95),
         default_top_k=_env_int("DEFAULT_TOP_K", 20),
         default_min_p=_env_float("DEFAULT_MIN_P", 0.0),
@@ -308,7 +342,7 @@ def build_settings(script_dir: Path = Path(__file__).parent) -> Settings:
         ngram_size=_env_int("NGRAM_SIZE", 35),
         ngram_window=_env_int("NGRAM_WINDOW", 400),
         ngram_check_interval=_env_int("NGRAM_CHECK_INTERVAL", 32),
-        adaptive_temperature_enabled=_env_bool("FEATURE_ADAPTIVE_TEMPERATURE", True),
+        adaptive_temperature_enabled=_env_bool("FEATURE_ADAPTIVE_TEMPERATURE", False),
         adaptive_temperature_layer=_env_int("ADAPTIVE_TEMP_LAYER", 20),
         adaptive_temperature_prosa=_env_float("ADAPTIVE_TEMP_PROSA", 0.85),
         adaptive_temperature_codigo_mate=_env_float("ADAPTIVE_TEMP_CODIGO_MATE", 0.10),

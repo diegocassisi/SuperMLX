@@ -3315,7 +3315,6 @@ def _build_sampler(
     body_temp = body.get("temperature")
 
     # Determine temperatures for thinking and response phases:
-    # think_temp MUST remain shielded from generic client body.get("temperature") (e.g. 1.0 default)
     body_thinking_temp = body.get("thinking_temperature")
     if body_thinking_temp is not None and isinstance(body_thinking_temp, (int, float)):
         think_temp = float(body_thinking_temp)
@@ -3326,15 +3325,16 @@ def _build_sampler(
 
     if is_compact:
         resp_temp = SETTINGS.compaction_temperature
+    elif has_tools:
+        resp_temp = SETTINGS.tool_calling_temperature
     elif body_temp is not None and isinstance(body_temp, (int, float)):
-        resp_temp = min(float(body_temp), SETTINGS.response_temperature)
+        resp_temp = float(body_temp)
     else:
         resp_temp = (
             SETTINGS.tool_calling_temperature
             if has_tools
             else SETTINGS.response_temperature
         )
-
 
     # Determine active tracker
     active_tracker = tracker if tracker is not None else globals().get("_thinking_tracker")
@@ -6546,7 +6546,8 @@ class APIHandler(BaseHTTPRequestHandler):
                         elif _thinking_tracker and getattr(_thinking_tracker, "is_thinking", False):
                             _stage_str = f"T={getattr(sampler, 'think_temp', 0.50):.2f} (THINK)"
                         elif locals().get("_tool_call_tracker") and getattr(_tool_call_tracker, "is_buffering", False):
-                            _stage_str = f"T={getattr(sampler, 'resp_temp', 0.10):.2f} [TOOLS]"
+                            _tag = getattr(_task_detector, "tag", "TOOLS") if _task_detector and getattr(_task_detector, "tag", "DEFAULT") != "DEFAULT" else "TOOLS"
+                            _stage_str = f"T={getattr(sampler, 'resp_temp', 0.10):.2f} [{_tag}]"
                         else:
                             _tag = getattr(_task_detector, "tag", "DEFAULT") if _task_detector else "DEFAULT"
                             _stage_str = f"T={getattr(sampler, 'resp_temp', getattr(sampler, 'temp', 0.30)):.2f} [{_tag}]"
@@ -7075,7 +7076,8 @@ class APIHandler(BaseHTTPRequestHandler):
                             elif _thinking_tracker and getattr(_thinking_tracker, "is_thinking", False):
                                 _stage_str = f"T={getattr(sampler, 'think_temp', 0.50):.2f} (THINK)"
                             elif locals().get("_tool_call_tracker") and getattr(_tool_call_tracker, "is_buffering", False):
-                                _stage_str = f"T={getattr(sampler, 'resp_temp', 0.10):.2f} [TOOLS]"
+                                _tag = getattr(_task_detector, "tag", "TOOLS") if _task_detector and getattr(_task_detector, "tag", "DEFAULT") != "DEFAULT" else "TOOLS"
+                                _stage_str = f"T={getattr(sampler, 'resp_temp', 0.10):.2f} [{_tag}]"
                             else:
                                 _tag = getattr(_task_detector, "tag", "DEFAULT") if _task_detector else "DEFAULT"
                                 _stage_str = f"T={getattr(sampler, 'resp_temp', getattr(sampler, 'temp', 0.30)):.2f} [{_tag}]"

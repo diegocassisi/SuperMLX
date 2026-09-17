@@ -735,11 +735,13 @@ def _extract_session_context(
 
 
 def _hoist_system_messages(msgs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Merge all system messages into one at position 0.
+    """Merge all system messages into one at position 0 and append dynamic protocol directive.
 
     Required by Qwen3.5 strict rule: system messages MUST be at the beginning.
     After compress/RAG/heal, system messages can be scattered — this fixes ordering.
     """
+    from .sampling import DYNAMIC_TEMP_PROTOCOL_DIRECTIVE
+
     system_parts: List[str] = []
     non_system: List[Dict[str, Any]] = []
     for m in msgs:
@@ -749,10 +751,20 @@ def _hoist_system_messages(msgs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 system_parts.append(c.strip())
         else:
             non_system.append(m)
+
     if system_parts:
-        merged_system = {"role": "system", "content": "\n\n".join(system_parts)}
+        merged = "\n\n".join(system_parts)
+        if (
+            "[TASK TAG DIRECTIVE]" not in merged
+            and "[PROTOCOL DIRECTIVE]" not in merged
+            and "[MANDATORY TASK TAG DIRECTIVE]" not in merged
+        ):
+            merged = f"{merged}\n\n{DYNAMIC_TEMP_PROTOCOL_DIRECTIVE}"
+        merged_system = {"role": "system", "content": merged}
         return [merged_system] + non_system
-    return non_system
+
+    merged_system = {"role": "system", "content": DYNAMIC_TEMP_PROTOCOL_DIRECTIVE}
+    return [merged_system] + non_system
 
 
 def _assert_cache_key_safety(

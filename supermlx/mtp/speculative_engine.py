@@ -15,17 +15,63 @@ REGLAS INVIOLABLES:
 - Obligatorio tipado estricto en funciones públicas.
 - Obligatorio recolectar telemetría de tasa de aceptación (alpha = accepted_drafts / total_drafts).
 SSoT: Leviathan, Mattson, Liang (2023) / Chen et al. (2023) Speculative Decoding Theorem.
+
+ASTRA Modification
+Integration requirements:
+- forward_with_hidden(..., n_confirmed=1) snapshots recurrent state after
+  the confirmed input and before the speculative input.
+- mtp_forward caches its confirmed input, not its predicted output.
+- The caller advances any adaptive sampler tracker for each emitted token.
+- Sampling implemented here supports temperature/top_k/min_p/top_p only,
+  in that order; arbitrary sampler callables/processors are not reproduced.
+- Exact rejection sampling is subject to floating-point arithmetic.
 """
 
 from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Dict, Generator, List, Optional, Tuple
+from typing import Any, Dict, Generator, List, Optional, Tuple, Union
 
 import mlx.core as mx
 
 logger = logging.getLogger(__name__)
+
+
+def _distribution_from_logits(
+    logits: mx.array,
+    temperature: float = 0.0,
+    top_p: float = 1.0,
+    min_p: float = 0.0,
+    top_k: int = 0,
+) -> mx.array:
+    """Final distribution for a single vocabulary vector; greedy is one-hot."""
+    if logits.ndim != 1 or logits.size == 0:
+        raise ValueError("Expected a nonempty 1D logits vector")
+    if not 0.0 < top_p <= 1.0 or not 0.0 <= min_p <= 1.0 or top_k < 0:
+        raise ValueError("Invalid top_p, min_p or top_k")
+    logits = logits.astype(mx.float32)
+    if temperature <= 0.0:
+        return (mx.arange(logits.shape[0]) == mx.argmax(logits)).astype(mx.float32)
+    scaled = logits / temperature
+    if top_k > 0:
+        k = min(top_k, scaled.shape[0])
+        threshold = mx.min(mx.topk(scaled, k=k))
+        scaled = mx.where(scaled < threshold, -float("inf"), scaled)
+    if min_p > 0.0:
+        # Equivalent to softmax(x) >= min_p * max(softmax(x)).
+        threshold = mx.max(scaled) + mx.log(mx.array(min_p, dtype=mx.float32))
+        scaled = mx.where(scaled < threshold, -float("inf"), scaled)
+    probs = mx.softmax(scaled)
+    if top_p < 1.0:
+        order = mx.argsort(-probs)
+        ordered = probs[order]
+        cumulative = mx.cumsum(ordered)
+        remove = mx.concatenate([mx.array([False]), cumulative[:-1] > top_p])
+        ordered = mx.where(remove, 0.0, ordered)
+        probs = ordered[mx.argsort(order)]
+        probs = probs / mx.sum(probs)
+    return probs
 
 
 def _sample_token(
@@ -35,46 +81,11 @@ def _sample_token(
     min_p: float = 0.0,
     top_k: int = 0,
 ) -> Tuple[int, mx.array]:
-    """
-    Muestrea un token a partir de logits y devuelve (token_id, probs).
-    Si temperature <= 0.0, ejecuta argmax determinístico (greedy).
-    Garantiza que probs devuelto sea la distribución final normalizada post-filtros
-    (temperatura, min_p, top_k, top_p) requerida para paridad en Rejection Sampling.
-    """
+    probs = _distribution_from_logits(logits, temperature, top_p, min_p, top_k)
     if temperature <= 0.0:
-        token_id = int(mx.argmax(logits, axis=-1).item())
-        probs = mx.softmax(logits, axis=-1)
-        return token_id, probs
-
-    # 1. Escalamiento por temperatura
-    scaled_logits = logits / temperature
-
-    # 2. Top-K filtering si aplica
-    if top_k > 0:
-        kth_val = mx.topk(scaled_logits, k=top_k)[..., -1:]
-        scaled_logits = mx.where(scaled_logits < kth_val, -1e9, scaled_logits)
-
-    # 3. Min-P filtering si aplica
-    if min_p > 0.0:
-        probs_raw = mx.softmax(scaled_logits, axis=-1)
-        max_prob = mx.max(probs_raw, axis=-1, keepdims=True)
-        threshold = max_prob * min_p
-        scaled_logits = mx.where(probs_raw < threshold, -1e9, scaled_logits)
-
-    probs = mx.softmax(scaled_logits, axis=-1)
-
-    # 4. Top-P / Nucleus sampling si aplica
-    if top_p < 1.0:
-        sorted_indices = mx.argsort(-probs, axis=-1)
-        sorted_probs = probs[sorted_indices]
-        cumulative_probs = mx.cumsum(sorted_probs, axis=-1)
-        cutoff_mask = cumulative_probs > top_p
-        cutoff_mask = mx.concatenate([mx.array([False]), cutoff_mask[:-1]])
-        probs = mx.where(cutoff_mask, 0.0, probs)
-        probs = probs / mx.sum(probs)
-
-    token_id = int(mx.random.categorical(mx.log(probs + 1e-12)).item())
-    return token_id, probs
+        return int(mx.argmax(logits).item()), probs
+    # log(0) = -inf: filtered-out tokens stay impossible.
+    return int(mx.random.categorical(mx.log(probs)).item()), probs
 
 
 def _verify_draft_token(
@@ -83,37 +94,23 @@ def _verify_draft_token(
     q_probs: mx.array,
     temperature: float,
 ) -> Tuple[bool, int]:
-    """
-    Aplica el teorema de Rejection Sampling de Leviathan & Chen:
-    - Probabilidad de aceptación: alpha = min(1, p(x) / q(x))
-    - Si se rechaza: muestrea de la distribución residual (p - q)+ / sum(p - q)+
-    """
     if temperature <= 0.0:
-        # En modo greedy, la verificación es una comparación de igualdad exacta
-        target_token = int(mx.argmax(p_probs, axis=-1).item())
-        is_accepted = (draft_token == target_token)
-        committed_token = draft_token if is_accepted else target_token
-        return is_accepted, committed_token
-
-    p_val = float(p_probs[draft_token].item())
-    q_val = float(q_probs[draft_token].item())
-    ratio = p_val / max(q_val, 1e-12)
-
-    # Moneda de aceptación
-    u = float(mx.random.uniform().item())
-    if u < ratio:
+        target = int(mx.argmax(p_probs).item())
+        return draft_token == target, target
+    p_val = p_probs[draft_token]
+    q_val = q_probs[draft_token]
+    # q_val is positive because the draft was sampled from q.
+    accept = mx.random.uniform() * q_val < mx.minimum(p_val, q_val)
+    if bool(accept.item()):
         return True, draft_token
-
-    # Si se rechaza, muestreo de la distribución residual
-    residual = mx.maximum(0.0, p_probs - q_probs)
-    residual_sum = float(mx.sum(residual).item())
-    if residual_sum > 1e-9:
-        residual_probs = residual / residual_sum
-        resampled_token = int(mx.random.categorical(mx.log(residual_probs + 1e-12)).item())
-    else:
-        resampled_token = int(mx.random.categorical(mx.log(p_probs + 1e-12)).item())
-
-    return False, resampled_token
+    residual = mx.maximum(p_probs - q_probs, 0.0)
+    # categorical normalizes the residual weights implicitly. No epsilon or
+    # fallback to p: either would alter the intended distribution.
+    total = mx.sum(residual)
+    if not bool((mx.isfinite(total) & (total > 0)).item()):
+        raise FloatingPointError("Invalid rejection residual; check logits and cache state")
+    token = int(mx.random.categorical(mx.log(residual)).item())
+    return False, token
 
 
 def _rollback_draft_caches(
@@ -124,7 +121,7 @@ def _rollback_draft_caches(
     Restaura los cachés del trunk y del MTP al estado previo al draft rechazado.
     - Capas SSM (ArraysCache): restaura (conv_snap, ssm_snap) de rollback_state.
     - Capas de atención (KVCache): recorta 1 token con trim(1).
-    - Cabezal MTP (KVCache): recorta 1 token con trim(1) para no desfasar posiciones RoPE.
+    - Cabezal MTP (KVCache): recorta 1 token con trim(1) para mantener sincronía posicional.
     """
     for c in model_cache:
         if hasattr(c, "rollback_state") and c.rollback_state is not None:
@@ -141,6 +138,7 @@ def _rollback_draft_caches(
         for c in mtp_cache:
             if hasattr(c, "trim") and getattr(c, "offset", 0) > 0:
                 c.trim(1)
+
 
 
 def _clear_draft_rollback(model_cache: List[Any]) -> None:
@@ -218,7 +216,11 @@ class MTPSpeculativeEngine:
         Utiliza verificación en batch de 2 tokens (n_confirmed=1) con emisión de bonus token (1+alpha).
         """
         logger.info("[INICIO] Generación especulativa MTP iniciada (max_tokens=%d)", max_tokens)
-        start_time = time.time()
+        if max_tokens < 0:
+            raise ValueError("max_tokens must be nonnegative")
+        if max_tokens == 0:
+            return
+        start_time = time.perf_counter()
 
         # 1. Inicialización de KV caches (trunk + cabeza MTP)
         from mlx_lm.models.cache import make_prompt_cache
@@ -235,7 +237,7 @@ class MTPSpeculativeEngine:
         mx.eval(logits, pre_norm)
 
         curr_temp, curr_top_p, curr_min_p, curr_top_k = self._get_sampling_params()
-        token_t1, p1_probs = _sample_token(
+        token_t1, _ = _sample_token(
             logits[0, -1],
             temperature=curr_temp,
             top_p=curr_top_p,
@@ -259,6 +261,9 @@ class MTPSpeculativeEngine:
 
         if eos_token_id is not None and token_t1 == eos_token_id:
             logger.info("[DECISION] EOS token alcanzado en prefill. Finalizando.")
+            return
+
+        if tokens_generated >= max_tokens:
             return
 
         # 3. Primer draft MTP a partir del último estado oculto del prompt prefill
@@ -296,7 +301,7 @@ class MTPSpeculativeEngine:
             bonus_logits = target_logits[0, 1]
 
             curr_temp, curr_top_p, curr_min_p, curr_top_k = self._get_sampling_params()
-            verify_pred, p_probs = _sample_token(
+            p_probs = _distribution_from_logits(
                 verify_logits,
                 temperature=curr_temp,
                 top_p=curr_top_p,
@@ -334,6 +339,8 @@ class MTPSpeculativeEngine:
                 if tokens_generated >= max_tokens:
                     break
 
+                # Resolve again after the consumer processes the accepted token.
+                curr_temp, curr_top_p, curr_min_p, curr_top_k = self._get_sampling_params()
                 # Muestrear y emitir bonus token proyectado por el trunk en posición 1
                 bonus_tok, _ = _sample_token(
                     bonus_logits,
@@ -418,7 +425,7 @@ class MTPSpeculativeEngine:
                 confirmed_token = committed_token
                 draft_tok = next_draft_tok
 
-        elapsed = time.time() - start_time
+        elapsed = time.perf_counter() - start_time
         alpha = (drafts_accepted / max(drafts_attempted, 1)) * 100.0
         tps = tokens_generated / max(elapsed, 0.001)
 
@@ -442,7 +449,7 @@ def stream_generate_mtp(
     prompt_cache: Optional[List[Any]] = None,
     mtp_cache: Optional[List[Any]] = None,
     adaptive_temperature: Optional[bool] = None,
-    **kwargs,
+    **kwargs: Any,
 ) -> Generator[Any, None, None]:
     """
     Generador compatible con stream_generate() de mlx_lm para integración transparente en SuperMLX.
@@ -489,11 +496,16 @@ def stream_generate_mtp(
     detokenizer = tokenizer.detokenizer
     detokenizer.reset()
 
-    eos_ids = getattr(tokenizer, "eos_token_ids", set())
+    eos_ids = set(getattr(tokenizer, "eos_token_ids", set()) or ())
     primary_eos = getattr(tokenizer, "eos_token_id", None)
+    if primary_eos is not None:
+        eos_ids.add(primary_eos)
 
     tic = time.perf_counter()
     tokens_yielded = 0
+    token_id = None
+    is_eos = False
+    last_step = {}
 
     for step in engine.generate(
         prompt_tokens=prompt,
@@ -503,11 +515,17 @@ def stream_generate_mtp(
         mtp_cache=mtp_cache,
     ):
         token_id = int(step["token"])
+        last_step = step
+        is_eos = token_id in eos_ids
+        if is_eos:
+            tokens_yielded += 1
+            break
+
         detokenizer.add_token(token_id)
         tokens_yielded += 1
 
-        is_eos = (token_id in eos_ids) or (token_id == primary_eos)
-        finish_reason = "stop" if is_eos else ("length" if tokens_yielded >= max_tokens else None)
+        if tokens_yielded >= max_tokens:
+            break
 
         response = GenerationResponse(
             text=detokenizer.last_segment,
@@ -519,7 +537,7 @@ def stream_generate_mtp(
             generation_tokens=tokens_yielded,
             generation_tps=tokens_yielded / max(time.perf_counter() - tic, 1e-6),
             peak_memory=mx.get_peak_memory() / 1e9,
-            finish_reason=finish_reason,
+            finish_reason=None,
         )
         response.drafts_accepted = step.get("drafts_accepted", 0)
         response.drafts_attempted = step.get("drafts_attempted", 0)
@@ -528,7 +546,22 @@ def stream_generate_mtp(
 
         yield response
 
-        if finish_reason is not None:
-            break
-
     detokenizer.finalize()
+    if token_id is not None:
+        final_response = GenerationResponse(
+            text=detokenizer.last_segment,
+            token=token_id,
+            logprobs=None,
+            from_draft=last_step.get("is_speculative", False),
+            prompt_tokens=prompt.size,
+            prompt_tps=0.0,
+            generation_tokens=tokens_yielded,
+            generation_tps=tokens_yielded / max(time.perf_counter() - tic, 1e-6),
+            peak_memory=mx.get_peak_memory() / 1e9,
+            finish_reason="stop" if is_eos else "length",
+        )
+        final_response.drafts_accepted = last_step.get("drafts_accepted", 0)
+        final_response.drafts_attempted = last_step.get("drafts_attempted", 0)
+        final_response.alpha = last_step.get("alpha", 0.0)
+        final_response.draft_accepted = last_step.get("accepted", True)
+        yield final_response

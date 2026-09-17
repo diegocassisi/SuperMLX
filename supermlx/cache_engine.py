@@ -19,6 +19,17 @@ Extends mlx-lm's LRUPromptCache with:
    and rollback_arrays_cache if next request's matched_prefix <
    snapshot_position. Decision logic lives in server.py (same layer
    as Memory Guard), NOT in this module.
+
+
+ASTRA Modification
+Hybrid-aware prompt cache with conservative reuse.
+
+Recurrent caches are never shortened without a complete checkpoint.
+Rollback is staged before committing. Callers remain responsible for
+matching physical model tokens to cache keys and validating prefix hashes.
+Snapshot schema now includes complete recurrent layer states; legacy
+array-only snapshots are rejected. Requires independent deepcopy semantics
+for mutable cache objects and compatible MLX persistent array semantics.
 """
 
 import copy
@@ -60,36 +71,23 @@ _is_arrays_cache = is_recurrent_layer  # backward compat alias for internal refs
 
 
 def _trim_hybrid(cache: list, n: int) -> bool:
-    """Trim n tokens from KVCache layers only (skip ArraysCache).
-
-    Returns True if at least one layer was trimmed.
-    """
-    trimmed = 0
-    for layer in cache:
-        if (
-            hasattr(layer, "is_trimmable")
-            and layer.is_trimmable()
-            and hasattr(layer, "trim")
-        ):
-            layer.trim(n)
-            trimmed += 1
-    return trimmed > 0
+    """Compatibility helper: never partially trim a recurrent cache."""
+    return strip_response_tokens(cache, n)
 
 
-def strip_response_tokens(
-    cache: list, n: int
-) -> bool:
-    """Strip n response tokens from cache (in-place).
-
-    Handles both pure KVCache and hybrid (ArraysCache + KVCache) models.
-    Returns True if trim succeeded.
-    """
+def strip_response_tokens(cache: list, n: int) -> bool:
+    """Trim only non-recurrent caches; failed caches must be discarded."""
     if n <= 0:
         return True
-    if can_trim_prompt_cache(cache):
-        trim_prompt_cache(cache, n)
-        return True
-    return _trim_hybrid(cache, n)
+    if not cache or any(_is_arrays_cache(c) for c in cache):
+        return False
+    if not can_trim_prompt_cache(cache):
+        return False
+    offsets = [getattr(c, "offset", None) for c in cache]
+    if any(o is None or int(o) < n for o in offsets):
+        return False
+    trim_prompt_cache(cache, n)
+    return all(int(c.offset) == int(o) - n for c, o in zip(cache, offsets))
 
 
 # ── ArraysCache Snapshot/Rollback ────────────────────────────────────────────
@@ -113,7 +111,7 @@ def snapshot_arrays_cache(cache: list) -> Dict[str, Any]:
     TRIGGER CONTRACT: caller (server.py) MUST call this BEFORE
     prefilling tokens > SNAPSHOT_THRESHOLD.
     """
-    snapshot = {"layers": {}, "kv_offsets": {}, "nbytes": 0}
+    snapshot = {"layers": {}, "states": {}, "kv_offsets": {}, "nbytes": 0}
 
     for i, layer in enumerate(cache):
         if _is_arrays_cache(layer):
@@ -126,6 +124,9 @@ def snapshot_arrays_cache(cache: list) -> Dict[str, Any]:
                 else:
                     copied.append(None)
             snapshot["layers"][i] = copied
+            state = copy.deepcopy(layer)
+            state.cache = copied
+            snapshot["states"][i] = state
         elif hasattr(layer, "offset"):
             # Record KVCache offset for trim on rollback
             snapshot["kv_offsets"][i] = int(layer.offset)
@@ -143,53 +144,49 @@ def snapshot_arrays_cache(cache: list) -> Dict[str, Any]:
 
 
 def rollback_arrays_cache(cache: list, snapshot: Dict[str, Any]) -> bool:
-    """Restore ArraysCache layers from a snapshot and trim KVCache layers.
+    """Stage restoration on copies, committing only after full validation.
 
-    - ArraysCache layers: in-place replace of .cache arrays from snapshot
-    - KVCache layers: trimmed back to the offset recorded in snapshot
-
-    Returns True if rollback succeeded (at least one layer restored).
+    Preserves snapshot-time recurrent metadata as well as arrays. Legacy
+    snapshots without complete recurrent states are intentionally rejected.
     """
-    if not snapshot.get("layers") and not snapshot.get("kv_offsets"):
+    try:
+        layers = {int(i): state for i, state in snapshot.get("states", {}).items()}
+        offsets = {int(i): int(o) for i, o in snapshot.get("kv_offsets", {}).items()}
+        recurrent = {i for i, c in enumerate(cache) if _is_arrays_cache(c)}
+        others = set(range(len(cache))) - recurrent
+        if not cache or set(layers) != recurrent or set(offsets) != others:
+            return False
+        for i, state in layers.items():
+            if type(state) is not type(cache[i]):
+                return False
+        for i, old in offsets.items():
+            c = cache[i]
+            if old < 0 or not hasattr(c, "offset") or int(c.offset) < old:
+                return False
+            if int(c.offset) > old and not (
+                callable(getattr(c, "trim", None))
+                and callable(getattr(c, "is_trimmable", None))
+                and c.is_trimmable()
+            ):
+                return False
+        # Custom __deepcopy__ implementations must provide isolated mutable
+        # state; this is also required by the existing prompt-cache API.
+        staged = copy.deepcopy(cache)
+        for i, state in layers.items():
+            staged[i] = copy.deepcopy(state)
+        for i, old in offsets.items():
+            delta = int(staged[i].offset) - old
+            if delta:
+                staged[i].trim(delta)
+            if int(staged[i].offset) != old:
+                return False
+        arrays = [a for i in layers for a in staged[i].cache if a is not None]
+        if arrays:
+            mx.eval(*arrays)
+    except Exception:
         return False
-
-    restored = 0
-
-    # Restore ArraysCache layers
-    for idx_str, arrays in snapshot.get("layers", {}).items():
-        idx = int(idx_str) if isinstance(idx_str, str) else idx_str
-        if idx < len(cache) and _is_arrays_cache(cache[idx]):
-            # Deep copy again to keep the snapshot reusable
-            cache[idx].cache = [
-                mx.array(a) if a is not None else None
-                for a in arrays
-            ]
-            restored += 1
-
-    # Trim KVCache layers back to snapshot position
-    for idx_str, old_offset in snapshot.get("kv_offsets", {}).items():
-        idx = int(idx_str) if isinstance(idx_str, str) else idx_str
-        if idx < len(cache) and hasattr(cache[idx], "offset"):
-            current_offset = int(cache[idx].offset)
-            if current_offset > old_offset:
-                trim_n = current_offset - old_offset
-                if hasattr(cache[idx], "trim"):
-                    cache[idx].trim(trim_n)
-                    restored += 1
-
-    # Materialize restored arrays
-    if restored > 0:
-        to_eval = []
-        for idx_str in snapshot.get("layers", {}):
-            idx = int(idx_str) if isinstance(idx_str, str) else idx_str
-            if idx < len(cache) and _is_arrays_cache(cache[idx]):
-                to_eval.extend(
-                    a for a in cache[idx].cache if a is not None
-                )
-        if to_eval:
-            mx.eval(*to_eval)
-
-    return restored > 0
+    cache[:] = staged
+    return True
 
 
 @dataclass
@@ -282,13 +279,17 @@ def prepare_cache_for_insertion(
     with generated tokens are reusable only after a complete checkpoint
     restore; failure is deliberately fail-closed.
     """
-    if not generated_tokens or can_trim_prompt_cache(cache):
+    if not generated_tokens:
+        return list(cache_key), []
+    if not any(_is_arrays_cache(c) for c in cache):
+        if not can_trim_prompt_cache(cache):
+            return None
         return list(cache_key), list(generated_tokens)
     if checkpoint is None:
         return None
-    if not restore_hybrid_generation_checkpoint(cache, checkpoint):
+    if not 0 < checkpoint.cache_key_len <= len(cache_key):
         return None
-    if checkpoint.cache_key_len > len(cache_key):
+    if not restore_hybrid_generation_checkpoint(cache, checkpoint):
         return None
     return list(cache_key[: checkpoint.cache_key_len]), []
 
@@ -300,7 +301,7 @@ class HybridPromptCache(LRUPromptCache):
 
     mlx-lm's fetch_nearest_cache skips "longer" matches when
     can_trim_prompt_cache is False (hybrid models like Qwen3 MoE).
-    This subclass handles them via per-layer KVCache trim.
+    This subclass rejects them unless a valid shorter entry exists.
 
     Returns (cache, rest_tokens, FetchResult) with diagnostics.
     """
@@ -323,36 +324,28 @@ class HybridPromptCache(LRUPromptCache):
 
         if result.longer is not None and result.common_prefix > short_length:
             cache_entry = self._trie.get(result.model, result.longer)
-            cache = copy.deepcopy(cache_entry.prompt_cache)
+            source = cache_entry.prompt_cache
             prefix = min(len(tokens) - 1, result.common_prefix)
             num_to_trim = len(result.longer) - prefix
-
-            # Pure KVCache: use mlx-lm's trim
-            if can_trim_prompt_cache(cache):
-                trim_prompt_cache(cache, num_to_trim)
-                return (
-                    cache,
-                    tokens[prefix:],
-                    FetchResult(
-                        hit_type=HitType.LONGER_TRIMMED,
-                        matched_prefix_len=prefix,
-                        trimmed_tokens=num_to_trim,
-                    ),
-                )
-
-            # Hybrid: per-layer KVCache trim
-            if _trim_hybrid(cache, num_to_trim):
-                return (
-                    cache,
-                    tokens[prefix:],
-                    FetchResult(
-                        hit_type=HitType.LONGER_TRIMMED,
-                        matched_prefix_len=prefix,
-                        trimmed_tokens=num_to_trim,
-                    ),
-                )
-
-            # Trim failed entirely — fall through to shorter
+            # Reject recurrent candidates before copying. A shorter valid
+            # entry remains eligible below, otherwise return MISS.
+            if (
+                prefix >= 0
+                and num_to_trim >= 0
+                and not any(_is_arrays_cache(c) for c in source)
+                and can_trim_prompt_cache(source)
+            ):
+                cache = copy.deepcopy(source)
+                if strip_response_tokens(cache, num_to_trim):
+                    return (
+                        cache,
+                        tokens[prefix:],
+                        FetchResult(
+                            hit_type=HitType.LONGER_TRIMMED,
+                            matched_prefix_len=prefix,
+                            trimmed_tokens=num_to_trim,
+                        ),
+                    )
 
         if short_length > 0:
             cache_entry = self._trie.get(result.model, result.shorter)
