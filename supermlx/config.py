@@ -202,6 +202,8 @@ class Settings:
     epistemic_nudge_interval: int      # Interval in thinking tokens between pauses
     epistemic_nudge_min_tokens: int    # Minimum thinking tokens before first nudge is allowed
     epistemic_nudge_text: str          # Text template to inject into thinking KV-cache
+    closure_nudge_interval: int        # Interval in thinking tokens for closure nudge injection
+    closure_nudge_text: str            # Text template to inject for closure evaluation
 
 
 def _normalize_model_family(value: Optional[str]) -> str:
@@ -374,6 +376,11 @@ def build_settings(script_dir: Path = Path(__file__).parent) -> Settings:
         epistemic_nudge_interval=_env_int("EPISTEMIC_NUDGE_INTERVAL", 2000),
         epistemic_nudge_min_tokens=_env_int("EPISTEMIC_NUDGE_MIN_TOKENS", 1500),
         epistemic_nudge_text=_env_str("EPISTEMIC_NUDGE_TEXT", "\n\n[PAUSA DE RIGOR EPISTEMOLÓGICO]\n"),
+        closure_nudge_interval=_env_int("CLOSURE_NUDGE_INTERVAL", 15000),
+        closure_nudge_text=_env_str(
+            "CLOSURE_NUDGE_TEXT",
+            "[CRÍTICO: EVALUACIÓN DE CIERRE]  SI RESUELTO ->  [RESPUESTA FINAL YA!!]   SI NO RESUELTO -> [PAUSA DE RIGOR EPISTEMOLÓGICO]",
+        ),
     )
 
 

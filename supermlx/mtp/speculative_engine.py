@@ -174,6 +174,7 @@ class MTPSpeculativeEngine:
         self.adaptive_temperature = adaptive_temperature
         self.tokenizer = tokenizer
         self._last_nudge_token: int = 0
+        self._last_closure_nudge_token: int = 0
         logger.info(
             "[CONFIG] MTPSpeculativeEngine inicializado: temp=%.2f, top_p=%.2f, min_p=%.2f, top_k=%d, adaptive_temp=%s",
             self.temperature,
@@ -298,7 +299,7 @@ class MTPSpeculativeEngine:
         )
 
         while tokens_generated < max_tokens:
-            # ── IN-SITU EPISTEMIC NUDGE INJECTION ────────────────────────
+            # ── IN-SITU EPISTEMIC / CLOSURE NUDGE INJECTION ───────────────
             if (
                 SETTINGS.feature_epistemic_nudge
                 and self.tokenizer is not None
@@ -306,11 +307,29 @@ class MTPSpeculativeEngine:
                 and getattr(self.sampler.tracker, "is_thinking", False)
             ):
                 _thinking_count = getattr(self.sampler.tracker, "thinking_count", tokens_generated)
+                is_closure_nudge = False
+                trigger_nudge = False
+
+                # 1. Prioridad: Evaluación de Cierre cada closure_nudge_interval (ej. 15000 tokens)
                 if (
+                    SETTINGS.closure_nudge_interval > 0
+                    and _thinking_count >= SETTINGS.closure_nudge_interval
+                    and (_thinking_count - self._last_closure_nudge_token) >= SETTINGS.closure_nudge_interval
+                ):
+                    is_closure_nudge = True
+                    trigger_nudge = True
+                    raw_nudge_text = SETTINGS.closure_nudge_text
+                # 2. Pausa de Rigor Epistemológico estándar cada epistemic_nudge_interval (ej. 2000 tokens)
+                elif (
                     _thinking_count >= SETTINGS.epistemic_nudge_min_tokens
                     and (_thinking_count - self._last_nudge_token) >= SETTINGS.epistemic_nudge_interval
                 ):
-                    nudge_text = SETTINGS.epistemic_nudge_text
+                    trigger_nudge = True
+                    raw_nudge_text = SETTINGS.epistemic_nudge_text
+
+                if trigger_nudge:
+                    clean_text = raw_nudge_text.strip()
+                    nudge_text = f"\n\n{clean_text}\n"
                     nudge_tokens = self.tokenizer.encode(nudge_text)
                     if nudge_tokens:
                         nudge_arr = mx.array([nudge_tokens], dtype=mx.int32)
@@ -334,6 +353,8 @@ class MTPSpeculativeEngine:
                         confirmed_token = int(nudge_tokens[-1])
                         hidden_at_confirmed = nudge_hidden[:, -1:, :]
                         self._last_nudge_token = _thinking_count
+                        if is_closure_nudge:
+                            self._last_closure_nudge_token = _thinking_count
 
                         # Acoplar Thermal Spark durante la pausa reflexiva si está configurado
                         if (
@@ -343,7 +364,9 @@ class MTPSpeculativeEngine:
                         ):
                             self.sampler.spark_controller.spark_remaining_tokens = SETTINGS.spark_pulse_duration
                             self.sampler.spark_controller.last_spark_token = _thinking_count
-                            self.sampler.spark_controller.last_cause = "epistemic_nudge"
+                            self.sampler.spark_controller.last_cause = (
+                                "closure_nudge" if is_closure_nudge else "epistemic_nudge"
+                            )
 
                         # Generar nuevo draft especulativo a partir del último token del nudge
                         mtp_logits = self.model.mtp_forward(
@@ -360,8 +383,10 @@ class MTPSpeculativeEngine:
                             min_p=next_min_p,
                             top_k=next_top_k,
                         )
+                        nudge_label = "Closure Nudge" if is_closure_nudge else "Epistemic Nudge"
                         logger.info(
-                            "[SPARK] ⚡ Epistemic Nudge inyectado en token %d (%d tokens)",
+                            "[SPARK] ⚡ %s inyectado en token %d (%d tokens)",
+                            nudge_label,
                             _thinking_count,
                             len(nudge_tokens),
                         )
