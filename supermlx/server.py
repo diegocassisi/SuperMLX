@@ -6912,6 +6912,9 @@ class APIHandler(BaseHTTPRequestHandler):
                     pipeline_log_fn=_pipeline_log if FEATURE_FULL_LOGGING else None,
                 )
 
+                _server_loop_warned = False
+                _server_loop_warned_token = 0
+
                 try:
                     for response in _stream_generate_unified(
                         rest_tokens,
@@ -6997,18 +7000,32 @@ class APIHandler(BaseHTTPRequestHandler):
                                         if _repeat_count >= _NGRAM_MAX_REPEATS:
                                             break
                                 if _repeat_count >= _NGRAM_MAX_REPEATS:
-                                    _terminal_status(
-                                        "🛑",
-                                        f"NGRAM LOOP: {_NGRAM_SIZE}-token sequence repeated "
-                                        f"{_repeat_count + 1}x after {_n_gen} tokens. "
-                                        f"Forcing generation stop.",
-                                        indent=1,
-                                    )
-                                    _pipeline_log("GEN", request_id,
-                                        f"NGRAM_LOOP_BREAK: {_NGRAM_SIZE}-gram repeated "
-                                        f"{_repeat_count + 1}x at token {_n_gen}. "
-                                        f"Breaking generation loop.")
-                                    break
+                                    if SETTINGS.ngram_nudge_enabled and not _server_loop_warned:
+                                        _server_loop_warned = True
+                                        _server_loop_warned_token = _n_gen
+                                        _terminal_status(
+                                            "⚠️",
+                                            f"NGRAM LOOP DETECTADO: {_NGRAM_SIZE}-token sequence repeated "
+                                            f"{_repeat_count + 1}x after {_n_gen} tokens. Steering Nudge activado.",
+                                            indent=1,
+                                        )
+                                        _pipeline_log("GEN", request_id,
+                                            f"NGRAM_LOOP_WARN: {_NGRAM_SIZE}-gram repeated "
+                                            f"{_repeat_count + 1}x at token {_n_gen}. Steering Nudge activado.")
+                                    else:
+                                        if not SETTINGS.ngram_nudge_enabled or (_n_gen - _server_loop_warned_token) >= SETTINGS.ngram_grace_tokens:
+                                            _terminal_status(
+                                                "🛑",
+                                                f"NGRAM LOOP: {_NGRAM_SIZE}-token sequence repeated "
+                                                f"{_repeat_count + 1}x after {_n_gen} tokens. "
+                                                f"Forcing generation stop.",
+                                                indent=1,
+                                            )
+                                            _pipeline_log("GEN", request_id,
+                                                f"NGRAM_LOOP_BREAK: {_NGRAM_SIZE}-gram repeated "
+                                                f"{_repeat_count + 1}x at token {_n_gen}. "
+                                                f"Breaking generation loop.")
+                                            break
                         if response_text:
                             raw_parts.append(response_text)
                             if hasattr(sampler, "feed_thinking_text"):

@@ -181,6 +181,9 @@ class Settings:
     ngram_size: int                   # Tokens per n-gram pattern
     ngram_window: int                 # Search window size in tokens
     ngram_check_interval: int         # Interval in tokens between loop checks
+    ngram_nudge_enabled: bool         # Enable in-situ steering thought instead of abrupt break
+    ngram_nudge_text: str             # In-situ thought text injected into thinking KV-cache
+    ngram_grace_tokens: int           # Grace token budget after nudge before applying hard break
     adaptive_temperature_enabled: bool # Enable prefill domain-adaptive temperature
     adaptive_temperature_layer: int    # Layer to tap for domain classification (default: 20)
     adaptive_temperature_prosa: float  # Response temperature for prose domain
@@ -355,6 +358,12 @@ def build_settings(script_dir: Path = Path(__file__).parent) -> Settings:
         ngram_size=_env_int("NGRAM_SIZE", 35),
         ngram_window=_env_int("NGRAM_WINDOW", 400),
         ngram_check_interval=_env_int("NGRAM_CHECK_INTERVAL", 32),
+        ngram_nudge_enabled=_env_bool("NGRAM_NUDGE_ENABLED", True),
+        ngram_nudge_text=_env_str(
+            "NGRAM_NUDGE_TEXT",
+            "[ATENCIÓN: ¡ESTOY EN LOOP! Debo salir ya. Hago Grounding: audito mis premisas comprobadas, descarto hipótesis circulares y cambio la dirección de mi razonamiento hacia la conclusión final.]",
+        ),
+        ngram_grace_tokens=_env_int("NGRAM_GRACE_TOKENS", 256),
         adaptive_temperature_enabled=_env_bool("FEATURE_ADAPTIVE_TEMPERATURE", False),
         adaptive_temperature_layer=_env_int("ADAPTIVE_TEMP_LAYER", 20),
         adaptive_temperature_prosa=_env_float("ADAPTIVE_TEMP_PROSA", 0.85),
