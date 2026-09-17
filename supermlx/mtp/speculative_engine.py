@@ -531,9 +531,6 @@ def stream_generate_mtp(
         detokenizer.add_token(token_id)
         tokens_yielded += 1
 
-        if hasattr(sampler, "feed_thinking_text") and detokenizer.last_segment:
-            sampler.feed_thinking_text(detokenizer.last_segment)
-
         if tokens_yielded >= max_tokens:
             break
 
