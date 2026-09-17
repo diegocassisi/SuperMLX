@@ -198,6 +198,10 @@ class Settings:
     spark_temperature: float           # Temperature during thermal spark
     spark_min_p: float                 # min_p safety filter during thermal spark
     spark_cooldown_tokens: int         # Minimum tokens between consecutive sparks
+    feature_epistemic_nudge: bool      # In-situ injection of epistemic rigor pause during thinking
+    epistemic_nudge_interval: int      # Interval in thinking tokens between pauses
+    epistemic_nudge_min_tokens: int    # Minimum thinking tokens before first nudge is allowed
+    epistemic_nudge_text: str          # Text template to inject into thinking KV-cache
 
 
 def _normalize_model_family(value: Optional[str]) -> str:
@@ -366,6 +370,10 @@ def build_settings(script_dir: Path = Path(__file__).parent) -> Settings:
         spark_temperature=_env_float("SPARK_TEMPERATURE", 0.88),
         spark_min_p=_env_float("SPARK_MIN_P", 0.05),
         spark_cooldown_tokens=_env_int("SPARK_COOLDOWN_TOKENS", 250),
+        feature_epistemic_nudge=_env_bool("FEATURE_EPISTEMIC_NUDGE", True),
+        epistemic_nudge_interval=_env_int("EPISTEMIC_NUDGE_INTERVAL", 2000),
+        epistemic_nudge_min_tokens=_env_int("EPISTEMIC_NUDGE_MIN_TOKENS", 1500),
+        epistemic_nudge_text=_env_str("EPISTEMIC_NUDGE_TEXT", "\n\n[PAUSA DE RIGOR EPISTEMOLÓGICO]\n"),
     )
 
 

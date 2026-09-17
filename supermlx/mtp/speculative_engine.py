@@ -34,6 +34,7 @@ import time
 from typing import Any, Dict, Generator, List, Optional, Tuple, Union
 
 import mlx.core as mx
+from supermlx.config import SETTINGS
 
 logger = logging.getLogger(__name__)
 
@@ -162,6 +163,7 @@ class MTPSpeculativeEngine:
         top_k: int = 0,
         sampler: Optional[Any] = None,
         adaptive_temperature: bool = False,
+        tokenizer: Optional[Any] = None,
     ) -> None:
         self.model = model
         self.temperature = temperature
@@ -170,6 +172,8 @@ class MTPSpeculativeEngine:
         self.top_k = top_k
         self.sampler = sampler
         self.adaptive_temperature = adaptive_temperature
+        self.tokenizer = tokenizer
+        self._last_nudge_token: int = 0
         logger.info(
             "[CONFIG] MTPSpeculativeEngine inicializado: temp=%.2f, top_p=%.2f, min_p=%.2f, top_k=%d, adaptive_temp=%s",
             self.temperature,
@@ -294,6 +298,76 @@ class MTPSpeculativeEngine:
         )
 
         while tokens_generated < max_tokens:
+            # ── IN-SITU EPISTEMIC NUDGE INJECTION ────────────────────────
+            if (
+                SETTINGS.feature_epistemic_nudge
+                and self.tokenizer is not None
+                and hasattr(self.sampler, "tracker")
+                and getattr(self.sampler.tracker, "is_thinking", False)
+            ):
+                _thinking_count = getattr(self.sampler.tracker, "thinking_count", tokens_generated)
+                if (
+                    _thinking_count >= SETTINGS.epistemic_nudge_min_tokens
+                    and (_thinking_count - self._last_nudge_token) >= SETTINGS.epistemic_nudge_interval
+                ):
+                    nudge_text = SETTINGS.epistemic_nudge_text
+                    nudge_tokens = self.tokenizer.encode(nudge_text)
+                    if nudge_tokens:
+                        nudge_arr = mx.array([nudge_tokens], dtype=mx.int32)
+                        nudge_logits, nudge_hidden = self.model.forward_with_hidden(
+                            nudge_arr, cache=cache
+                        )
+                        mx.eval(nudge_logits, nudge_hidden)
+
+                        for n_tok in nudge_tokens:
+                            tokens_generated += 1
+                            yield {
+                                "token": int(n_tok),
+                                "is_speculative": False,
+                                "accepted": True,
+                                "tokens_generated": tokens_generated,
+                                "drafts_accepted": drafts_accepted,
+                                "drafts_attempted": drafts_attempted,
+                                "alpha": curr_alpha if 'curr_alpha' in locals() else 0.0,
+                            }
+
+                        confirmed_token = int(nudge_tokens[-1])
+                        hidden_at_confirmed = nudge_hidden[:, -1:, :]
+                        self._last_nudge_token = _thinking_count
+
+                        # Acoplar Thermal Spark durante la pausa reflexiva si está configurado
+                        if (
+                            hasattr(self.sampler, "spark_controller")
+                            and self.sampler.spark_controller is not None
+                            and self.sampler.spark_controller.enabled
+                        ):
+                            self.sampler.spark_controller.spark_remaining_tokens = SETTINGS.spark_pulse_duration
+                            self.sampler.spark_controller.last_spark_token = _thinking_count
+                            self.sampler.spark_controller.last_cause = "epistemic_nudge"
+
+                        # Generar nuevo draft especulativo a partir del último token del nudge
+                        mtp_logits = self.model.mtp_forward(
+                            hidden_at_confirmed,
+                            mx.array([[confirmed_token]]),
+                            mtp_cache=mtp_cache,
+                        )
+                        mx.eval(mtp_logits)
+                        next_temp, next_top_p, next_min_p, next_top_k = self._get_sampling_params()
+                        draft_tok, q2_probs = _sample_token(
+                            mtp_logits[0, -1],
+                            temperature=next_temp,
+                            top_p=next_top_p,
+                            min_p=next_min_p,
+                            top_k=next_top_k,
+                        )
+                        logger.info(
+                            "[SPARK] ⚡ Epistemic Nudge inyectado en token %d (%d tokens)",
+                            _thinking_count,
+                            len(nudge_tokens),
+                        )
+                        if tokens_generated >= max_tokens:
+                            break
+
             # 4. Fase VERIFY en batch de 2 tokens: [confirmed_token, draft_tok]
             # n_confirmed=1 le indica a GatedDeltaNet que guarde snapshot SSM entre ellos.
             y_with_draft = mx.array([[confirmed_token, draft_tok]])
@@ -498,6 +572,7 @@ def stream_generate_mtp(
         top_k=top_k,
         sampler=sampler,
         adaptive_temperature=adaptive_temperature,
+        tokenizer=tokenizer,
     )
 
     detokenizer = tokenizer.detokenizer
