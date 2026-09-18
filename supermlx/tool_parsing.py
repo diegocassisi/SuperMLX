@@ -1,9 +1,17 @@
 # SPDX-License-Identifier: MIT
 """
-SuperMLX tool call parsing: regex patterns, thinking extraction, tool call extraction.
-
-All functions are pure (input → output). No state, no globals, no model access.
+[AI_DIRECTIVE]
+ROL: Parser puro de tool calls y reasoning tags para SuperMLX.
+OBJETIVO: Extraer llamadas a herramientas y bloques de pensamiento (<think>) desde la salida cruda de LLMs de múltiples familias (Qwen, DeepSeek, Gemma, etc.) a formato OpenAI/Anthropic compatible.
+ENTRADAS: Texto generado por el modelo (str), familia del modelo (str), herramientas permitidas (list/None).
+SALIDAS: Texto saneado (str), lista de tool calls estructuradas (List[Dict]).
+REGLAS INVIOLABLES:
+- Prohibido estado mutable o acceso a GPU/Metal en este módulo (funciones puras).
+- Prohibido alterar contenido de archivos o código embebido a menos que el schema declare explícitamente tipos estructurados simples.
+- Obligatorio tipado estricto en funciones públicas y manejo determinista de fallback.
+SSoT: Parser único para compatibilidad de herramientas en SuperMLX.
 """
+
 import json
 import re
 import uuid
@@ -337,17 +345,22 @@ def _normalize_assistant_text(text, enable_thinking, model_family):
     return text
 
 
-def _coerce_arg_value(raw_value):
+def _coerce_arg_value(raw_value: str, expected_type: Optional[str] = None):
     value = raw_value.strip()
     # Handle Python-style booleans that json.loads rejects (case-sensitive)
     if value in ("True", "False"):
         return value == "True"
     try:
         parsed = json.loads(value)
-        # Only coerce primitives (int, float, bool, None).
-        # Dicts/lists stay as raw strings — the model writes JSON file
-        # content (package.json, config) inside <parameter=content> which
-        # json.loads happily parses to dict. But the tool expects a string.
+        # Schema-guided coercion for structured types with strict type verification:
+        # Array requires list, object requires dict.
+        if expected_type == "array" and isinstance(parsed, list):
+            return parsed
+        if expected_type == "object" and isinstance(parsed, dict):
+            return parsed
+
+        # Default safety guard: dicts/lists stay as raw strings unless schema explicitly
+        # requested array/object. Protects JSON file content inside <parameter=content> (e.g. write_file).
         if isinstance(parsed, (dict, list)):
             return value
         return parsed
@@ -425,6 +438,50 @@ def _allowed_tool_name_set(allowed_tools) -> Optional[set]:
     return names
 
 
+def _build_tool_param_types(allowed_tools: Optional[List[Any]]) -> Dict[Tuple[str, str], str]:
+    """Map (tool_name, param_name) -> declared JSON schema type ('array', 'object', etc.).
+
+    Supports both OpenAI format ('parameters.properties') and Anthropic format ('input_schema.properties').
+    Scope: simple string types ('array', 'object'). Polymorphic or complex schema types
+    (anyOf, oneOf, $ref, type list) are omitted and fall back to safe default.
+    """
+    param_types: Dict[Tuple[str, str], str] = {}
+    if not allowed_tools:
+        return param_types
+
+    for tool in allowed_tools:
+        if not isinstance(tool, dict):
+            continue
+        fn = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+        tool_name = fn.get("name")
+        if not isinstance(tool_name, str) or not tool_name:
+            continue
+
+        # Check OpenAI 'parameters' then Anthropic 'input_schema'
+        schema_dict = None
+        for schema_key in ("parameters", "input_schema"):
+            candidate = fn.get(schema_key)
+            if isinstance(candidate, dict):
+                schema_dict = candidate
+                break
+
+        if not isinstance(schema_dict, dict):
+            continue
+
+        props = schema_dict.get("properties")
+        if not isinstance(props, dict):
+            continue
+
+        for p_name, p_schema in props.items():
+            if not isinstance(p_name, str) or not isinstance(p_schema, dict):
+                continue
+            p_type = p_schema.get("type")
+            if isinstance(p_type, str) and p_type in ("array", "object"):
+                param_types[(tool_name, p_name)] = p_type
+
+    return param_types
+
+
 def _extract_openai_tool_calls(text, model_family, allowed_tools=None):
     if not isinstance(text, str):
         return text, []
@@ -434,6 +491,8 @@ def _extract_openai_tool_calls(text, model_family, allowed_tools=None):
         # No tools were declared for this request. Preserve code examples and
         # any model-emitted markup as text; never manufacture executable calls.
         return text, []
+
+    param_types = _build_tool_param_types(allowed_tools)
 
     # Agents-A1 and similar models conditioned by Claude's system prompt may output
     # tool calls as markdown code blocks instead of <tool_call> XML. Convert them
@@ -497,7 +556,8 @@ def _extract_openai_tool_calls(text, model_family, allowed_tools=None):
             key = arg_key.strip()
             if not key:
                 continue
-            args[key] = _coerce_arg_value(arg_value)
+            expected_type = param_types.get((tool_name, key))
+            args[key] = _coerce_arg_value(arg_value, expected_type=expected_type)
         return {
             "id": f"call_{uuid.uuid4().hex[:24]}",
             "type": "function",
@@ -545,7 +605,8 @@ def _extract_openai_tool_calls(text, model_family, allowed_tools=None):
             if last_close >= 0:
                 raw_content = raw_content[:last_close]
             raw_content = raw_content.strip()
-            args[param_key] = _coerce_arg_value(raw_content)
+            expected_type = param_types.get((tool_name, param_key))
+            args[param_key] = _coerce_arg_value(raw_content, expected_type=expected_type)
         return {
             "id": f"call_{uuid.uuid4().hex[:24]}",
             "type": "function",

@@ -547,6 +547,12 @@ from .cache_engine import (
     snapshot_arrays_cache,
     rollback_arrays_cache,
 )
+from .housekeeping_staging import (
+    HousekeepingStagingManager,
+    HousekeepingStagingEntry,
+)
+HOUSEKEEPING_STAGING_MANAGER = HousekeepingStagingManager()
+
 
 # ── CASCADE ROUTING ──────────────────────────────────────────────────────────
 # Forward a frontier API cuando RAG confidence es baja (no hay knowledge local).
@@ -1183,6 +1189,13 @@ class LRUPromptCache:
         stale_keys = [k for k, v in self._entries.items() if self._is_expired(v)]
         for k in stale_keys:
             self._delete(k[0], k[1])
+        if "HOUSEKEEPING_STAGING_MANAGER" in globals() and "PROMPT_CACHE" in globals() and self is PROMPT_CACHE:
+            HOUSEKEEPING_STAGING_MANAGER.prune(
+                self,
+                now=now,
+                ttl_seconds=getattr(SETTINGS, "housekeeping_staging_ttl_seconds", 300.0),
+                max_entries=getattr(SETTINGS, "housekeeping_staging_max_entries", 2),
+            )
 
     def _delete(self, model, tokens, _reaper_telemetry=False):
         key = (model, tuple(tokens))
@@ -1502,6 +1515,30 @@ PROMPT_CACHE_COMPACT = LRUPromptCache(
 # the dual pipeline (model_tokens vs prompt_tokens/canonical).
 _LAST_MAIN_TOOLS: Optional[List[Dict[str, Any]]] = None
 _LAST_MAIN_SYSTEM_BODY: Optional[str] = None
+
+
+def _housekeeping_staging_reaper_loop() -> None:
+    while True:
+        time.sleep(30.0)
+        try:
+            with prompt_cache_lock:
+                if "HOUSEKEEPING_STAGING_MANAGER" in globals() and "PROMPT_CACHE" in globals():
+                    HOUSEKEEPING_STAGING_MANAGER.prune(
+                        PROMPT_CACHE,
+                        ttl_seconds=getattr(SETTINGS, "housekeeping_staging_ttl_seconds", 300.0),
+                        max_entries=getattr(SETTINGS, "housekeeping_staging_max_entries", 2),
+                    )
+        except Exception as _reaper_err:
+            logger.error("[ERROR] Housekeeping staging reaper loop error: %s", _reaper_err)
+
+
+_staging_reaper_thread = threading.Thread(
+    target=_housekeeping_staging_reaper_loop,
+    name="housekeeping_staging_reaper",
+    daemon=True,
+)
+_staging_reaper_thread.start()
+
 
 
 class SessionIndex:
@@ -2594,6 +2631,8 @@ def _post_generation_cache_update(
     skip_cache_store: bool = False,
     housekeeping_pre_snapshot: Optional[Dict] = None,
     housekeeping_original_tokens: Optional[tuple] = None,
+    model_tokens: Optional[List[int]] = None,
+    is_compact: bool = False,
 ) -> None:
     """
     Shared post-generation logic: insert cache entries (MAIN or COMPACT),
@@ -2603,11 +2642,51 @@ def _post_generation_cache_update(
     _cache_hit_ratio = matched_prefix_len / max(len(prompt_tokens), 1) if prompt_tokens else 1.0
 
     if skip_cache_store:
-        # BORROW & RETURN: if we have a pre-housekeeping snapshot, restore
-        # the ArraysCache to its pre-housekeeping state and re-insert the
-        # trie entry with the original key.  This preserves the cache for
-        # the next normal request while still giving housekeeping good quality.
         if (
+            SETTINGS.feature_housekeeping_staging
+            and not is_compact
+            and session_id_for_turn
+            and prompt_cache is not None
+        ):
+            success = HOUSEKEEPING_STAGING_MANAGER.store_or_update(
+                session_id=session_id_for_turn,
+                model_name=SETTINGS.model_path,
+                staged_cache=prompt_cache,
+                prompt_tokens=prompt_tokens,
+                model_tokens=model_tokens if model_tokens is not None else prompt_tokens,
+                hybrid_checkpoint=hybrid_checkpoint,
+                base_snapshot=housekeeping_pre_snapshot,
+                base_tokens=housekeeping_original_tokens,
+            )
+            if success:
+                _pipeline_log(
+                    "CACHE",
+                    request_id,
+                    f"HOUSEKEEPING_STAGING: staged successfully for session {session_id_for_turn} | "
+                    f"hybrid_restored={hybrid_checkpoint is not None} | "
+                    f"kv_off={_kv_cache_offset(prompt_cache)}",
+                )
+            else:
+                _pipeline_log(
+                    "CACHE",
+                    request_id,
+                    f"HOUSEKEEPING_STAGING: checkpoint restoration FAILED (fail-closed) | "
+                    f"session={session_id_for_turn}",
+                )
+                if housekeeping_pre_snapshot is not None and housekeeping_original_tokens is not None:
+                    _restored = rollback_arrays_cache(prompt_cache, housekeeping_pre_snapshot)
+                    if _restored:
+                        PROMPT_CACHE.insert_cache(
+                            SETTINGS.model_path,
+                            list(housekeeping_original_tokens),
+                            prompt_cache,
+                        )
+                        _pipeline_log(
+                            "CACHE",
+                            request_id,
+                            "HOUSEKEEPING_STAGING: base conversation cache rescued & re-inserted",
+                        )
+        elif (
             FEATURE_HOUSEKEEPING_CACHE_BORROW
             and housekeeping_pre_snapshot is not None
             and housekeeping_original_tokens is not None
@@ -3967,6 +4046,30 @@ def _get_system_free_memory_pct() -> float:
     return 100.0  # fail-open
 
 
+def _get_vm_counters() -> Dict[str, int]:
+    """Capture pageouts, pageins, swapins, swapouts from vm_stat (stable BSD API).
+    Returns counters dictionary for prefill telemetry. Fail-open returns zeros.
+    """
+    counters = {"pageouts": 0, "pageins": 0, "swapins": 0, "swapouts": 0}
+    try:
+        import subprocess
+        out = subprocess.check_output(["vm_stat"], text=True, timeout=2)
+        for line in out.splitlines():
+            line_str = line.strip()
+            if line_str.startswith("Pageouts:"):
+                counters["pageouts"] = int(line_str.split(":")[1].strip().rstrip("."))
+            elif line_str.startswith("Pageins:"):
+                counters["pageins"] = int(line_str.split(":")[1].strip().rstrip("."))
+            elif line_str.startswith("Swapouts:"):
+                counters["swapouts"] = int(line_str.split(":")[1].strip().rstrip("."))
+            elif line_str.startswith("Swapins:"):
+                counters["swapins"] = int(line_str.split(":")[1].strip().rstrip("."))
+    except Exception as _e:
+        logger.debug("[VM_STAT] Failed to read vm_stat: %s", _e)
+    return counters
+
+
+
 def _memory_pressure_gate(request_id: str) -> None:
     """Wait for sufficient free memory before first-ever Metal shader compilation.
 
@@ -4040,6 +4143,9 @@ def _adaptive_prefill(
     _PROGRESS_INTERVAL = 2000  # Log every N tokens
     _diag_pre_prefill = _cache_diag.snapshot(prompt_cache, rest_tokens, "before_adaptive_prefill")
 
+    _vm_before = _get_vm_counters()
+    _fwd_eval_total_s = 0.0
+
     while processed < total:
         # Compute available memory
         budget_bytes = _get_metal_budget_gb() * 1e9
@@ -4068,7 +4174,8 @@ def _adaptive_prefill(
         if chunk_size < base_chunk:
             chunk_reductions += 1
 
-        # Forward pass
+        # Forward pass & cache materialization (timed with high-precision perf_counter)
+        _fwd_t0 = time.perf_counter()
         chunk = prompt_array[processed : processed + n][None]  # (1, n)
         model(chunk, cache=prompt_cache)
 
@@ -4078,6 +4185,7 @@ def _adaptive_prefill(
                 mx.eval(c.state)
             else:
                 mx.eval(c)
+        _fwd_eval_total_s += (time.perf_counter() - _fwd_t0)
         mx.clear_cache()
 
         # GPU yield: let other Metal clients (Chrome VideoToolbox) process between chunks
@@ -4101,6 +4209,22 @@ def _adaptive_prefill(
             f"Adaptive prefill complete: {total} tokens | "
             f"chunk reductions={chunk_reductions} | req={request_id[:12] if request_id else '?'}",
         )
+
+    _vm_after = _get_vm_counters()
+    _d_pageouts = _vm_after["pageouts"] - _vm_before["pageouts"]
+    _d_swapouts = _vm_after["swapouts"] - _vm_before["swapouts"]
+    _d_swapins = _vm_after["swapins"] - _vm_before["swapins"]
+    _fwd_eval_ms = _fwd_eval_total_s * 1000.0
+    _total_prefill_ms = (time.time() - _prefill_t0) * 1000.0
+    _eval_tps = total / (_fwd_eval_total_s if _fwd_eval_total_s > 0 else 0.001)
+
+    _pipeline_log(
+        "PREFILL_TELEMETRY",
+        request_id,
+        f"tokens={total} | wall={_total_prefill_ms:.1f}ms | fwd_eval={_fwd_eval_ms:.1f}ms | "
+        f"eval_speed={_eval_tps:.1f} tok/s | "
+        f"vm_delta: pageouts={_d_pageouts}, swapouts={_d_swapouts}, swapins={_d_swapins}",
+    )
 
     _cache_diag.compare(_diag_pre_prefill, prompt_cache, rest_tokens, "adaptive_prefill", request_id,
         extra={"tokens": total, "chunks": chunk_reductions})
@@ -5581,44 +5705,83 @@ class APIHandler(BaseHTTPRequestHandler):
                 # rest_tokens will be overridden below to use model_tokens (original).
                 #
                 # HOUSEKEEPING CACHE STRATEGY:
-                # When HOUSEKEEPING_CACHE_BORROW=True: allow normal cache lookup
-                # (good quality), snapshot beforehand, restore+re-insert after.
-                # When False: bypass trie lookup (TPC cold start, lower quality).
+                # 1. Normal request: if session previously had housekeeping staging, close and restore to PROMPT_CACHE
+                if not _is_housekeeping and not _is_compact and _session_id_for_turn:
+                    if HOUSEKEEPING_STAGING_MANAGER.has_staging(_session_id_for_turn, SETTINGS.model_path):
+                        HOUSEKEEPING_STAGING_MANAGER.close_and_restore(_session_id_for_turn, SETTINGS.model_path, PROMPT_CACHE)
+                        _pipeline_log("CACHE", request_id,
+                            f"HOUSEKEEPING_STAGING: session {_session_id_for_turn} returned to normal conversation | restored base cache")
+
                 _diag_pre_lookup = _cache_diag.snapshot(prompt_cache, list(prompt_tokens), "before_cache_lookup")
                 _housekeeping_pre_snapshot = None
                 _housekeeping_original_tokens = None
-                if _is_housekeeping and not FEATURE_HOUSEKEEPING_CACHE_BORROW:
-                    prompt_cache = None
-                    _rest_tokens_canonical = prompt_tokens
-                    cache_session_tokens = prompt_tokens
-                    cache_match_type = "miss"
-                    matched_prefix_len = 0
-                    cache_selection_source = "housekeeping_bypass"
-                    if FEATURE_FULL_LOGGING:
-                        _pipeline_log("CACHE", request_id,
-                            "HOUSEKEEPING_BYPASS: skipping trie lookup to protect MAIN cache entry")
-                else:
-                    (
-                        prompt_cache,
-                        _rest_tokens_canonical,
-                        cache_session_tokens,
-                        cache_match_type,
-                        matched_prefix_len,
-                        cache_selection_source,
-                    ) = SESSION_INDEX.select_best_cache(
-                        model_name=SETTINGS.model_path,
-                        prompt_tokens=prompt_tokens,
-                        session_ctx=session_ctx,
-                        prompt_cache_store=_active_cache_store,
+                _housekeeping_staging_hit = False
+
+                # 2. Housekeeping request: check for staging continuation hit
+                if (
+                    _is_housekeeping
+                    and not _is_compact
+                    and SETTINGS.feature_housekeeping_staging
+                    and _session_id_for_turn
+                ):
+                    _continuation = HOUSEKEEPING_STAGING_MANAGER.check_continuation(
+                        _session_id_for_turn,
+                        SETTINGS.model_path,
+                        list(prompt_tokens),
+                        list(model_tokens),
                     )
-                # Model always prefills from original tokens (dual-pipeline invariant).
-                # Use the actual KV cache offset (number of original tokens stored)
-                # rather than matched_prefix_len (which is a canonical token count and
-                # may differ when _canonicalize_messages() changes token lengths).
-                _kv_off = _kv_cache_offset(prompt_cache)
-                rest_tokens = model_tokens[
-                    _kv_off if _kv_off is not None else matched_prefix_len :
-                ]
+                    if _continuation is not None:
+                        _entry, _canon_matched_len, _model_off = _continuation
+                        prompt_cache = _entry.staged_cache
+                        _rest_tokens_canonical = prompt_tokens[_canon_matched_len:]
+                        cache_session_tokens = _entry.staged_canonical_tokens
+                        cache_match_type = "housekeeping_staging_hit"
+                        matched_prefix_len = _canon_matched_len
+                        cache_selection_source = "housekeeping_staging"
+                        _housekeeping_pre_snapshot = _entry.base_snapshot
+                        _housekeeping_original_tokens = _entry.base_tokens
+                        _kv_off = _model_off
+                        rest_tokens = model_tokens[_model_off:]
+                        _housekeeping_staging_hit = True
+                        _pipeline_log("CACHE", request_id,
+                            f"HOUSEKEEPING_STAGING: continuation HIT | turn={_entry.turn_count} | "
+                            f"rest_tokens={len(rest_tokens)} (offset={_model_off}) | canon_matched={_canon_matched_len}")
+                    elif HOUSEKEEPING_STAGING_MANAGER.has_staging(_session_id_for_turn, SETTINGS.model_path):
+                        # Staging mismatch / divergence
+                        HOUSEKEEPING_STAGING_MANAGER.close_and_restore(_session_id_for_turn, SETTINGS.model_path, PROMPT_CACHE)
+                        _pipeline_log("CACHE", request_id,
+                            f"HOUSEKEEPING_STAGING: divergence detected | restored base cache for session {_session_id_for_turn}")
+
+                if not _housekeeping_staging_hit:
+                    if _is_housekeeping and not FEATURE_HOUSEKEEPING_CACHE_BORROW:
+                        prompt_cache = None
+                        _rest_tokens_canonical = prompt_tokens
+                        cache_session_tokens = prompt_tokens
+                        cache_match_type = "miss"
+                        matched_prefix_len = 0
+                        cache_selection_source = "housekeeping_bypass"
+                        if FEATURE_FULL_LOGGING:
+                            _pipeline_log("CACHE", request_id,
+                                "HOUSEKEEPING_BYPASS: skipping trie lookup to protect MAIN cache entry")
+                    else:
+                        (
+                            prompt_cache,
+                            _rest_tokens_canonical,
+                            cache_session_tokens,
+                            cache_match_type,
+                            matched_prefix_len,
+                            cache_selection_source,
+                        ) = SESSION_INDEX.select_best_cache(
+                            model_name=SETTINGS.model_path,
+                            prompt_tokens=prompt_tokens,
+                            session_ctx=session_ctx,
+                            prompt_cache_store=_active_cache_store,
+                        )
+                    _kv_off = _kv_cache_offset(prompt_cache)
+                    rest_tokens = model_tokens[
+                        _kv_off if _kv_off is not None else matched_prefix_len :
+                    ]
+
                 _mem_profiler.snapshot(request_id, "POST_CACHE", is_anthropic=self._is_anthropic, rest_tokens=len(rest_tokens), kv_cache_offset=_kv_off, cache_hit_type=cache_match_type, matched_prefix=matched_prefix_len, prompt_tokens=len(prompt_tokens) if prompt_tokens else None)
                 _cache_diag.compare(_diag_pre_lookup, prompt_cache, list(prompt_tokens), "cache_lookup", request_id,
                     extra={"hit": cache_match_type, "matched": matched_prefix_len, "rest": len(rest_tokens)})
@@ -5633,7 +5796,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 # using the stable prefix as the minimum acceptable match.
                 # Only triggers when there is a real improvement available.
                 if (
-                    (not _is_housekeeping or FEATURE_HOUSEKEEPING_CACHE_BORROW)
+                    not _housekeeping_staging_hit
+                    and (not _is_housekeeping or FEATURE_HOUSEKEEPING_CACHE_BORROW)
                     and stable_prefix_token_len_computed > matched_prefix_len
                     and stable_prefix_token_len_computed > 0
                     and stable_prefix_token_len_computed < len(prompt_tokens)
@@ -5666,9 +5830,10 @@ class APIHandler(BaseHTTPRequestHandler):
                 # the entry with cache_session_tokens as the key.
                 if (
                     _is_housekeeping
-                    and FEATURE_HOUSEKEEPING_CACHE_BORROW
+                    and (FEATURE_HOUSEKEEPING_CACHE_BORROW or SETTINGS.feature_housekeeping_staging)
                     and prompt_cache is not None
                     and cache_session_tokens is not None
+                    and not _housekeeping_staging_hit
                 ):
                     _housekeeping_pre_snapshot = snapshot_arrays_cache(prompt_cache)
                     _housekeeping_original_tokens = tuple(cache_session_tokens)
@@ -5692,7 +5857,7 @@ class APIHandler(BaseHTTPRequestHandler):
             #   v2 — fixed comparison but FIX-16/17 mixed spaces: canonical
             #         matched_prefix_len (19849) >= model _m_len (15848) always
             #         fired, forcing rest_tokens=1 → garbage output.
-            if prompt_cache is not None and cache_session_tokens is not None:
+            if not _housekeeping_staging_hit and prompt_cache is not None and cache_session_tokens is not None:
                 # FIX-31 DIAG: snapshot before real-match sync
                 _diag_pre_fix31 = _cache_diag.snapshot(prompt_cache, cache_key, "before_fix31_sync")
                 # 1. Canonical match (determines IF the cache entry is valid).
@@ -6659,6 +6824,8 @@ class APIHandler(BaseHTTPRequestHandler):
                         skip_cache_store=_is_housekeeping,
                         housekeeping_pre_snapshot=_housekeeping_pre_snapshot,
                         housekeeping_original_tokens=_housekeeping_original_tokens,
+                        model_tokens=model_tokens,
+                        is_compact=_is_compact,
                     )
 
                 # POST-COMPACT PRE-WARMUP: after compact finishes, pre-warm MAIN
@@ -7486,6 +7653,8 @@ class APIHandler(BaseHTTPRequestHandler):
                         skip_cache_store=_is_housekeeping,
                         housekeeping_pre_snapshot=_housekeeping_pre_snapshot,
                         housekeeping_original_tokens=_housekeeping_original_tokens,
+                        model_tokens=model_tokens,
+                        is_compact=_is_compact,
                     )
 
                 # POST-COMPACT PRE-WARMUP: after compact finishes, pre-warm MAIN

@@ -207,6 +207,9 @@ class Settings:
     epistemic_nudge_text: str          # Text template to inject into thinking KV-cache
     closure_nudge_interval: int        # Interval in thinking tokens for closure nudge injection
     closure_nudge_text: str            # Text template to inject for closure evaluation
+    feature_housekeeping_staging: bool    # Multi-turn safe staging for Hermes housekeeping requests
+    housekeeping_staging_ttl_seconds: float # Staging TTL in seconds before rollback to base
+    housekeeping_staging_max_entries: int  # Max concurrent sessions in housekeeping staging
 
 
 def _normalize_model_family(value: Optional[str]) -> str:
@@ -390,7 +393,11 @@ def build_settings(script_dir: Path = Path(__file__).parent) -> Settings:
             "CLOSURE_NUDGE_TEXT",
             "[CRÍTICO: EVALUACIÓN DE CIERRE]  SI RESUELTO ->  [RESPUESTA FINAL YA!!]   SI NO RESUELTO -> [PAUSA DE RIGOR EPISTEMOLÓGICO]",
         ),
+        feature_housekeeping_staging=_env_bool("FEATURE_HOUSEKEEPING_STAGING", False),
+        housekeeping_staging_ttl_seconds=_env_float("HOUSEKEEPING_STAGING_TTL_SECONDS", 300.0),
+        housekeeping_staging_max_entries=_env_int("HOUSEKEEPING_STAGING_MAX_ENTRIES", 2),
     )
+
 
 
 # Default global Settings instance
