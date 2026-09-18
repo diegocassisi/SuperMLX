@@ -391,11 +391,13 @@ class MTPSpeculativeEngine:
                     nudge_text = f"\n\n{clean_text}\n"
                     nudge_tokens = self.tokenizer.encode(nudge_text)
                     if nudge_tokens:
-                        nudge_arr = mx.array([nudge_tokens], dtype=mx.int32)
-                        nudge_logits, nudge_hidden = self.model.forward_with_hidden(
-                            nudge_arr, cache=cache
+                        # Forward del confirmed_token previo + todo el nudge EXCEPTO el último token
+                        tokens_to_forward = [confirmed_token] + list(nudge_tokens[:-1])
+                        fwd_arr = mx.array([tokens_to_forward], dtype=mx.int32)
+                        fwd_logits, fwd_hidden = self.model.forward_with_hidden(
+                            fwd_arr, cache=cache
                         )
-                        mx.eval(nudge_logits, nudge_hidden)
+                        mx.eval(fwd_logits, fwd_hidden)
 
                         for n_tok in nudge_tokens:
                             tokens_generated += 1
@@ -410,8 +412,10 @@ class MTPSpeculativeEngine:
                                 "alpha": curr_alpha if 'curr_alpha' in locals() else 0.0,
                             }
 
+                        # El último token del nudge queda como confirmed_token para entrar en Step 4
                         confirmed_token = int(nudge_tokens[-1])
-                        hidden_at_confirmed = nudge_hidden[:, -1:, :]
+                        hidden_at_confirmed = fwd_hidden[:, -1:, :]
+                        mtp_cache = self.model.make_mtp_cache()
                         self._last_nudge_token = _thinking_count
                         if is_closure_nudge:
                             self._last_closure_nudge_token = _thinking_count
