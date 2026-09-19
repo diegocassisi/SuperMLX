@@ -550,6 +550,7 @@ from .cache_engine import (
 from .housekeeping_staging import (
     HousekeepingStagingManager,
     HousekeepingStagingEntry,
+    find_housekeeping_split_index,
 )
 HOUSEKEEPING_STAGING_MANAGER = HousekeepingStagingManager()
 
@@ -4116,24 +4117,28 @@ def _adaptive_prefill(
     rest_tokens: list,
     prompt_cache: list,
     request_id: str = "",
+    leave_last_token: bool = True,
 ) -> list:
-    """Pre-prefill rest_tokens[:-1] with adaptive chunk sizing.
+    """Pre-prefill rest_tokens with adaptive chunk sizing.
 
-    Returns the remaining tokens (just the last one) to pass to stream_generate.
+    If leave_last_token is True: prefills rest_tokens[:-1] and returns rest_tokens[-1:].
+    If leave_last_token is False: prefills ALL rest_tokens and returns [].
     The cache is updated in-place.
-
-    If rest_tokens has <= 1 token, returns rest_tokens unchanged (no prefill needed).
     """
-    if len(rest_tokens) <= 1:
+    if not rest_tokens:
+        return []
+    if leave_last_token and len(rest_tokens) <= 1:
         return rest_tokens
 
     # Gate: ensure OS has settled memory before first Metal shader compilation
     _memory_pressure_gate(request_id)
 
-    tokens_to_prefill = rest_tokens[:-1]
-    last_token = rest_tokens[-1:]  # keep as list for stream_generate
+    tokens_to_prefill = rest_tokens[:-1] if leave_last_token else rest_tokens
+    last_token = rest_tokens[-1:] if leave_last_token else []
 
     total = len(tokens_to_prefill)
+    if total == 0:
+        return last_token
     processed = 0
     prompt_array = mx.array(tokens_to_prefill)
     base_chunk = PREFILL_STEP_SIZE
@@ -4229,6 +4234,57 @@ def _adaptive_prefill(
     _cache_diag.compare(_diag_pre_prefill, prompt_cache, rest_tokens, "adaptive_prefill", request_id,
         extra={"tokens": total, "chunks": chunk_reductions})
     return last_token
+
+
+def _split_and_commit_housekeeping_history(
+    prompt_cache: Any,
+    model_tokens: List[int],
+    conv_model_boundary: int,
+    conv_prompt_tokens: Optional[List[int]],
+    cache_session_tokens: Optional[List[int]],
+    session_ctx: Optional[SessionContext],
+    request_id: str,
+) -> Tuple[List[int], Optional[Dict[str, Any]], Optional[Tuple[int, ...]]]:
+    """Prefill conversation history up to conv_model_boundary, commit to PROMPT_CACHE,
+
+    and capture base snapshot before prefilling the ephemeral housekeeping tail.
+    """
+    curr_kv_off = _kv_cache_offset(prompt_cache) or 0
+    if curr_kv_off < conv_model_boundary:
+        conv_to_prefill = model_tokens[curr_kv_off:conv_model_boundary]
+        if conv_to_prefill:
+            _adaptive_prefill(
+                conv_to_prefill,
+                prompt_cache,
+                request_id,
+                leave_last_token=False,
+            )
+
+    with prompt_cache_lock:
+        if conv_prompt_tokens:
+            PROMPT_CACHE.insert_cache(
+                SETTINGS.model_path,
+                list(conv_prompt_tokens),
+                prompt_cache,
+            )
+            if session_ctx is not None and getattr(session_ctx, "session_id", None):
+                SESSION_INDEX.register_cache_key(session_ctx, list(conv_prompt_tokens))
+        snapshot = snapshot_arrays_cache(prompt_cache)
+        orig_tokens = (
+            tuple(conv_prompt_tokens)
+            if conv_prompt_tokens
+            else (tuple(cache_session_tokens) if cache_session_tokens else ())
+        )
+        _pipeline_log(
+            "CACHE",
+            request_id,
+            f"HOUSEKEEPING_BOUNDARY: conversation history committed to PROMPT_CACHE | "
+            f"boundary_tokens={len(orig_tokens)} | snapshot captured",
+        )
+
+    remaining_rest = model_tokens[conv_model_boundary:]
+    return remaining_rest, snapshot, orig_tokens
+
 
 
 def _stream_generate_kwargs(prompt_tokens, max_tokens, sampler, prompt_cache, logits_processors=None):
@@ -5523,6 +5579,9 @@ class APIHandler(BaseHTTPRequestHandler):
                 log_fn=_pipeline_log if FEATURE_FULL_LOGGING else None,
             )
 
+            _housekeeping_conv_model_boundary: Optional[int] = None
+            _housekeeping_conv_prompt_tokens: Optional[List[int]] = None
+
             # --- DUAL PIPELINE: split model input from cache key at message-struct level ---
             # original_messages → rendered → model sees this (never normalized)
             # canonical_messages → rendered → scrubbed → cache lookup key only
@@ -5593,6 +5652,44 @@ class APIHandler(BaseHTTPRequestHandler):
                               "canonical_prompt_len": len(cache_prompt),
                               "prompt_tokens_count": len(prompt_tokens),
                               "model_tokens_count": len(model_tokens)})
+
+            # Housekeeping split-prefill: compute exact boundary for clean conversation history
+            if _is_housekeeping and SETTINGS.feature_housekeeping_staging:
+                _hk_idx = find_housekeeping_split_index(messages)
+                if _hk_idx > 0 and hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template:
+                    try:
+                        _conv_prompt_raw = tokenizer.apply_chat_template(
+                            messages[:_hk_idx],
+                            tokenize=False,
+                            add_generation_prompt=False,
+                            tools=tools,
+                            preserve_thinking=FEATURE_PRESERVE_THINKING,
+                        )
+                        _conv_cache_prompt_raw = tokenizer.apply_chat_template(
+                            cache_messages[:_hk_idx],
+                            tokenize=False,
+                            add_generation_prompt=False,
+                            tools=tools,
+                            preserve_thinking=FEATURE_PRESERVE_THINKING,
+                        )
+                        _conv_cache_prompt = _scrub_cache_key(_conv_cache_prompt_raw, SETTINGS.cache_canonicalize_tool_context)
+                        _c_model_toks = _tokenize_prompt(_conv_prompt_raw)
+                        _c_prompt_toks = _tokenize_prompt(_conv_cache_prompt)
+                        if (
+                            len(_c_model_toks) <= len(model_tokens)
+                            and model_tokens[: len(_c_model_toks)] == _c_model_toks
+                        ):
+                            _housekeeping_conv_model_boundary = len(_c_model_toks)
+                            _housekeeping_conv_prompt_tokens = _c_prompt_toks
+                            _pipeline_log(
+                                "CACHE",
+                                request_id,
+                                f"HOUSEKEEPING_BOUNDARY: detected split at message {_hk_idx} | "
+                                f"conv_model_boundary={_housekeeping_conv_model_boundary} | "
+                                f"conv_prompt_tokens={len(_housekeeping_conv_prompt_tokens)}",
+                            )
+                    except Exception as _hk_split_exc:
+                        logger.warning("[CACHE] Failed to compute housekeeping boundary: %s", _hk_split_exc)
 
         session_ctx = _extract_session_context(body, prompt_tokens)
         if is_vlm:
@@ -5835,12 +5932,13 @@ class APIHandler(BaseHTTPRequestHandler):
                     and cache_session_tokens is not None
                     and not _housekeeping_staging_hit
                 ):
-                    _housekeeping_pre_snapshot = snapshot_arrays_cache(prompt_cache)
-                    _housekeeping_original_tokens = tuple(cache_session_tokens)
-                    _pipeline_log("CACHE", request_id,
-                        f"HOUSEKEEPING_BORROW: snapshot captured | "
-                        f"original_key_len={len(_housekeeping_original_tokens)} | "
-                        f"snapshot_bytes={_housekeeping_pre_snapshot.get('nbytes', 0)}")
+                    if _housekeeping_conv_model_boundary is None:
+                        _housekeeping_pre_snapshot = snapshot_arrays_cache(prompt_cache)
+                        _housekeeping_original_tokens = tuple(cache_session_tokens)
+                        _pipeline_log("CACHE", request_id,
+                            f"HOUSEKEEPING_BORROW: snapshot captured | "
+                            f"original_key_len={len(_housekeeping_original_tokens)} | "
+                            f"snapshot_bytes={_housekeeping_pre_snapshot.get('nbytes', 0)}")
             
             # --- REAL-MATCH SYNC (FIX-31 v3) ---
             # Two coordinate systems:
@@ -6616,6 +6714,30 @@ class APIHandler(BaseHTTPRequestHandler):
 
                 _pre_prefill_memory_relief(request_id, rest_count, is_embedded_agent=_is_embedded_agent)
 
+                # Housekeeping Split-Prefill: advance and commit clean conversation history to PROMPT_CACHE
+                if (
+                    _is_housekeeping
+                    and SETTINGS.feature_housekeeping_staging
+                    and not is_vlm
+                    and _housekeeping_conv_model_boundary is not None
+                    and not _housekeeping_staging_hit
+                    and prompt_cache is not None
+                ):
+                    (
+                        rest_tokens,
+                        _housekeeping_pre_snapshot,
+                        _housekeeping_original_tokens,
+                    ) = _split_and_commit_housekeeping_history(
+                        prompt_cache=prompt_cache,
+                        model_tokens=model_tokens,
+                        conv_model_boundary=_housekeeping_conv_model_boundary,
+                        conv_prompt_tokens=_housekeeping_conv_prompt_tokens,
+                        cache_session_tokens=cache_session_tokens,
+                        session_ctx=session_ctx,
+                        request_id=request_id,
+                    )
+                    rest_count = len(rest_tokens)
+
                 # Adaptive pre-prefill: process rest_tokens[:-1] with dynamic chunks,
                 # pass only the last token to stream_generate (skips its fixed-step loop).
                 if not is_vlm and len(rest_tokens) > 1:
@@ -7040,6 +7162,30 @@ class APIHandler(BaseHTTPRequestHandler):
                 _keepalive_thread.start()
 
                 _pre_prefill_memory_relief(request_id, rest_count, is_embedded_agent=_is_embedded_agent)
+
+                # Housekeeping Split-Prefill: advance and commit clean conversation history to PROMPT_CACHE
+                if (
+                    _is_housekeeping
+                    and SETTINGS.feature_housekeeping_staging
+                    and not is_vlm
+                    and _housekeeping_conv_model_boundary is not None
+                    and not _housekeeping_staging_hit
+                    and prompt_cache is not None
+                ):
+                    (
+                        rest_tokens,
+                        _housekeeping_pre_snapshot,
+                        _housekeeping_original_tokens,
+                    ) = _split_and_commit_housekeeping_history(
+                        prompt_cache=prompt_cache,
+                        model_tokens=model_tokens,
+                        conv_model_boundary=_housekeeping_conv_model_boundary,
+                        conv_prompt_tokens=_housekeeping_conv_prompt_tokens,
+                        cache_session_tokens=cache_session_tokens,
+                        session_ctx=session_ctx,
+                        request_id=request_id,
+                    )
+                    rest_count = len(rest_tokens)
 
                 # Adaptive pre-prefill: process rest_tokens[:-1] with dynamic chunks,
                 # pass only the last token to stream_generate (skips its fixed-step loop).

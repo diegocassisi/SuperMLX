@@ -361,3 +361,32 @@ class HousekeepingStagingManager:
                 entry.session_id,
                 exc,
             )
+
+
+def find_housekeeping_split_index(messages: List[Dict[str, Any]]) -> int:
+    """Find the index of the injected housekeeping user message in messages.
+
+    Hermes injects housekeeping tasks as a user message whose text starts with:
+      - 'Review the conversation above and update the skill library'
+      - 'Review the conversation above and consider saving to memory'
+
+    Returns the message index (0 <= idx < len(messages)), or -1 if not found.
+    All messages strictly prior to this index (messages[:idx]) constitute the
+    legitimate conversation history.
+    """
+    if not messages:
+        return -1
+    for idx in range(len(messages) - 1, -1, -1):
+        msg = messages[idx]
+        role = (msg.get("role") or "").lower()
+        if role != "user":
+            continue
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            content = " ".join(
+                p.get("text", "") for p in content if isinstance(p, dict)
+            )
+        if isinstance(content, str) and content.strip().startswith("Review the conversation above and"):
+            return idx
+    return -1
+
