@@ -809,7 +809,7 @@ from .message_pipeline import (
     _canonicalize_messages, _extract_session_context,
     _assert_cache_key_safety, _hoist_system_messages,
 )
-from .debug_tools import _debug_token_divergence
+from .cache_diag import _debug_token_divergence
 from .anthropic_compat import (
     CLAUDE_MODEL_ALIASES, anthropic_to_openai_body,
     openai_to_anthropic_response, build_anthropic_sse_events,
