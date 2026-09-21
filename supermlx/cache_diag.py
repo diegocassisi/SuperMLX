@@ -22,6 +22,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
+from supermlx.cache_types import is_recurrent_layer
+
 # ANSI colors (same as server.py)
 _ANSI_RED = "\033[31m"
 _ANSI_CYAN = "\033[36m"
@@ -62,17 +64,12 @@ class DiagResult:
 
 
 def _kv_offset(cache: Any) -> Optional[int]:
-    """Extract KV offset from cache layers (mirrors server._kv_cache_offset)."""
+    """Extract KV offset from cache layers (uses cache_types for detection)."""
     try:
         layers = cache if isinstance(cache, (list, tuple)) else [cache]
         for layer in layers:
-            if hasattr(layer, "offset"):
+            if not is_recurrent_layer(layer) and hasattr(layer, "offset"):
                 return int(layer.offset)
-        for layer in layers:
-            if hasattr(layer, "cache") and isinstance(layer.cache, list):
-                for c in layer.cache:
-                    if c is not None and len(c.shape) >= 3:
-                        return int(c.shape[2])
     except (IndexError, TypeError, AttributeError):
         pass
     return None
@@ -116,14 +113,14 @@ def _recurrent_fingerprint(cache: Any) -> Optional[str]:
 
 
 def _count_layer_types(cache: Any) -> Tuple[int, int, int]:
-    """Returns (total_layers, arrays_cache_count, kv_cache_count)."""
+    """Returns (total_layers, recurrent_count, kv_count). Uses cache_types SSoT."""
     if not cache:
         return (0, 0, 0)
     layers = cache if isinstance(cache, (list, tuple)) else [cache]
     total = len(layers)
-    arrays = sum(1 for l in layers if hasattr(l, "state"))
-    kv = sum(1 for l in layers if hasattr(l, "offset"))
-    return (total, arrays, kv)
+    recurrent = sum(1 for l in layers if is_recurrent_layer(l))
+    kv = sum(1 for l in layers if not is_recurrent_layer(l) and hasattr(l, "offset"))
+    return (total, recurrent, kv)
 
 
 # Operations that are EXPECTED to change the key tail hash
