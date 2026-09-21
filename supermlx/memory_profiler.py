@@ -14,6 +14,7 @@ SSoT: Este módulo es la única fuente de profiling de memoria Metal.
 
 import json
 import logging
+import os
 import time
 from datetime import datetime
 from pathlib import Path
@@ -24,7 +25,7 @@ logger = logging.getLogger(__name__)
 # ── Config ────────────────────────────────────────────────────────────────────
 
 _LOG_DIR: Optional[Path] = None
-_ENABLED: bool = True
+_ENABLED: bool = os.environ.get("FEATURE_MEMORY_PROFILER", "false").lower() in ("true", "1", "yes")
 
 
 def init(log_root: Path) -> None:

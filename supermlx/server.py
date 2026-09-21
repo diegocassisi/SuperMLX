@@ -276,10 +276,6 @@ SETTINGS = build_settings(script_dir=SCRIPT_DIR)
 # Env: FEATURE_COMPRESSOR=true | COMPRESSION_THRESHOLD=6000 | COMPRESSION_GUARD=6
 FEATURE_COMPRESSOR            = _env_str("FEATURE_COMPRESSOR", "false").lower() in ("1", "true", "yes")
 
-# Emergency content compression (LLMLingua-2): independent of FEATURE_COMPRESSOR.
-# Activates on rest_tokens > MAX_SAFE_PREFILL_TOKENS as last-resort OOM defense.
-# Only needs LLMLingua (CPU BERT), not the full reranker+compression pipeline.
-FEATURE_EMERGENCY_COMPRESS    = _env_str("EMERGENCY_CONTENT_COMPRESS", "true").lower() in ("1", "true", "yes")
 
 # Hermes compact prompt swap: when Hermes sends a compaction request,
 # replace its generic summarization prompt with Claude Code's structured
@@ -3644,29 +3640,7 @@ if FEATURE_COMPRESSOR:
 else:
     _terminal_status("ℹ️", "Compressor: DISABLED (FEATURE_COMPRESSOR=False)")
 
-# --- Emergency Compressor standalone init ---
-# When FEATURE_COMPRESSOR is disabled but EMERGENCY_CONTENT_COMPRESS is enabled,
-# we still need _compressor_module loaded with LLMLingua for emergency compression.
-# This only loads the LLMLingua model (CPU BERT, ~200MB) — not the full reranker.
-if not FEATURE_COMPRESSOR and FEATURE_EMERGENCY_COMPRESS and _compressor_module is None:
-    try:
-        if _rag_module is not None:
-            _compressor_module = _rag_module
-        else:
-            from . import rag_enricher as _comp_mod
-            _compressor_module = _comp_mod
-        try:
-            _terminal_status("🗜️", "Emergency Compressor: precargando LLMLingua (CPU)...")
-            _compressor_module._load_llmlingua()
-            _terminal_status("✅", "Emergency Compressor: LLMLingua listo en CPU (standalone)")
-        except Exception as _preload_err:
-            _terminal_status("⚠️", f"Emergency Compressor: partial preload ({_preload_err}) — will load lazily")
-    except ImportError as e:
-        _terminal_status("⚠️", f"Emergency Compressor: UNAVAILABLE (import failed: {e})")
-        _compressor_module = None
-    except Exception as e:
-        _terminal_status("❌", f"Emergency Compressor: FAILED to initialize ({e})")
-        _compressor_module = None
+# Emergency compressor removed — overflow guard inlined in _should_signal_overflow().
 
 # --- Feature flags summary ---
 _active_features = []
