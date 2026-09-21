@@ -799,8 +799,7 @@ from .tool_parsing import (
     get_think_token_ids,
     _sanitize_tool_calls,
 )
-from .thinking_tracker import ThinkingTracker, ThinkingEvent
-from .thinking_tracker_v2 import ThinkingTrackerV2
+from .thinking_tracker import ThinkingTracker, ThinkingTrackerV2, ThinkingEvent
 from .tool_call_tracker import ToolCallTracker, ToolCallEvent
 # ── Message pipeline (extracted to message_pipeline.py) ──────────────────────
 from .message_pipeline import (
