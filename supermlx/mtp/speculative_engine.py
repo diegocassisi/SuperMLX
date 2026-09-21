@@ -265,6 +265,7 @@ class MTPSpeculativeEngine:
         drafts_accepted = 0
         self._loop_nudge_applied = False
         self._loop_nudge_token = 0
+        curr_alpha = 0.0
         self._generated_tokens_history = [int(token_t1)]
 
         yield {
@@ -409,7 +410,7 @@ class MTPSpeculativeEngine:
                                 "tokens_generated": tokens_generated,
                                 "drafts_accepted": drafts_accepted,
                                 "drafts_attempted": drafts_attempted,
-                                "alpha": curr_alpha if 'curr_alpha' in locals() else 0.0,
+                                "alpha": curr_alpha,
                             }
 
                         # El último token del nudge queda como confirmed_token para entrar en Step 4
