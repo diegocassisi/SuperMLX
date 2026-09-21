@@ -3533,13 +3533,16 @@ except Exception as _moe_err:
 # Applies wired_limit (anti-swap) + cache_limit (scratch ceiling).
 from . import metal_memory_guard as _guard
 try:
+    _terminal_status("🛡️", "Metal Guard: initializing (wired limit + cache ceiling + shader warmup)...")
+    _guard_t0 = time.time()
     _guard_result = _guard.init_protections(model=model, kv_bits=SETTINGS.kv_bits)
+    _guard_init_ms = int((time.time() - _guard_t0) * 1000)
     _terminal_status(
         "🛡️",
         f"Metal Guard: wired={_guard_result['wired_limit_gb']:.1f}GB | "
         f"cache_limit={_guard_result['cache_limit_gb']:.1f}GB | "
         f"active={_guard_result['active_gb']:.1f}GB | "
-        f"budget={_guard_result['max_working_set_gb']:.1f}GB",
+        f"budget={_guard_result['max_working_set_gb']:.1f}GB ({_guard_init_ms}ms)",
     )
     # Mechanism 3: compile Metal shaders via a real forward pass
     _shader_elapsed = _guard.warmup_shaders(
