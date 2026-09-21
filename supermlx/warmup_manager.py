@@ -1,33 +1,53 @@
 """
-[AI_DIRECTIVE]
-ROL: Primitivas de persistencia KV cache a disco + state container para startup
-OBJETIVO: Proveer load/save de safetensors, hashing de prefijo, restauración
-          de snapshots congelados. Usado por TPC (tool_prefix_cache) y server.py.
-ENTRADAS: KV cache arrays, token lists, paths
-SALIDAS: Archivos .safetensors + .hash en disco, snapshots restaurados en memoria
-REGLAS INVIOLABLES:
-- Prohibido tomar decisiones de evicción — eso lo hace el caller
-- Prohibido crashear el servidor en operaciones de disco (best-effort)
-- Las funciones son primitivas puras: no acceden a globals del server
-SSoT: TPC (tool_prefix_cache.py) es la SSoT para el prefix cache.
-      Este módulo provee las primitivas de I/O que TPC consume.
+warmup_manager.py — Dynamic Prefix Capture (DPC) for SuperMLX
+══════════════════════════════════════════════════════════════════════════════
+
+Manages KV cache warmup lifecycle with zero manual seed files.
+
+Architecture inspired by SGLang (RadixAttention) and vLLM (Automatic Prefix
+Caching), adapted for MLX's flat ArraysCache/KVCache memory model.
+
+Flow:
+  1. Boot:    Load prefix hash from disk (instant, <1ms)
+  2. Request: Detect boundary → hash prefix → compare with disk
+              Match  → load .safetensors → instant warm cache
+              Miss   → cold start → auto-capture → save to disk
+  3. Restart: Back to step 1 (self-healing if SOUL/tools changed)
+
+Files managed:
+  - logs/warmup_cache.safetensors  — KV state of the static prefix
+  - logs/warmup_cache.hash         — MD5 of the prefix token array
+
+Replaces: warmup_seed.txt, .seed_hash, FEATURE_WARMUP_AUTO_UPDATE
 """
 
 import copy
 import hashlib
-import logging
+import math
 import struct
 import threading
 import time
 from pathlib import Path
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from supermlx.cache_types import is_recurrent_layer
 
 import mlx.core as mx
-from mlx_lm.models.cache import make_prompt_cache
+from mlx_lm.models.cache import (
+    make_prompt_cache,
+    can_trim_prompt_cache,
+    trim_prompt_cache,
+)
 
-logger = logging.getLogger(__name__)
+# ── Boundary markers for different model families ────────────────────────────
+# The first user message marker separates the static prefix (system + tools)
+# from the variable content (user messages, RAG, conversation history).
+_USER_MARKERS = [
+    "<|im_start|>user",        # Qwen3/ChatML
+    "<|start_header_id|>user", # Llama 3
+    "<|user|>",                # Gemma/generic
+    "<start_of_turn>user",     # Gemma 2
+]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -57,6 +77,75 @@ def compute_prefix_hash(
     return h.hexdigest()
 
 
+def load_prefix_hash(cache_dir: Path) -> Optional[str]:
+    """Load prefix hash from disk. Returns None if not found."""
+    hash_path = cache_dir / "warmup_cache.hash"
+    if hash_path.exists():
+        try:
+            return hash_path.read_text().strip()
+        except Exception:
+            return None
+    return None
+
+
+def save_prefix_hash(prefix_hash: str, cache_dir: Path) -> None:
+    """Save prefix hash to disk."""
+    hash_path = cache_dir / "warmup_cache.hash"
+    hash_path.parent.mkdir(parents=True, exist_ok=True)
+    hash_path.write_text(prefix_hash)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# BOUNDARY DETECTION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def detect_boundary(prompt_text: str, tokens: List[int], tokenizer) -> int:
+    """
+    Find the boundary between static prefix (system + tools) and variable
+    content (user messages) in token space.
+
+    Strategy:
+      1. Find the character position of the first user marker in the rendered
+         prompt string (reliable, model-family agnostic).
+      2. Tokenize only the static prefix substring to get the exact token
+         boundary index.
+
+    Returns the token index where the first user message begins.
+    If no user marker is found, returns len(tokens) (entire prompt is static).
+
+    NOTE: We operate on the rendered string first and then re-tokenize the
+    prefix substring, instead of searching for marker tokens directly in the
+    token array. This avoids BPE context-sensitivity issues where tokenizing
+    a marker string in isolation produces different token IDs than when it
+    appears in a larger context.
+    """
+    # Find character position of first user marker
+    cut_pos = len(prompt_text)
+    for marker in _USER_MARKERS:
+        pos = prompt_text.find(marker)
+        if pos > 0:
+            cut_pos = min(cut_pos, pos)
+            break
+
+    if cut_pos >= len(prompt_text):
+        # No user marker found — entire prompt is static (unusual but valid)
+        return len(tokens)
+
+    # Tokenize just the static prefix to get exact token boundary
+    static_text = prompt_text[:cut_pos]
+
+    # Use same logic as _tokenize_prompt: skip BOS if already present
+    add_special_tokens = (
+        getattr(tokenizer, "bos_token", None) is None
+        or not static_text.startswith(tokenizer.bos_token or "")
+    )
+    static_tokens = tokenizer.encode(static_text, add_special_tokens=add_special_tokens)
+    boundary = len(static_tokens)
+
+    # Safety: clamp to total token count
+    return min(boundary, len(tokens))
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # CACHE PERSISTENCE (save/load KV state to/from disk)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -80,79 +169,98 @@ def save_cache(
     Args:
         tokens: Token IDs corresponding to the cached KV state.
         prompt_cache: List of cache layer objects (KVCache/ArraysCache).
-        path: Target file path (.safetensors).
-        prefix_hash: Optional MD5 hash to save alongside.
+        path: Destination path for the .safetensors file.
+        prefix_hash: MD5 hash of the prefix tokens (saved alongside).
         log_fn: Optional logging callback fn(emoji, message).
-
-    Returns:
-        True on success, False on failure.
     """
     _log = log_fn or (lambda *a: None)
-    _t0 = time.perf_counter()
-    path = Path(path)
-
     try:
-        if not tokens or not prompt_cache:
-            _log("⚠️", "save_cache: empty tokens or cache — skipping")
-            return False
-
         path.parent.mkdir(parents=True, exist_ok=True)
-        weights = {}
-
-        # Metadata
-        import numpy as np
-        weights["__tokens__"] = mx.array(tokens, dtype=mx.int32)
-        weights["__version__"] = mx.array([CACHE_FORMAT_VERSION], dtype=mx.int32)
-
-        # Serialize each layer
+        arrays: Dict[str, Any] = {}
+        arrays["tokens"] = mx.array(tokens, dtype=mx.int32)
+        arrays["cache_format_version"] = mx.array(
+            [CACHE_FORMAT_VERSION], dtype=mx.int32
+        )
+        # n_kv_layers: count of layers that actually have KV cache state
+        # (hybrid models like DeltaNet/Attention have fewer KV layers than total layers)
+        saved_layers = 0
+        saved_recurrent = 0
         for i, layer in enumerate(prompt_cache):
-            if is_recurrent_layer(layer):
-                # Recurrent layer (ArraysCache): save the cache/state arrays
-                cache_data = getattr(layer, 'cache', getattr(layer, 'state', []))
-                for j, arr in enumerate(cache_data):
-                    if arr is not None:
-                        weights[f"layer_{i}_recurrent_{j}"] = arr
-                # Save offset/position
-                offset = getattr(layer, 'offset', None)
-                if offset is not None:
-                    weights[f"layer_{i}_offset"] = mx.array([int(offset)], dtype=mx.int32)
+            # # DEBUG: trace each layer to find why KVCache layers are not saved
+            # _has_state = hasattr(layer, "state")
+            # _has_keys = hasattr(layer, "keys")
+            # _keys_none = layer.keys is None if _has_keys else "N/A"
+            # _offset = getattr(layer, "offset", "N/A")
+            # _cls = type(layer).__name__
+            # if i < 5 or (i % 10 == 0):
+            #     _log("DEBUG", f"save layer[{i}] cls={_cls} has_state={_has_state} has_keys={_has_keys} keys_none={_keys_none} offset={_offset}")
+            # --- ArraysCache (GatedDeltaNet recurrent state) ---
+            # Hybrid models (Qwen3.5/Agents-A1) have GatedDeltaNet layers that use
+            # ArraysCache with [conv_state, recurrent_state] instead of KVCache.
+            # Persisting this avoids re-computing 30 layers of recurrent state on prefill.
+            if hasattr(layer, "state") and isinstance(layer.state, (list, tuple)) and not hasattr(layer, "keys"):
+                has_data = any(
+                    s is not None and hasattr(s, "shape")
+                    for s in layer.state
+                )
+                if has_data:
+                    for part_idx, part in enumerate(layer.state):
+                        if part is not None and hasattr(part, "shape"):
+                            arrays[f"rs{i}_{part_idx}"] = part
+                    arrays[f"rs{i}_n"] = mx.array(
+                        [len(layer.state)], dtype=mx.int32
+                    )
+                    saved_recurrent += 1
+                continue
+            
+            # --- KVCache / QuantizedKVCache ---
+            if not hasattr(layer, "keys") or layer.keys is None:
+                continue
+            offset = int(getattr(layer, "offset", 0))
+            if offset == 0:
+                continue
+            # tree_map converts tuples to lists, so check both types.
+            # QuantizedKVCache stores keys/values as 3-element sequences (data, scales, biases).
+            is_quantized = isinstance(layer.keys, (tuple, list)) and len(layer.keys) == 3
+            if is_quantized:
+                # QuantizedKVCache: keys/values are tuples of (data, scales, biases)
+                group_size = getattr(layer, "group_size", 64)
+                bits = getattr(layer, "bits", 8)
+                arrays[f"qmeta{i}"] = mx.array([group_size, bits], dtype=mx.int32)
+                for part_idx, part in enumerate(layer.keys):
+                    arrays[f"k{i}_{part_idx}"] = part[..., :offset, :]
+                for part_idx, part in enumerate(layer.values):
+                    arrays[f"v{i}_{part_idx}"] = part[..., :offset, :]
             else:
-                # Standard KVCache layer
-                keys = getattr(layer, "keys", None)
-                values = getattr(layer, "values", None)
-                if keys is not None:
-                    weights[f"layer_{i}_keys"] = keys
-                if values is not None:
-                    weights[f"layer_{i}_values"] = values
-                # Store offset
-                offset = getattr(layer, "offset", None)
-                if offset is not None:
-                    weights[f"layer_{i}_offset"] = mx.array([int(offset)], dtype=mx.int32)
-                # Store step (for rotary position tracking)
-                step = getattr(layer, "step", None)
-                if step is not None:
-                    weights[f"layer_{i}_step"] = mx.array([int(step)], dtype=mx.int32)
+                # KVCache: keys/values are plain arrays (or single-element lists)
+                k_arr = layer.keys[0] if isinstance(layer.keys, list) else layer.keys
+                v_arr = layer.values[0] if isinstance(layer.values, list) else layer.values
+                arrays[f"k{i}"] = k_arr[..., :offset, :]
+                arrays[f"v{i}"] = v_arr[..., :offset, :]
+            arrays[f"o{i}"] = mx.array([offset], dtype=mx.int32)
+            saved_layers += 1
+        # Save actual KV layer count (not total model layers)
+        arrays["n_layers"] = mx.array([saved_layers], dtype=mx.int32)
+        if saved_recurrent > 0:
+            arrays["n_recurrent"] = mx.array([saved_recurrent], dtype=mx.int32)
+        # Force evaluation before writing to disk
+        live = [v for v in arrays.values() if hasattr(v, "shape")]
+        if live:
+            mx.eval(*live)
+        mx.save_safetensors(str(path), arrays)
 
-        mx.savez(str(path), **weights)
-
-        _elapsed = time.perf_counter() - _t0
-        _size_mb = path.stat().st_size / 1e6 if path.exists() else 0
+        # Save prefix hash alongside the cache
+        if prefix_hash:
+            save_prefix_hash(prefix_hash, path.parent)
 
         _log(
             "💾",
-            f"Cache saved: {path.name} | {len(tokens)} tokens | "
-            f"{_size_mb:.1f}MB | {_elapsed:.2f}s",
+            f"DPC: cache saved → {path.name} | format=v{CACHE_FORMAT_VERSION} | "
+            f"layers={saved_layers} + {saved_recurrent} recurrent | tokens={len(tokens)}",
         )
-
-        # Save hash alongside
-        if prefix_hash:
-            hash_path = path.parent / "warmup_cache.hash"
-            hash_path.write_text(prefix_hash)
-
         return True
-
     except Exception as e:
-        _log("⚠️", f"save_cache FAILED: {type(e).__name__}: {e}")
+        _log("⚠️", f"DPC: cache save FAILED ({type(e).__name__}: {e})")
         return False
 
 
@@ -166,89 +274,159 @@ def load_cache(
     """
     Deserialize KV cache from disk.
 
-    Creates a fresh prompt_cache from the model and populates it with the
-    saved K/V arrays. Validates format version and array shapes.
+    Reconstructs KVCache layer objects with saved K/V arrays and offsets.
+    Returns (tokens, prompt_cache) or (None, None) on any failure.
 
     Args:
         path: Path to the .safetensors file.
         model: The loaded MLX model (needed for make_prompt_cache).
-        max_kv_size: Maximum KV cache size in tokens.
-        is_vlm: Whether the model is a vision-language model.
+        max_kv_size: Maximum KV cache size setting.
+        is_vlm: Whether the model is a Vision-Language Model.
         log_fn: Optional logging callback fn(emoji, message).
-
-    Returns:
-        (tokens, prompt_cache) on success, (None, None) on failure.
     """
     _log = log_fn or (lambda *a: None)
-    path = Path(path)
-
     if not path.exists():
-        _log("ℹ️", f"load_cache: {path.name} not found — cold start")
         return None, None
-
     try:
-        _t0 = time.perf_counter()
-        weights = dict(mx.load(str(path)))
-
-        # Version check
-        version = int(weights.get("__version__", mx.array([1]))[0].item())
-        if version > CACHE_FORMAT_VERSION:
-            _log("⚠️", f"load_cache: unsupported version {version} — skipping")
-            return None, None
-
-        # Extract tokens
-        tokens_arr = weights.get("__tokens__")
-        if tokens_arr is None:
-            _log("⚠️", "load_cache: no __tokens__ in saved cache — skipping")
-            return None, None
-        tokens = tokens_arr.tolist()
-
-        # Create fresh cache from model
-        prompt_cache = make_prompt_cache(model, max_kv_size)
-
-        # Populate layers
-        for i, layer in enumerate(prompt_cache):
-            if is_recurrent_layer(layer):
-                # Recurrent layer: restore cache/state arrays
-                cache_data = getattr(layer, 'cache', getattr(layer, 'state', []))
-                for j in range(len(cache_data)):
-                    key = f"layer_{i}_recurrent_{j}"
-                    if key in weights:
-                        cache_data[j] = weights[key]
-                # Restore offset
-                offset_key = f"layer_{i}_offset"
-                if offset_key in weights:
-                    offset_val = int(weights[offset_key][0].item())
-                    if hasattr(layer, 'offset'):
-                        layer.offset = offset_val
-            else:
-                # Standard KVCache layer
-                keys_key = f"layer_{i}_keys"
-                values_key = f"layer_{i}_values"
-                if keys_key in weights and values_key in weights:
-                    layer.keys = weights[keys_key]
-                    layer.values = weights[values_key]
-                # Restore offset
-                offset_key = f"layer_{i}_offset"
-                if offset_key in weights:
-                    offset_val = int(weights[offset_key][0].item())
-                    if hasattr(layer, 'offset'):
-                        layer.offset = offset_val
-                # Restore step
-                step_key = f"layer_{i}_step"
-                if step_key in weights:
-                    step_val = int(weights[step_key][0].item())
-                    if hasattr(layer, 'step'):
-                        layer.step = step_val
-
-        _elapsed = time.perf_counter() - _t0
-        _log(
-            "🔥",
-            f"Cache loaded: {path.name} | {len(tokens)} tokens | "
-            f"{len(prompt_cache)} layers | {_elapsed:.2f}s",
+        arrays = mx.load(str(path))
+        version_array = arrays.get("cache_format_version")
+        version = (
+            int(version_array.tolist()[0])
+            if version_array is not None
+            else None
         )
-        return tokens, prompt_cache
+        if version != CACHE_FORMAT_VERSION:
+            _log(
+                "⚠️",
+                "DPC: incompatible cache format "
+                f"({version if version is not None else 'legacy'} != "
+                f"v{CACHE_FORMAT_VERSION}) — ignoring and cold-starting",
+            )
+            return None, None
+        tokens = arrays["tokens"].tolist()
+        if not tokens:
+            _log("⚠️", "DPC: disk cache has empty token list — ignoring")
+            return None, None
 
+        cache_model = (
+            model.language_model
+            if is_vlm and hasattr(model, "language_model")
+            else model
+        )
+        prompt_cache = make_prompt_cache(cache_model, max_kv_size=max_kv_size)
+
+        restored_layers = 0
+        restored_recurrent = 0
+        for i, layer in enumerate(prompt_cache):
+            # --- ArraysCache (GatedDeltaNet recurrent state) ---
+            rs_n_key = f"rs{i}_n"
+            if rs_n_key in arrays:
+                n_parts = int(arrays[rs_n_key].tolist()[0])
+                state_parts = []
+                for p_idx in range(n_parts):
+                    part_key = f"rs{i}_{p_idx}"
+                    if part_key in arrays:
+                        state_parts.append(arrays[part_key])
+                    else:
+                        state_parts.append(None)
+                if hasattr(layer, "state") and not hasattr(layer, "keys"):
+                    layer.state = state_parts
+                    restored_recurrent += 1
+                continue
+            
+            # --- KVCache / QuantizedKVCache ---
+            # Detect format: quantized (k{i}_0) vs plain (k{i})
+            is_quantized = f"k{i}_0" in arrays
+            if not is_quantized and f"k{i}" not in arrays:
+                continue
+            o_key = f"o{i}"
+            if o_key not in arrays:
+                continue
+            offset = int(arrays[o_key].tolist()[0])
+            if offset == 0:
+                continue
+
+            step = int(getattr(layer, "step", 256))
+            capacity = math.ceil(offset / step) * step
+
+            if is_quantized:
+                # QuantizedKVCache format: restore tuples + convert layer type
+                qmeta = arrays.get(f"qmeta{i}")
+                group_size = int(qmeta.tolist()[0]) if qmeta is not None else 64
+                bits = int(qmeta.tolist()[1]) if qmeta is not None else 8
+
+                def _pad_parts(prefix: str) -> tuple:
+                    parts = []
+                    for p in range(3):
+                        arr = arrays[f"{prefix}{i}_{p}"]
+                        current_len = arr.shape[2]
+                        if capacity > current_len:
+                            pad = mx.zeros(
+                                (*arr.shape[:2], capacity - current_len, arr.shape[3]),
+                                dtype=arr.dtype,
+                            )
+                            arr = mx.concatenate([arr, pad], axis=2)
+                        parts.append(arr)
+                    return tuple(parts)
+
+                # Replace the KVCache layer with a QuantizedKVCache
+                from mlx_lm.models.cache import QuantizedKVCache
+                qlayer = QuantizedKVCache(group_size=group_size, bits=bits)
+                qlayer.keys = _pad_parts("k")
+                qlayer.values = _pad_parts("v")
+                qlayer.offset = offset
+                prompt_cache[i] = qlayer
+            else:
+                # Plain KVCache format
+                saved_k = arrays[f"k{i}"]
+                saved_v = arrays[f"v{i}"]
+                current_len = saved_k.shape[2]
+                if capacity > current_len:
+                    pad_len = capacity - current_len
+                    zeros_k = mx.zeros(
+                        (*saved_k.shape[:2], pad_len, saved_k.shape[3]), dtype=saved_k.dtype
+                    )
+                    zeros_v = mx.zeros(
+                        (*saved_v.shape[:2], pad_len, saved_v.shape[3]), dtype=saved_v.dtype
+                    )
+                    layer.keys = mx.concatenate([saved_k, zeros_k], axis=2)
+                    layer.values = mx.concatenate([saved_v, zeros_v], axis=2)
+                else:
+                    layer.keys = saved_k
+                    layer.values = saved_v
+                layer.offset = offset
+            restored_layers += 1
+
+        # Force GPU evaluation of all reconstructed tensors
+        live = [
+            l.keys for l in prompt_cache
+            if hasattr(l, "keys") and l.keys is not None
+        ]
+        # Also eval restored recurrent states (GatedDeltaNet ArraysCache)
+        for l in prompt_cache:
+            if hasattr(l, "state") and isinstance(l.state, (list, tuple)):
+                for s in l.state:
+                    if s is not None and hasattr(s, "shape"):
+                        live.append(s)
+        if live:
+            mx.eval(*live)
+
+        _log(
+            "💾",
+            f"DPC: disk cache loaded | layers={restored_layers} + {restored_recurrent} recurrent | tokens={len(tokens)}",
+        )
+        # Guard: restored layers must match what was originally saved.
+        # Hybrid models (DeltaNet/Attention) save fewer layers than total model layers
+        # because DeltaNet layers use recurrent state, not KV cache.
+        expected_kv_layers = int(arrays["n_layers"].tolist()[0]) if "n_layers" in arrays else total_layers
+        if restored_layers < expected_kv_layers:
+            _log(
+                "⚠️",
+                f"DPC: partial cache ({restored_layers}/{expected_kv_layers} kv-layers) — "
+                f"discarding to avoid shape mismatch. Will cold-start.",
+            )
+            return None, None
+        return tokens, prompt_cache
     except Exception as e:
         _log(
             "⚠️",
@@ -258,8 +436,62 @@ def load_cache(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# FROZEN CACHE RESTORE (pollution recovery for FIX-31)
+# FROZEN CACHE (immutable snapshot for pollution recovery)
 # ═══════════════════════════════════════════════════════════════════════════════
+
+def create_frozen_snapshot(
+    prompt_cache: Any,
+    tokens: List[int],
+    log_fn=None,
+) -> Tuple[Optional[Any], Optional[List[int]]]:
+    """
+    Create an immutable deep copy of the prompt cache for pollution recovery.
+
+    When the sliding window gets contaminated with response tokens, this frozen
+    snapshot allows restoring a clean prefix cache in ~3s instead of doing a
+    full re-prefill (~70s).
+
+    Args:
+        prompt_cache: Live prompt cache (list of layer objects).
+        tokens: Token IDs corresponding to the cached state.
+        log_fn: Optional logging callback fn(emoji, message).
+
+    Returns:
+        (frozen_cache, frozen_tokens) or (None, None) on failure.
+    """
+    _log = log_fn or (lambda *a: None)
+    try:
+        if isinstance(prompt_cache, list) and len(prompt_cache) > 0:
+            frozen = []
+            for layer in prompt_cache:
+                if is_recurrent_layer(layer):
+                    # Recurrent layer: copy arrays without importing ArraysCache
+                    cache_data = getattr(layer, 'cache', getattr(layer, 'state', []))
+                    new_layer = copy.copy(layer)
+                    if hasattr(layer, 'cache'):
+                        new_layer.cache = [
+                            mx.array(c) if c is not None else None
+                            for c in layer.cache
+                        ]
+                    elif hasattr(layer, 'state'):
+                        new_layer.state = [
+                            mx.array(c) if c is not None else None
+                            for c in layer.state
+                        ]
+                    frozen.append(new_layer)
+                else:
+                    frozen.append(copy.deepcopy(layer))
+            frozen_tokens = list(tokens)
+            _log(
+                "🧊",
+                f"DPC: frozen cache created | {len(frozen)} layers | "
+                f"{len(frozen_tokens)} tokens",
+            )
+            return frozen, frozen_tokens
+    except Exception as e:
+        _log("⚠️", f"DPC: freeze failed ({e}) — pollution recovery disabled")
+    return None, None
+
 
 def restore_frozen_snapshot(
     frozen_cache: Any,
@@ -272,7 +504,7 @@ def restore_frozen_snapshot(
     immutable for future restores.
 
     Args:
-        frozen_cache: Previously frozen cache.
+        frozen_cache: Previously frozen cache (from create_frozen_snapshot).
         log_fn: Optional logging callback fn(emoji, message).
 
     Returns:
@@ -299,29 +531,317 @@ def restore_frozen_snapshot(
                 restored.append(new_layer)
             else:
                 restored.append(copy.deepcopy(layer))
-        _log("🧊", f"Frozen cache restored | {len(restored)} layers")
+        _log("🧊", f"DPC: frozen cache restored | {len(restored)} layers")
         return restored
     except Exception as e:
-        _log("⚠️", f"Frozen restore failed ({e})")
+        _log("⚠️", f"DPC: frozen restore failed ({e})")
         return None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# STATE CONTAINER (shared between startup thread and request handler)
+# AUTO-SAVE: trim response tokens and persist prefix-only cache
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def trim_and_save_prefix(
+    cache_key: List[int],
+    prompt_cache: Any,
+    generated_tokens: List[int],
+    persist_path: Path,
+    prefix_hash: Optional[str] = None,
+    log_fn=None,
+) -> Tuple[Optional[Any], Optional[List[int]]]:
+    """
+    Trim response tokens from cache, save prefix-only state to disk,
+    and return a frozen snapshot of the trimmed cache.
+
+    This handles the complexity of hybrid caches (ArraysCache + KVCache)
+    where only KVCache layers are trimmable.
+
+    Args:
+        cache_key: Full token sequence (prompt + generated).
+        prompt_cache: Live prompt cache after generation.
+        generated_tokens: Tokens generated in this turn.
+        persist_path: Path for the .safetensors file.
+        prefix_hash: MD5 hash of the prefix tokens.
+        log_fn: Optional logging callback fn(emoji, message).
+
+    Returns:
+        (frozen_cache, frozen_tokens) for pollution recovery, or (None, None).
+    """
+    _log = log_fn or (lambda *a: None)
+
+    # Strip response tokens from the key
+    prompt_only_key = (
+        cache_key[:-len(generated_tokens)]
+        if generated_tokens
+        else list(cache_key)
+    )
+
+    _log(
+        "💾",
+        f"DPC auto-save: capturing prefix cache → {persist_path.name} | "
+        f"tokens={len(prompt_only_key)} (stripped {len(generated_tokens)} response tok)",
+    )
+
+    save_cache_copy = None
+
+    if generated_tokens and can_trim_prompt_cache(prompt_cache):
+        # Standard path: all layers trimmable (pure KVCache model)
+        try:
+            save_cache_copy = copy.deepcopy(prompt_cache)
+            pre_trim = _kv_offset(save_cache_copy)
+            trim_prompt_cache(save_cache_copy, len(generated_tokens))
+            post_trim = _kv_offset(save_cache_copy)
+
+            if post_trim is not None and pre_trim is not None and post_trim >= pre_trim:
+                _log("⚠️", f"DPC auto-save ABORTED: trim did not reduce offset ({pre_trim} → {post_trim})")
+                save_cache_copy = None
+        except Exception as e:
+            _log("⚠️", f"DPC auto-save ABORTED: deepcopy/trim failed ({e})")
+            save_cache_copy = None
+
+    elif not generated_tokens:
+        # No response tokens to strip — safe to save as-is
+        save_cache_copy = prompt_cache
+
+    else:
+        # Hybrid cache (e.g., Qwen3.5: ArraysCache + KVCache):
+        # can_trim_prompt_cache() requires ALL layers trimmable, but
+        # ArraysCache (linear attention) is never trimmable.
+        # Fix: deepcopy + trim only the trimmable layers (KVCache).
+        any_trimmable = any(
+            hasattr(layer, "is_trimmable") and layer.is_trimmable()
+            for layer in prompt_cache
+        )
+        if any_trimmable:
+            try:
+                save_cache_copy = copy.deepcopy(prompt_cache)
+                pre_trim = None
+                for layer in save_cache_copy:
+                    if hasattr(layer, "is_trimmable") and layer.is_trimmable() and hasattr(layer, "offset"):
+                        pre_trim = int(layer.offset)
+                        break
+
+                n_trimmed = 0
+                for layer in save_cache_copy:
+                    if hasattr(layer, "is_trimmable") and layer.is_trimmable() and hasattr(layer, "trim"):
+                        layer.trim(len(generated_tokens))
+                        n_trimmed += 1
+
+                post_trim = None
+                for layer in save_cache_copy:
+                    if hasattr(layer, "is_trimmable") and layer.is_trimmable() and hasattr(layer, "offset"):
+                        post_trim = int(layer.offset)
+                        break
+
+                if post_trim is not None and pre_trim is not None and post_trim >= pre_trim:
+                    _log("⚠️", f"DPC auto-save ABORTED: per-layer trim did not reduce offset ({pre_trim} → {post_trim})")
+                    save_cache_copy = None
+                else:
+                    _log("💾", f"DPC auto-save: per-layer trim OK | trimmed={n_trimmed}/{len(save_cache_copy)} layers | offset {pre_trim} → {post_trim}")
+            except Exception as e:
+                _log("⚠️", f"DPC auto-save ABORTED: per-layer trim failed ({e})")
+                save_cache_copy = None
+        else:
+            _log("⚠️", f"DPC auto-save SKIPPED: no trimmable layers ({type(prompt_cache[0]).__name__ if prompt_cache else 'empty'})")
+
+    # Persist and create frozen snapshot
+    frozen_cache = None
+    frozen_tokens = None
+
+    if save_cache_copy is not None:
+        # Save to disk in background thread
+        threading.Thread(
+            target=save_cache,
+            args=(prompt_only_key, save_cache_copy, persist_path),
+            kwargs={"prefix_hash": prefix_hash, "log_fn": log_fn},
+            daemon=True,
+            name="dpc-cache-save",
+        ).start()
+
+        # Create frozen snapshot from the trimmed copy
+        frozen_cache = save_cache_copy
+        frozen_tokens = list(prompt_only_key)
+        _log("🧊", f"DPC: frozen cache updated | {len(save_cache_copy)} layers | {len(prompt_only_key)} tokens")
+
+    return frozen_cache, frozen_tokens
+
+
+def _kv_offset(cache: Any) -> Optional[int]:
+    """Return the current KV offset from the first layer that has one."""
+    if cache is None:
+        return None
+    for layer in cache:
+        off = getattr(layer, "offset", None)
+        if off is not None:
+            return int(off)
+    return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# STARTUP: Background boot sequence (load hash + pre-load cache)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class DPCState:
     """
-    Shared state for the cache lifecycle.
+    Shared state for the Dynamic Prefix Capture lifecycle.
 
     Thread-safe via the warmup_done event and explicit locking where needed.
     Created once at boot, referenced by the request handler.
     """
-    def __init__(self) -> None:
+    def __init__(self):
         self.prefix_hash: Optional[str] = None       # MD5 from disk (loaded at boot)
         self.frozen_cache: Optional[Any] = None       # Immutable snapshot for pollution recovery
         self.frozen_tokens: Optional[List[int]] = None  # Tokens for the frozen cache
         self.disk_cache_saved: bool = False            # True after first MAIN save to disk
         self.embedded_cache_saved: bool = False        # True after first EMBEDDED save to disk
         self.warmup_done = threading.Event()           # Set when boot sequence completes
-        self.first_capture_done: bool = False          # True after auto-capture on first request
+        self.first_capture_done: bool = False          # True after DPC auto-capture on first request
+
+
+def run_startup(
+    state: DPCState,
+    cache_persist_path: Optional[str],
+    embedded_cache_persist_path: Optional[str],
+    model: Any,
+    max_kv_size: int,
+    is_vlm: bool,
+    prompt_cache_main,      # LRUPromptCache for MAIN
+    prompt_cache_compact,   # LRUPromptCache for COMPACT
+    prompt_cache_lock,      # threading.Lock for cache access
+    model_path: str,
+    log_fn=None,
+) -> None:
+    """
+    Background startup sequence for DPC.
+
+    1. Load prefix hash from disk (instant)
+    2. Load EMBEDDED cache from disk → PROMPT_CACHE_COMPACT
+    3. Load MAIN cache from disk (tentative — validated on first request)
+    4. Signal warmup_done
+
+    Does NOT do any prefill. The first real request handles cold start
+    if the hash doesn't match.
+    """
+    _log = log_fn or (lambda *a: None)
+
+    persist_path = Path(cache_persist_path) if cache_persist_path else None
+    embedded_persist_path = (
+        Path(embedded_cache_persist_path) if embedded_cache_persist_path else None
+    )
+
+    try:
+        # ── 1. Load prefix hash ─────────────────────────────────────────────
+        if persist_path:
+            state.prefix_hash = load_prefix_hash(persist_path.parent)
+            if state.prefix_hash:
+                _log("🔑", f"DPC: prefix hash loaded from disk | {state.prefix_hash[:12]}…")
+            else:
+                _log("ℹ️", "DPC: no prefix hash on disk — first request will cold-start")
+
+        # ── 2. Load EMBEDDED cache (PROMPT_CACHE_COMPACT) ────────────────────
+        # DISABLED: OpenClaw compact runner is no longer in use.
+        # PROMPT_CACHE_COMPACT is never populated at runtime, so skip loading
+        # the disk cache to save ~9K tokens of GPU memory at startup.
+        if False and embedded_persist_path and embedded_persist_path.exists():
+            emb_tokens, emb_cache = load_cache(
+                embedded_persist_path, model, max_kv_size, is_vlm, log_fn=_log,
+            )
+            if emb_tokens and emb_cache and len(emb_tokens) > 1000:
+                with prompt_cache_lock:
+                    prompt_cache_compact.insert_cache(
+                        model_path, emb_tokens, emb_cache, pinned=False
+                    )
+                _log(
+                    "🔥",
+                    f"DPC: EMBEDDED cache loaded (disk) | {len(emb_tokens)} tokens → COMPACT slot",
+                )
+            else:
+                _log("⚠️", "DPC: EMBEDDED disk cache invalid or empty — COMPACT slot empty")
+
+        # ── 3. Load MAIN cache from disk (tentative) ─────────────────────────
+        # We load it into PROMPT_CACHE now. On the first real request, we'll
+        # validate the prefix hash. If it doesn't match, we evict and cold-start.
+        if persist_path and persist_path.exists():
+            _t_load_start = time.perf_counter()
+            _mem_pre_load = mx.get_active_memory() / 1e9
+
+            disk_tokens, disk_cache = load_cache(
+                persist_path, model, max_kv_size, is_vlm, log_fn=_log,
+            )
+
+            _load_elapsed = time.perf_counter() - _t_load_start
+            _mem_post_load = mx.get_active_memory() / 1e9
+            _log(
+                "⏱️",
+                f"DPC: load_cache() tomó {_load_elapsed:.1f}s | "
+                f"mem {_mem_pre_load:.3f}GB → {_mem_post_load:.3f}GB "
+                f"(delta={_mem_post_load - _mem_pre_load:+.3f}GB)"
+            )
+
+            if disk_tokens and disk_cache and len(disk_tokens) > 5000:
+                _t_insert_start = time.perf_counter()
+                with prompt_cache_lock:
+                    prompt_cache_main.insert_cache(
+                        model_path, disk_tokens, disk_cache, pinned=True  # Base prefix: never evict
+                    )
+                _insert_elapsed = time.perf_counter() - _t_insert_start
+                _mem_post_insert = mx.get_active_memory() / 1e9
+                _log(
+                    "⏱️",
+                    f"DPC: insert_cache() tomó {_insert_elapsed:.2f}s | "
+                    f"tokens={len(disk_tokens)} | "
+                    f"mem_final={_mem_post_insert:.3f}GB "
+                    f"(delta insert={_mem_post_insert - _mem_post_load:+.3f}GB)"
+                )
+
+                # Create frozen snapshot from disk cache
+                state.frozen_cache, state.frozen_tokens = create_frozen_snapshot(
+                    disk_cache, disk_tokens, log_fn=_log,
+                )
+                _log(
+                    "🔥",
+                    f"DPC: MAIN cache loaded (disk) | {len(disk_tokens)} tokens | "
+                    f"hash={'✓' if state.prefix_hash else '?'} | LRU (evictable)",
+                )
+                # FIX: Mark as already saved so auto-save never overwrites
+                # the clean warmup with contaminated conversation state.
+                # Without this, every restart resets disk_cache_saved=False,
+                # and the first real request overwrites the clean warmup
+                # with recurrent state that includes conversation data
+                # → cross-session contamination (e.g. quant trading → galaga).
+                state.disk_cache_saved = True
+
+                # VALIDATE: ensure warmup only contains a short user message
+                # (e.g. "hola"). A clean warmup has ≤10 tokens between the
+                # last <|im_start|>user and <|im_end|>. Longer = contaminated.
+                _IM_START, _IM_END, _USER_TOK = 248045, 248046, 846
+                try:
+                    _last_user_pos = None
+                    for _i in range(len(disk_tokens) - 1, -1, -1):
+                        if (disk_tokens[_i] == _IM_START
+                                and _i + 1 < len(disk_tokens)
+                                and disk_tokens[_i + 1] == _USER_TOK):
+                            _last_user_pos = _i
+                            break
+                    if _last_user_pos is not None:
+                        _end_pos = len(disk_tokens)
+                        for _j in range(_last_user_pos + 2, len(disk_tokens)):
+                            if disk_tokens[_j] == _IM_END:
+                                _end_pos = _j
+                                break
+                        _user_block_len = _end_pos - _last_user_pos
+                        if _user_block_len <= 10:
+                            _log("✅", f"DPC: warmup validated — clean prefix (user block={_user_block_len} tokens)")
+                        else:
+                            _log("⚠️", f"DPC: warmup may be CONTAMINATED — user block={_user_block_len} tokens (expected ≤10). Delete warmup_cache.safetensors and send 'hola' to regenerate.")
+                except Exception:
+                    pass  # Validation is best-effort, don't block startup
+            else:
+                state.prefix_hash = None
+                _log("⚠️", "DPC: disk cache invalid or empty — first request will cold-start")
+
+    except Exception as e:
+        _log("❌", f"DPC: startup FAILED ({type(e).__name__}: {e}) — server still functional")
+    finally:
+        state.warmup_done.set()
