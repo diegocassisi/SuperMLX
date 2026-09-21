@@ -225,7 +225,7 @@ ArraysCache._ac_rollback = _ac_rollback
 ArraysCache.trim = _ac_trim
 ArraysCache.is_trimmable = _ac_is_trimmable
 
-logger.info("[INIT] ArraysCache monkey-patched: checkpoint/rollback/trim (Marconi pattern)")
+print("[INIT] ArraysCache monkey-patched: checkpoint/rollback/trim (Marconi pattern)")
 
 # Optional VLM support (Blaizzy/mlx-vlm). If unavailable, is_vlm is always False.
 try:
