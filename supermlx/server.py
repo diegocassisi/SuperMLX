@@ -3701,42 +3701,18 @@ def _warmup_save_cache(
 
 
 
-def _run_startup_warmup() -> None:
-    """
-    Background startup — Dynamic Prefix Capture (DPC).
+def _run_tpc_startup() -> None:
+    """Background startup — load Tool Prefix Cache (TPC) from disk.
 
-    No seed file needed. Boot sequence:
-      1. Load prefix hash from disk (instant)
-      2. Load EMBEDDED cache → PROMPT_CACHE_COMPACT
-      3. Load MAIN cache → PROMPT_CACHE (tentative, validated on first request)
-      4. Signal warmup_done
-
-    First real request handles validation + cold start if needed.
+    TPC stores the pre-computed KV cache for the system+tools prefix,
+    eliminating cold-start prefill on server restart.
     """
     _t0 = time.perf_counter()
     _mem_before = mx.get_active_memory() / 1e9
-    _terminal_status("⚡", f"Warmup Cache: desconectado (reemplazado 100% por TPC) | active_mem={_mem_before:.3f}GB")
 
-    # Warmup cache deshabilitado formalmente — TPC (tool_prefix_cache) es la única SSoT
-    # Ahorro de ~440 MB de VRAM al no cargar snapshot duplicado al boot.
-    # _wm.run_startup(
-    #     state=_DPC,
-    #     cache_persist_path=SETTINGS.cache_persist_path,
-    #     embedded_cache_persist_path=SETTINGS.embedded_cache_persist_path,
-    #     model=model,
-    #     max_kv_size=SETTINGS.max_kv_size,
-    #     is_vlm=is_vlm,
-    #     prompt_cache_main=PROMPT_CACHE,
-    #     prompt_cache_compact=PROMPT_CACHE_COMPACT,
-    #     prompt_cache_lock=prompt_cache_lock,
-    #     model_path=SETTINGS.model_path,
-    #     log_fn=_terminal_status,
-    # )
     _DPC.warmup_done.set()
     _DPC.disk_cache_saved = True
 
-    # Load tool prefix KV cache from disk (non-blocking — first request triggers
-    # compute if no saved state exists).
     if SETTINGS.cache_persist_path:
         _tpc.init(SETTINGS.cache_persist_path)
         _tpc.load_from_disk(model, SETTINGS.max_kv_size)
@@ -3747,26 +3723,25 @@ def _run_startup_warmup() -> None:
     _mem_delta = _mem_after - _mem_before
     _terminal_status(
         "⏱️",
-        f"DPC warmup: completo | elapsed={_elapsed:.1f}s | "
+        f"TPC startup: completo | elapsed={_elapsed:.1f}s | "
         f"active_mem={_mem_after:.3f}GB | delta={_mem_delta:+.3f}GB"
     )
 
 
-# ── Launch DPC daemon thread ────────────────────────────────────────────────
+# ── Launch TPC startup thread ────────────────────────────────────────────────
 if SETTINGS.cache_persist_path:
     _warmup_thread = threading.Thread(
-        target=_run_startup_warmup, daemon=True, name="dpc-startup"
+        target=_run_tpc_startup, daemon=True, name="tpc-startup"
     )
     _warmup_thread.start()
     _terminal_status(
         "🔥",
-        f"DPC: thread launched | "
-        f"persist={'✓ ' + Path(SETTINGS.cache_persist_path).name if SETTINGS.cache_persist_path else 'none'}",
+        f"TPC: loading tool prefix cache from disk...",
     )
 else:
     _terminal_status(
         "ℹ️",
-        "DPC: DISABLED — set CACHE_PERSIST_PATH to enable",
+        "TPC: DISABLED — set CACHE_PERSIST_PATH to enable",
     )
     _WARMUP_DONE.set()
 
