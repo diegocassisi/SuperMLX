@@ -31,10 +31,9 @@ SSoT: server.py es la única fuente de verdad (SSoT) para la ejecución de infer
   Minimal:
     python SuperMLX.py
 
-  Production (DPC + cache persistence):
+  Production (TPC + cache persistence):
     FORCE_TEXT_MODE=true \\
       CACHE_PERSIST_PATH=logs/warmup_cache.safetensors \\
-      EMBEDDED_CACHE_PERSIST_PATH=logs/embedded_cache.safetensors \\
       python SuperMLX.py
 
   Endpoints:
@@ -46,7 +45,7 @@ SSoT: server.py es la única fuente de verdad (SSoT) para la ejecución de infer
 
   ✅ On by default:
     • Dual-Slot KV Cache        Isolated MAIN + COMPACT LRU stores per agent type
-    • Dynamic Prefix Capture    Auto-capture, hash validation, disk persistence (warmup_manager.py)
+    • Tool Prefix Cache (TPC)   Pre-computed system+tools KV cache, disk persistence (tool_prefix_cache.py)
     • Post-Reaper Cache Reload  Automatic disk reload after idle eviction (v1.4.0)
     • Cache Canonicalization     Volatile fields masked → 97%+ cache hit rate
     • Compact Runner Detector   Multi-signal routing: tools + keywords + anti-MAIN guard
@@ -531,8 +530,8 @@ FEATURE_PRESERVE_THINKING     = _env_bool("PRESERVE_THINKING", True)
 # When False, housekeeping skips cache lookup entirely (TPC cold start).
 FEATURE_HOUSEKEEPING_CACHE_BORROW = _env_bool("HOUSEKEEPING_CACHE_BORROW", True)
 
-# Dynamic Prefix Capture (DPC): replaces warmup_seed.txt with auto-capture + hash validation.
-# Managed by warmup_manager.py. No manual seed files needed.
+# warmup_manager: disk I/O primitives for KV cache persistence (used by TPC + FIX-31 recovery).
+# TPC (tool_prefix_cache.py) is the SSoT for prefix caching.
 from . import warmup_manager as _wm
 from .cache_engine import (
     HybridGenerationCheckpoint,
@@ -3664,23 +3663,18 @@ _terminal_status(
 )
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STARTUP WARMUP + KV CACHE PERSISTENCE
+# TPC STARTUP + KV CACHE PERSISTENCE
 # Reduces first-request cold-start from ~40s to <2s.
 #
-# Dynamic Prefix Capture (DPC) — replaces manual warmup_seed.txt:
-#   - Boot: loads prefix hash from disk (instant)
-#   - First request: boundary detection → hash → validate → load or cold-start
-#   - Auto-capture: saves prefix KV + hash after cold start
-#   - Self-healing: invalidates cache if SOUL/tools change
+# TPC (tool_prefix_cache.py) pre-computes and persists the system+tools
+# KV cache to disk. On restart, loads from disk → instant warm start.
 #
-# CACHE_PERSIST_PATH  — path to save/load KV state between restarts.
-#                       E.g.: logs/warmup_cache.safetensors
-#                       Eliminates 40s prefill cost across server restarts.
+# CACHE_PERSIST_PATH  — directory for TPC disk state.
 # ══════════════════════════════════════════════════════════════════════════════
 
-# DPC shared state — replaces _WARMUP_SEED_HASH, _WARMUP_CACHE_FROZEN, etc.
+# Shared state: startup event + frozen cache for FIX-31 pollution recovery.
 _DPC = _wm.DPCState()
-_WARMUP_DONE = _DPC.warmup_done  # Alias for backward compat (warmup gate, sidecar wait)
+_WARMUP_DONE = _DPC.warmup_done  # Signals TPC startup complete (gates first request)
 
 
 
@@ -7710,13 +7704,13 @@ def run():
             _terminal_status("⚠️", f"Sidecar: failed to bind port {SETTINGS.sidecar_port} ({e})")
             sidecar_httpd = None
 
-    # ── Wait for warmup to complete before accepting requests ──────────
-    # Without this, the first request arrives while warmup is still prefilling
-    # in background → 0% cache miss → 75s prefill. Better to delay SYSTEM READY
-    # by ~82s and guarantee cache hits from the first request.
+    # ── Wait for TPC startup to complete before accepting requests ─────
+    # Without this, the first request arrives before TPC loads from disk
+    # → cache miss → full prefill. Better to delay SYSTEM READY and
+    # guarantee cache hits from the first request.
     if not _WARMUP_DONE.is_set():
-        print("\n⏳ Waiting for warmup to complete before accepting requests...")
-        _WARMUP_DONE.wait(timeout=300)  # 5 min max, warmup typically takes ~82s
+        logger.info("[DATA] Waiting for TPC startup to complete...")
+        _WARMUP_DONE.wait(timeout=300)  # 5 min max, TPC load typically takes <1s
 
     # Two-stage expert expansion: handled in post-response hook (_stream method).
     # Expanding at startup causes OOM: cap=170 (13.6 GB) + 33K cold prefill (3.3 GB)
