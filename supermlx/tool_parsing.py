@@ -13,9 +13,12 @@ SSoT: Parser único para compatibilidad de herramientas en SuperMLX.
 """
 
 import json
+import logging
 import re
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 # ── Tool call patterns ────────────────────────────────────────────────────────
 
@@ -732,9 +735,6 @@ def _extract_openai_tool_calls(text, model_family, allowed_tools=None):
 
 # ── Tool call sanitization (incomplete / alias normalization) ────────────────
 
-import logging as _logging
-_tc_logger = _logging.getLogger(__name__)
-
 # Alias normalization: model sometimes uses alternate names for arguments.
 # Maps tool_name → {alias: canonical}.  Canonical wins if both are present.
 _TOOL_ARG_ALIASES: Dict[str, Dict[str, str]] = {
@@ -792,7 +792,7 @@ def _sanitize_tool_calls(
                 if alias_key in args and canonical_key not in args:
                     args[canonical_key] = args.pop(alias_key)
                     changed = True
-                    _tc_logger.info(
+                    logger.info(
                         "[TOOL_COMPAT] %s req=%s | alias %s→%s applied",
                         name, request_id[:8], alias_key, canonical_key,
                     )
