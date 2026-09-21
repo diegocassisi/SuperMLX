@@ -4788,27 +4788,22 @@ class APIHandler(BaseHTTPRequestHandler):
 
     def _handle_chat_completion(self, body):
 
-        # ── DPC GATE ────────────────────────────────────────────────────────
-        # If DPC is configured and boot hasn't finished yet, the first request waits
-        # until the cache hash is loaded. For all subsequent requests
-        # _WARMUP_DONE.is_set() == True → no overhead (O(1) operation).
-        # Timeout de 120s por si el boot falla: el request procede igual (cold start).
+        # ── TPC STARTUP GATE ─────────────────────────────────────────────────
+        # If TPC is loading from disk and boot hasn't finished yet, the first
+        # request waits. For all subsequent requests _WARMUP_DONE.is_set() == True
+        # → no overhead (O(1) check).
+        # Timeout 120s: if boot fails, request proceeds with cold start.
         if not _WARMUP_DONE.is_set() and SETTINGS.cache_persist_path:
             _wg_t0 = time.time()
             _WARMUP_DONE.wait(timeout=120)
             _wg_elapsed = time.time() - _wg_t0
             if _wg_elapsed > 0.5:  # Only log if actually waited
-                with console_lock:
-                    print(
-                        f"  [WARMUP_GATE] {datetime.now().strftime('%H:%M:%S')} "
-                        f"request queued {_wg_elapsed:.1f}s for warmup | "
-                        f"cache_ready={_WARMUP_DONE.is_set()}",
-                        flush=True,
-                    )
+                logger.info(
+                    "[DATA] TPC startup gate: request queued %.1fs | cache_ready=%s",
+                    _wg_elapsed, _WARMUP_DONE.is_set(),
+                )
 
-
-
-        # ── END DPC GATE ────────────────────────────────────────────────────
+        # ── END TPC STARTUP GATE ────────────────────────────────────────────
 
         _wg_elapsed = 0.0 # Placeholder if gate didn't run
 
