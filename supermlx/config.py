@@ -172,6 +172,7 @@ class Settings:
     sidecar_enable_rag: bool          # Enable RAG enrichment on sidecar requests
     sidecar_rag_threshold: float      # L2 distance threshold for sidecar RAG (stricter than OpenClaw's 1.6)
     moe_expert_capacity: int          # Max experts per MoE layer (0=auto, based on RAM)
+    enable_moe_cache: bool            # Enable predictive MoE expert caching (lazy load + dynamic swap)
     moe_target_capacity: int          # Target capacity after warmup (0=no expansion)
     moe_expert_profile: str           # Path to expert profile JSON for MoE pinning (""=none)
     moe_shallow_pin_layers: int       # Pin top experts in first N MoE layers (0=disabled)
@@ -210,6 +211,10 @@ class Settings:
     feature_housekeeping_staging: bool    # Multi-turn safe staging for Hermes housekeeping requests
     housekeeping_staging_ttl_seconds: float # Staging TTL in seconds before rollback to base
     housekeeping_staging_max_entries: int  # Max concurrent sessions in housekeeping staging
+    enable_ane: bool                       # Enable Apple Neural Engine (ANE) offload for prefill
+    ane_prefill_threshold: int            # Minimum prompt length in tokens to trigger ANE offload
+    ane_compiled_dir: str                  # Directory to store precompiled ANE kernels
+    ane_prefill_buckets: List[int]         # Precompiled sequence length buckets for ANE
 
 
 def _normalize_model_family(value: Optional[str]) -> str:
@@ -352,6 +357,7 @@ def build_settings(script_dir: Path = Path(__file__).parent) -> Settings:
         sidecar_enable_rag=_env_bool("SIDECAR_ENABLE_RAG", True),
         sidecar_rag_threshold=_env_float("SIDECAR_RAG_THRESHOLD", 1.4),
         moe_expert_capacity=_env_int("MOE_EXPERT_CAPACITY", 100),
+        enable_moe_cache=_env_bool("ENABLE_MOE_CACHE", False),
         moe_target_capacity=_env_int("MOE_TARGET_CAPACITY", 0),
         moe_expert_profile=_env_str("MOE_EXPERT_PROFILE", ""),
         moe_shallow_pin_layers=_env_int("MOE_SHALLOW_PIN_LAYERS", 5),
@@ -396,6 +402,12 @@ def build_settings(script_dir: Path = Path(__file__).parent) -> Settings:
         feature_housekeeping_staging=_env_bool("FEATURE_HOUSEKEEPING_STAGING", False),
         housekeeping_staging_ttl_seconds=_env_float("HOUSEKEEPING_STAGING_TTL_SECONDS", 300.0),
         housekeeping_staging_max_entries=_env_int("HOUSEKEEPING_STAGING_MAX_ENTRIES", 2),
+        enable_ane=_env_bool("ENABLE_ANE", False),
+        ane_prefill_threshold=_env_int("ANE_PREFILL_THRESHOLD", 64),
+        ane_compiled_dir=_env_str("ANE_COMPILED_DIR", "models/ane_cache"),
+        ane_prefill_buckets=[
+            int(x.strip()) for x in _env_str("ANE_PREFILL_BUCKETS", "64,128,256").split(",") if x.strip()
+        ],
     )
 
 

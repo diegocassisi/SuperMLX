@@ -19,6 +19,7 @@ SSoT: This module is the single source of MoE expert management in SuperMLX.
 import json
 import logging
 import mmap
+import os
 import struct
 import time
 import types
@@ -30,6 +31,7 @@ import mlx.nn as nn
 import numpy as np
 
 from . import ssd_prefetch
+from . import metal_memory_guard as _guard
 
 logger = logging.getLogger(__name__)
 
@@ -473,7 +475,7 @@ class PredictiveExpertCache:
                 b[slot_indices] = new_b
                 self.biases[proj_name] = b
 
-        mx.clear_cache()
+        _guard.force_clear_cache("expert_swap")
 
         # Update bookkeeping
         for slot, old_eid, new_eid in swaps:
@@ -1059,20 +1061,8 @@ def enable_moe_cache(
     # Enable skip-fallback on MoE blocks
     patched = enable_skip_fallback(model)
 
-    # Wire memory to prevent OS paging.
-    # Reserve PREFILL_SCRATCH_GB for large-context prefill scratch;
-    # wiring too aggressively causes Metal OOM during mx.eval() on long prompts.
-    if hasattr(mx, "set_wired_limit"):
-        PREFILL_SCRATCH_RESERVE_GB = 8.0
-        active = mx.get_active_memory()
-        metal_total = mx.device_info()["memory_size"]
-        headroom = int(metal_total - PREFILL_SCRATCH_RESERVE_GB * 1e9)
-        wired = min(active, headroom)
-        mx.set_wired_limit(wired)
-        logger.info(
-            "[MOE] Wired %.1f GB in Metal residency set (%.1f GB reserved for prefill)",
-            wired / 1e9, PREFILL_SCRATCH_RESERVE_GB,
-        )
+    # Wire memory to prevent OS paging (delegated to metal_memory_guard SSoT).
+    _guard.update_wired_after_change("moe_init")
 
     elapsed = time.time() - t0
     active_gb = mx.get_active_memory() / 1e9
@@ -1243,16 +1233,10 @@ def expand_expert_capacity(
         expanded_layers += 1
         total_new_experts += len(new_ids)
 
-    mx.clear_cache()
+    _guard.force_clear_cache("expert_expand")
 
-    # Re-wire memory with new footprint
-    if hasattr(mx, "set_wired_limit"):
-        PREFILL_SCRATCH_RESERVE_GB = 4.0  # Less reserve needed with warm cache
-        active = mx.get_active_memory()
-        metal_total = mx.device_info()["memory_size"]
-        headroom = int(metal_total - PREFILL_SCRATCH_RESERVE_GB * 1e9)
-        wired = min(active, headroom)
-        mx.set_wired_limit(wired)
+    # Re-wire memory with new footprint (delegated to metal_memory_guard SSoT)
+    _guard.update_wired_after_change("expert_expand")
 
     elapsed = time.time() - t0
     active_gb = mx.get_active_memory() / 1e9
@@ -1475,8 +1459,7 @@ def breathe_down(
         total_evicted += evicted
         avg_coverage += cache.get_coverage_ratio()
 
-    mx.clear_cache()
-    import gc; gc.collect()
+    _guard.force_clear_cache("breathe_down")
 
     after_mem = mx.get_active_memory() / 1e9
     freed = before_mem - after_mem
@@ -1637,16 +1620,10 @@ def breathe_up(
         layers_expanded += 1
         total_loaded += len(new_ids)
 
-    mx.clear_cache()
+    _guard.force_clear_cache("breathe_up")
 
-    # Re-wire memory
-    if hasattr(mx, "set_wired_limit"):
-        PREFILL_SCRATCH_RESERVE_GB = 4.0
-        active = mx.get_active_memory()
-        metal_total = mx.device_info()["memory_size"]
-        headroom = int(metal_total - PREFILL_SCRATCH_RESERVE_GB * 1e9)
-        wired = min(active, headroom)
-        mx.set_wired_limit(wired)
+    # Re-wire memory (delegated to metal_memory_guard SSoT)
+    _guard.update_wired_after_change("breathe_up")
 
     elapsed = time.time() - t0
     active_gb = mx.get_active_memory() / 1e9
@@ -1785,4 +1762,158 @@ def apply_historical_frequency(
     if seeded > 0:
         logger.info("[MOE] Historical frequency applied: %d layers from %s", seeded, path)
     return seeded
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FACADE API FOR SUPERMLX SERVER INTEGRATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+_moe_expand_pending: bool = False
+_breathing_active: bool = False
+
+
+def init_moe_subsystem(
+    model: nn.Module,
+    model_path: str,
+    settings: Any,
+    log_fn: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """
+    Inicializa el subsistema MoE de forma transparente y segura.
+    Si settings.enable_moe_cache es False o el modelo no es MoE, no-op seguro.
+    Si settings.enable_moe_cache es True, activa el caché predictivo de expertos.
+    """
+    global _moe_expand_pending
+    _log = log_fn or (lambda icon, msg: logger.info("[%s] %s", icon, msg))
+
+    if not is_moe_model(model):
+        return {"moe_layers": 0, "active": False}
+
+    enable_cache = getattr(settings, "enable_moe_cache", False)
+    if not enable_cache:
+        _log("⚡", "MoE Native MLX: modo nativo sin caché de expertos (ENABLE_MOE_CACHE=false)")
+        return {"moe_layers": 0, "active": False}
+
+    _log("🔧", "MoE model detected — enabling predictive expert cache...")
+    moe_stats = enable_moe_cache(
+        model,
+        model_path,
+        capacity=settings.moe_expert_capacity,
+        profile_path=settings.moe_expert_profile or None,
+    )
+    model._moe_config = moe_stats
+
+    # Check if two-stage expert loading is pending
+    _moe_expand_pending = (
+        settings.moe_target_capacity > settings.moe_expert_capacity
+        and moe_stats.get("moe_layers", 0) > 0
+    )
+    if _moe_expand_pending:
+        _log("📋", f"Staged loading: {settings.moe_expert_capacity}→{settings.moe_target_capacity} experts after first warm response")
+
+    # Seed historical frequency if available
+    try:
+        stats_path = os.path.join("logs", "expert_stats.json")
+        seeded = apply_historical_frequency(model, stats_path)
+        if seeded > 0:
+            _log("📊", f"Expert frequency stats loaded: {seeded} layers from previous sessions")
+    except Exception as e:
+        logger.warning("[MOE] Historical frequency load failed: %s", e)
+
+    return moe_stats
+
+
+def moe_pre_prefill_hook(
+    model: nn.Module,
+    rest_count: int,
+    threshold: int,
+    request_id: str = "",
+    log_fn: Optional[Any] = None,
+) -> None:
+    """Ejecuta contracción de expertos (breathe_down) si aplica antes de prefill."""
+    global _breathing_active
+    config = getattr(model, "_moe_config", None)
+    if not config or config.get("capacity", 0) <= 100:
+        return
+    if rest_count < threshold:
+        return
+
+    try:
+        current_cap = config.get("capacity", 256)
+        min_used = current_cap
+        for layer in getattr(model, "layers", []):
+            switch, _ = _find_switch_mlp(layer)
+            if switch is None:
+                continue
+            proj = getattr(switch, "up_proj", None)
+            if not isinstance(proj, PredictiveCachedSwitchLinear):
+                continue
+            cache = proj._cache
+            used_count = sum(1 for eid in cache.cached_ids if cache.breathing_priority(eid) > 0)
+            min_used = min(min_used, used_count)
+        target = max(min_used, 64)
+        if target < current_cap:
+            result = breathe_down(model, target, log_fn=log_fn)
+            if result.get("breathed"):
+                _breathing_active = True
+    except Exception as e:
+        if log_fn:
+            log_fn("⚠️", f"BREATHE DOWN failed: {e} | req={request_id[:8]}")
+
+
+def moe_post_generation_hook(
+    model: nn.Module,
+    output_tokens: int,
+    settings: Any,
+    request_id: str = "",
+    log_fn: Optional[Any] = None,
+) -> None:
+    """Ejecuta todas las tareas de mantenimiento MoE post-generación de forma cohesiva."""
+    global _breathing_active, _moe_expand_pending
+    _log = log_fn or (lambda icon, msg: logger.info("[%s] %s", icon, msg))
+
+    config = getattr(model, "_moe_config", None)
+    if not config or config.get("moe_layers", 0) == 0:
+        return
+
+    # 1. Breathe up
+    if _breathing_active:
+        try:
+            breathe_up(model, log_fn=log_fn)
+            _breathing_active = False
+        except Exception as e:
+            if log_fn:
+                log_fn("⚠️", f"BREATHE UP failed: {e} | req={request_id[:8]}")
+
+    # 2. Expand capacity after first warm response
+    if _moe_expand_pending and output_tokens > 0:
+        try:
+            if log_fn:
+                log_fn("🔄", f"Expanding experts: {settings.moe_expert_capacity}→{settings.moe_target_capacity}...")
+            expand_stats = expand_expert_capacity(
+                model,
+                target_capacity=settings.moe_target_capacity,
+                profile_path=settings.moe_expert_profile or None,
+            )
+            if expand_stats.get("expanded") and log_fn:
+                log_fn("✅", f"Expert expansion complete: {expand_stats['old_capacity']}→{expand_stats['new_capacity']} | +{expand_stats['new_experts_loaded']} experts")
+        except Exception as e:
+            if log_fn:
+                log_fn("⚠️", f"Expert expansion failed: {e}")
+        _moe_expand_pending = False
+
+    # 3. Frequency flush
+    try:
+        flush_frequency_only(model)
+    except Exception as e:
+        if log_fn:
+            log_fn("⚠️", f"Expert frequency flush failed: {e}")
+
+    # 4. End routing
+    if getattr(settings, "expert_routing_log", False):
+        try:
+            end_expert_routing()
+        except Exception:
+            pass
+
 

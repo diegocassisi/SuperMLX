@@ -30,6 +30,9 @@ from .cache_engine import (
 
 logger = logging.getLogger(__name__)
 
+# Hermes housekeeping detection prefix — update if Hermes changes its injection text
+_HOUSEKEEPING_MSG_PREFIX = "Review the conversation above and"
+
 
 @dataclass
 class HousekeepingStagingEntry:
@@ -112,7 +115,6 @@ class HousekeepingStagingManager:
 
         if canon_match and model_match:
             entry.last_touched_at = time.time()
-            entry.turn_count += 1
             logger.info(
                 "[DATA] Housekeeping staging continuation HIT | session=%s turn=%d | "
                 "canon_match=%d model_off=%d",
@@ -386,7 +388,7 @@ def find_housekeeping_split_index(messages: List[Dict[str, Any]]) -> int:
             content = " ".join(
                 p.get("text", "") for p in content if isinstance(p, dict)
             )
-        if isinstance(content, str) and content.strip().startswith("Review the conversation above and"):
+        if isinstance(content, str) and content.strip().startswith(_HOUSEKEEPING_MSG_PREFIX):
             return idx
     return -1
 

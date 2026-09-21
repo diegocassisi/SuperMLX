@@ -26,6 +26,7 @@ from mlx_lm.generate import maybe_quantize_kv_cache
 from mlx_lm.models.cache import make_prompt_cache
 
 from supermlx.warmup_manager import load_cache, save_cache
+from supermlx import metal_memory_guard as _guard
 
 logger = logging.getLogger(__name__)
 
@@ -144,7 +145,7 @@ def prefill_cache_only(
     model: Any,
     cache: List[Any],
     *,
-    prefill_step_size: int = 512,
+    prefill_step_size: int = 256,
     kv_bits: Optional[int] = None,
     kv_group_size: int = 64,
     quantized_kv_start: int = 0,
@@ -187,7 +188,7 @@ def prefill_cache_only(
                 kv_bits=kv_bits,
             )
         mx.eval([c.state if hasattr(c, "state") else c for c in cache])
-        mx.clear_cache()
+        _guard.force_clear_cache("tpc_prefill_chunk")
         processed += n
 
     # ── Postcondition: offset integrity ──────────────────────────────────
@@ -217,7 +218,7 @@ def compute_and_save(
     max_kv_size: Optional[int],
     kv_bits: Optional[int],
     enable_thinking: bool = False,
-    prefill_step_size: int = 512,
+    prefill_step_size: int = 256,
     log_fn: Optional[Any] = None,
 ) -> bool:
     """
@@ -344,6 +345,7 @@ def get_prefix_cache_clone(
     enable_thinking: bool = False,
     model_path: str = "",
     log_fn: Optional[Any] = None,
+    prefill_step_size: int = 256,
 ) -> Tuple[Optional[List[Any]], Optional[List[int]], bool]:
     """
     Main entry point for server.py.
@@ -388,6 +390,7 @@ def get_prefix_cache_clone(
             max_kv_size=max_kv_size,
             kv_bits=kv_bits,
             enable_thinking=enable_thinking,
+            prefill_step_size=prefill_step_size,
             log_fn=log_fn,
         )
         was_recomputed = True

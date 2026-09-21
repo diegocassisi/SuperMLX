@@ -146,11 +146,10 @@ import shutil
 import signal
 import math
 from datetime import datetime
-try:
-    from .emergency_compressor import emergency_compress_if_needed, should_signal_overflow, _max_safe_prefill
-    _emergency_compressor_available = True
-except ImportError:
-    _emergency_compressor_available = False
+# Emergency compressor removed — overflow guard inlined below
+_max_safe_prefill_tokens = int(os.environ.get("MAX_SAFE_PREFILL_TOKENS", "82192"))
+def _should_signal_overflow(rest_count: int) -> bool:
+    return rest_count > _max_safe_prefill_tokens
 from collections import OrderedDict, deque
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
@@ -771,8 +770,7 @@ def _memory_guard_pre_prefill(request_id: str = "") -> int:
         with prompt_cache_lock:
             evicted += PROMPT_CACHE.evict_unpinned()
             evicted += PROMPT_CACHE_COMPACT.evict_unpinned()
-        mx.clear_cache()
-        import gc; gc.collect()
+        _guard.force_clear_cache("memory_guard_eviction")
         post_bytes = get_mem()
         if FEATURE_FULL_LOGGING:
             _terminal_status(
@@ -1221,7 +1219,7 @@ class LRUPromptCache:
         # after the Python reference is dropped, causing monotonic GPU memory
         # growth during long sessions with repeated cache divergence.
         try:
-            mx.clear_cache()
+            _guard.force_clear_cache("cache_entry_delete")
         except Exception:
             pass
 
@@ -1354,7 +1352,7 @@ class LRUPromptCache:
             self._delete(m, t)
         if to_delete:
             try:
-                mx.clear_cache()  # Return Metal buffers immediately
+                _guard.force_clear_cache("batch_evict")  # Return Metal buffers immediately
             except Exception:
                 pass
         return len(to_delete)
@@ -2200,44 +2198,13 @@ def _metal_mem_str() -> str:
         return ""
 
 
-# Minimum tokens to even consider running memory relief (avoid overhead for tiny prefills)
-_PREFILL_MEMORY_RELIEF_MIN_TOKENS = 1000
-
-# Empirical KV cache bytes per token at FP16 (Qwen3.6-27B-class: ~65 KB/tok).
-# Scaled down by KV_BITS at runtime.  Override via PREFILL_KV_BYTES_PER_TOKEN env var.
-_PREFILL_KV_BYTES_PER_TOKEN_FP16 = int(os.environ.get("PREFILL_KV_BYTES_PER_TOKEN_FP16", "65536"))
-
-# Safety margin: run relief when projected usage exceeds this fraction of Metal budget
-_PREFILL_RELIEF_BUDGET_FRACTION = float(os.environ.get("PREFILL_RELIEF_BUDGET_FRACTION", "0.90"))
-
-# ── Metal budget (effective memory ceiling for prefill estimation) ─────────
-_metal_budget_gb_cached: Optional[float] = None
+# ── Prefill memory constants ──────────────────────────────────────────────
+# These are now managed by metal_memory_guard (SSoT).
+# Kept as a thin redirect for _adaptive_prefill which still needs the budget.
 
 def _get_metal_budget_gb() -> float:
-    """Return effective Metal budget in GB for dynamic guard calculations.
-
-    Priority: METAL_BUDGET_GB env var > device_info - 3GB (OS overhead).
-    Cached after first call. Note: iogpu.wired_limit_mb is NOT used here —
-    that controls MoE expert pinning, not the Metal allocation ceiling.
-    """
-    global _metal_budget_gb_cached
-    if _metal_budget_gb_cached is not None:
-        return _metal_budget_gb_cached
-
-    # 1. Explicit env var (most reliable)
-    _env_val = os.environ.get("METAL_BUDGET_GB")
-    if _env_val:
-        _metal_budget_gb_cached = float(_env_val)
-        return _metal_budget_gb_cached
-
-    # 2. Device total minus OS/system overhead (~3GB)
-    # On a 24GiB Mac: device_info reports 25.77GB, OOM occurs ~22.4GB → 3.3GB overhead.
-    try:
-        _device_gb = mx.device_info()["memory_size"] / 1e9
-        _metal_budget_gb_cached = _device_gb - 3.0
-    except Exception:
-        _metal_budget_gb_cached = 20.0  # conservative default
-    return _metal_budget_gb_cached
+    """Redirect to metal_memory_guard SSoT."""
+    return _guard.get_metal_budget_gb()
 
 # Threshold for Expert Breathing: rest tokens above this trigger breathe_down
 _BREATHE_DOWN_REST_THRESHOLD = int(os.environ.get("BREATHE_DOWN_REST_THRESHOLD", "15000"))
@@ -2247,105 +2214,30 @@ _BREATHE_DOWN_REST_THRESHOLD = int(os.environ.get("BREATHE_DOWN_REST_THRESHOLD",
 # 0 = disabled (default), 1-2 ms is enough for smooth video playback alongside inference.
 _GPU_YIELD_SECONDS = float(os.environ.get("GPU_YIELD_MS", "0")) / 1000.0
 
-# Track whether breathing is active for the current request
-_breathing_active = False
-
-
-def _find_switch_mlp_for_breathing(layer):
-    """Wrapper for expert_cache._find_switch_mlp without layer_idx (not needed here)."""
-    from .expert_cache import _find_switch_mlp
-    return _find_switch_mlp(layer)
 
 
 def _pre_prefill_memory_relief(request_id: str, rest_count: int, is_embedded_agent: bool = False) -> None:
     """Free OS and Metal memory before large prefills to reduce peak pressure.
 
-    Runs gc.collect + mx.clear_cache + malloc_zone_pressure_relief
-    (macOS-specific: tells the C allocator to return freed pages to the OS).
+    Delegates memory relief to metal_memory_guard (SSoT).
     Also triggers Expert Breathing (breathe_down) for large MAIN requests.
-
-    Decision is memory-based: estimates projected Metal usage after prefill
-    (current + KV cache growth + scratch) and only fires when it would exceed
-    _PREFILL_RELIEF_BUDGET_FRACTION of the Metal budget.  Tiny prefills
-    (< _PREFILL_MEMORY_RELIEF_MIN_TOKENS) are always skipped.
     """
-    global _breathing_active
+    # Memory relief: delegated to metal_memory_guard (SSoT for clear_cache/gc/malloc)
+    _guard.pre_prefill_gate(rest_count, kv_bits=SETTINGS.kv_bits, request_id=request_id)
 
-    # Skip trivially small prefills (no benefit from relief)
-    if rest_count < _PREFILL_MEMORY_RELIEF_MIN_TOKENS:
-        return
-
-    # ── Memory-based gate: project post-prefill usage ──────────────
-    _projected_gb = -1.0  # fallback if estimation fails
-    _threshold_gb = -1.0
-    try:
-        _active_gb = mx.get_active_memory() / 1e9
-        _kv_bits = SETTINGS.kv_bits or 16  # None means FP16
-        _kv_bytes_per_tok = _PREFILL_KV_BYTES_PER_TOKEN_FP16 * _kv_bits / 16
-        _kv_growth_gb = rest_count * _kv_bytes_per_tok / 1e9
-        _scratch_gb = 1.5  # activation/attention scratch during prefill
-        _projected_gb = _active_gb + _kv_growth_gb + _scratch_gb
-        _budget_gb = _get_metal_budget_gb()
-        _threshold_gb = _budget_gb * _PREFILL_RELIEF_BUDGET_FRACTION
-
-        if _projected_gb < _threshold_gb:
-            _pipeline_log("METAL", request_id,
-                f"PRE_PREFILL_RELIEF: SKIPPED (headroom) | "
-                f"rest={rest_count} | projected={_projected_gb:.2f}GB | "
-                f"threshold={_threshold_gb:.2f}GB ({_PREFILL_RELIEF_BUDGET_FRACTION:.0%} of {_budget_gb:.1f}GB) | "
-                f"{_metal_mem_str()}")
-            return
-    except Exception:
-        pass  # If estimation fails, fall through to relief (safe default)
-    _mem_before = _metal_mem_str()
-    import gc as _gc
-    _gc.collect()
-    mx.clear_cache()
-    # macOS: return freed malloc pages to the OS
-    try:
-        import ctypes
-        _libc = ctypes.CDLL("libSystem.dylib")
-        _libc.malloc_zone_pressure_relief(0, 0)
-    except Exception:
-        pass  # Non-macOS or ctypes unavailable
-
-    # Expert Breathing: contract experts for large MAIN prefills
-    if (
-        not is_embedded_agent
-        and rest_count >= _BREATHE_DOWN_REST_THRESHOLD
-        and hasattr(model, "_moe_config")
-        and model._moe_config.get("capacity", 0) > 100
-    ):
+    # Expert Breathing: contract experts for large MAIN prefills (delegated to expert_cache)
+    if not is_embedded_agent and rest_count >= _BREATHE_DOWN_REST_THRESHOLD:
         try:
-            from .expert_cache import breathe_down, PredictiveCachedSwitchLinear
-            config = model._moe_config
-            current_cap = config.get("capacity", 256)
-            # Count experts with non-zero breathing priority (session*3 + historical*1)
-            # Target = keep only the ones that have SOME usage signal, evict the rest
-            min_used = current_cap  # worst case: keep all
-            for layer in model.layers:
-                switch, _ = _find_switch_mlp_for_breathing(layer)
-                if switch is None:
-                    continue
-                proj = getattr(switch, "up_proj", None)
-                if not isinstance(proj, PredictiveCachedSwitchLinear):
-                    continue
-                cache = proj._cache
-                used_count = sum(1 for eid in cache.cached_ids if cache.breathing_priority(eid) > 0)
-                min_used = min(min_used, used_count)
-            target = max(min_used, 64)  # Never below 64
-            if target < current_cap:
-                result = breathe_down(model, target, log_fn=_terminal_status)
-                if result.get("breathed"):
-                    _breathing_active = True
+            from .expert_cache import moe_pre_prefill_hook
+            moe_pre_prefill_hook(
+                model=model,
+                rest_count=rest_count,
+                threshold=_BREATHE_DOWN_REST_THRESHOLD,
+                request_id=request_id,
+                log_fn=_terminal_status,
+            )
         except Exception as _be:
-            _terminal_status("⚠️", f"BREATHE DOWN failed: {_be} | req={request_id[:8]}")
-
-    _mem_after = _metal_mem_str()
-    _pipeline_log("METAL", request_id,
-        f"PRE_PREFILL_RELIEF: gc+clear_cache+malloc_pressure | "
-        f"rest={rest_count} | projected={_projected_gb:.2f}GB/{_threshold_gb:.2f}GB | "
-        f"before={_mem_before} | after={_mem_after}")
+            _terminal_status("⚠️", f"MoE pre-prefill hook error: {_be} | req={request_id[:8]}")
 
 
 def _start_prefill_progress(
@@ -2383,7 +2275,7 @@ def _start_prefill_progress(
             try:
                 current_mem = mx.get_active_memory()
                 if last_cleared_mem > 0 and current_mem - last_cleared_mem >= 600 * 1024 * 1024:  # 600 MB threshold
-                    mx.clear_cache()
+                    _guard.force_clear_cache("intra_prefill")
                     _log("🧹", f"Memory Guard: Purged intra-prefill transient memory. Was {current_mem/1e9:.2f}GB", indent=2)
                     last_cleared_mem = mx.get_active_memory()
             except Exception:
@@ -2603,7 +2495,7 @@ def _prewarm_post_compact(
         PROMPT_CACHE_COMPACT.evict_unpinned()
         PROMPT_CACHE.insert_cache(SETTINGS.model_path, canonical_key, new_cache)
 
-    mx.clear_cache()
+    _guard.force_clear_cache("post_compact_warmup")
 
     elapsed_ms = (time.time() - t0) * 1000
     _terminal_status("🔥",
@@ -3094,23 +2986,11 @@ def _insert_cache_entries(
         # ── AUTO-SAVE MAIN CACHE TO DISK ──────────────────────────────────────────
         persist_path = Path(SETTINGS.cache_persist_path) if SETTINGS.cache_persist_path else None
 
+        # ── WARMUP CACHE AUTO-SAVE: DESCONECTADO (REEMPLAZADO POR TPC) ─────────────
+        # El sistema utiliza Tool Prefix Cache (TPC) como única fuente de verdad (SSoT)
+        # para la persistencia del prefijo (logs/tool_prefix_cache.safetensors).
+        # El guardado de warmup_cache.safetensors queda formalmente desconectado.
         _should_save = False
-        _save_reason = ""
-        if persist_path and is_warmup_candidate and len(cache_key) > 5000:
-            # Explicit diagnostic — always visible on real startup
-            _terminal_status(
-                "🔍",
-                f"Auto-save check: saved={_DPC.disk_cache_saved} | hit={cache_hit_ratio:.0%} | "
-                f"tokens={len(cache_key)} | path={persist_path.name}",
-            )
-            if not _DPC.disk_cache_saved:
-                # Primera vez: siempre guardar (sea buen o mal hit rate)
-                _should_save = True
-                _save_reason = f"first_save (hit={cache_hit_ratio:.0%})"
-            elif cache_hit_ratio < 0.85:
-                # Cache en disco desactualizado — sobreescribir con el real
-                _should_save = True
-                _save_reason = f"stale_cache (hit={cache_hit_ratio:.0%} < 85%)"
 
         if _should_save:
             _DPC.disk_cache_saved = True
@@ -3555,7 +3435,7 @@ else:
     # After module replacement, only non-expert params (~1.4 GB) are materialized.
     _is_moe_path = any(tag in SETTINGS.model_path for tag in ("A3B", "A14B", "MoE", "moe", "Mixtral", "mixtral", "Agents-A1"))
     _load_kwargs = {"tokenizer_config": {"trust_remote_code": True}}
-    if _is_moe_path:
+    if _is_moe_path and getattr(SETTINGS, "enable_moe_cache", False):
         _load_kwargs["lazy"] = True
         _terminal_status("🔧", "MoE model detected — loading with lazy=True (experts as placeholders)")
     if SETTINGS.enable_mtp:
@@ -3584,6 +3464,19 @@ else:
                 _terminal_status("⚠️", "MTP injection failed — falling back to standard autoregressive")
         else:
             _terminal_status("⚠️", f"MTP config not found at {_mtp_cfg_path} — running standard autoregressive")
+
+    # ── Apple Neural Engine (ANE) Prefill Injection ────────────────────────
+    if getattr(SETTINGS, "enable_ane", False) or os.environ.get("ENABLE_ANE", "").strip().lower() in {"1", "true", "yes"}:
+        try:
+            from lab.ane_code.ane_shim import inject_ane_support, validate_ane_support
+            _ane_buckets = getattr(SETTINGS, "ane_prefill_buckets", [64, 128, 256])
+            _ane_ok = inject_ane_support(model, {}, buckets=_ane_buckets)
+            if _ane_ok and validate_ane_support(model):
+                _terminal_status("🍏", f"Apple Neural Engine (ANE) acceleration enabled (buckets={_ane_buckets})")
+            else:
+                _terminal_status("⚠️", "ANE injection failed — falling back to standard GPU path")
+        except Exception as _ane_err:
+            _terminal_status("⚠️", f"ANE setup error: {_ane_err} — falling back to standard GPU path")
 
     # ── Resolve think token IDs (once, at load) ───────────────────────────
     _think_start_id, _think_end_id = get_think_token_ids(tokenizer)
@@ -3631,75 +3524,46 @@ else:
             pass  # No jinja file available, model uses a different template mechanism
 
 # ── MoE Expert Cache ──────────────────────────────────────────────────────
-# Phase 3 predictive cache: lazy load → module replacement → selective expert
-# materialization → zero-eval forward pass. See docs/MOE_EXPERT_CACHE.md.
+# ── MoE Expert Subsystem ──────────────────────────────────────────────────
 _moe_stats = {}
 try:
-    from .expert_cache import is_moe_model, enable_moe_cache
-    if is_moe_model(model):
-        _terminal_status("🔧", "MoE model detected — enabling predictive expert cache...")
-        # mx.eval of non-expert params happens INSIDE enable_moe_cache,
-        # AFTER module replacement, to avoid materializing all 19.5 GB.
-        _moe_stats = enable_moe_cache(
-            model,
-            SETTINGS.model_path,
-            capacity=SETTINGS.moe_expert_capacity,
-            profile_path=SETTINGS.moe_expert_profile or None,
-        )
-        _terminal_status(
-            "✅",
-            f"MoE Expert Cache: {_moe_stats.get('moe_layers', 0)} layers, "
-            f"{_moe_stats.get('num_experts', 0)} experts, "
-            f"cap={_moe_stats.get('capacity', 0)}, "
-            f"loaded={_moe_stats.get('expert_tensors_loaded', 0)}, "
-            f"mem={_moe_stats.get('active_memory_gb', 0):.1f}GB",
-        )
-        try:
-            from .router_tracer import attach_router_tracer
-            attach_router_tracer(model)
-        except Exception as _rt_err:
-            _terminal_status("⚠️", f"Prefill tap init error: {_rt_err}")
-        # ── Qwen3.6 full-residency guard ─────────────────────────────────
-        # Qwen3.6-35B-A3B MUST run with all 256 experts resident.
-        # Partial capacity causes severe quality degradation and hallucinations.
-        _moe_cap = _moe_stats.get("capacity", 0)
-        _moe_ne = _moe_stats.get("num_experts", 0)
-        if _moe_cap < _moe_ne and "A3B" in SETTINGS.model_path:
-            raise RuntimeError(
-                f"Qwen3.6-35B-A3B requires ALL {_moe_ne} experts but only "
-                f"{_moe_cap} are loaded. Set MOE_EXPERT_CAPACITY={_moe_ne} "
-                f"and MOE_TARGET_CAPACITY={_moe_ne}. Refusing to start with "
-                f"partial experts — quality degradation and hallucinations."
-            )
-        # Load historical expert frequency stats for breathing decisions
-        try:
-            from .expert_cache import apply_historical_frequency
-            _stats_path = os.path.join("logs", "expert_stats.json")
-            _seeded = apply_historical_frequency(model, _stats_path)
-            if _seeded > 0:
-                _terminal_status("📊", f"Expert frequency stats loaded: {_seeded} layers from previous sessions")
-        except Exception as _freq_err:
-            _terminal_status("⚠️", f"Historical frequency load failed: {_freq_err}")
+    from .expert_cache import init_moe_subsystem
+    _moe_stats = init_moe_subsystem(model, SETTINGS.model_path, SETTINGS, log_fn=_terminal_status)
 except ImportError:
     pass  # expert_cache not available — dense model, no action needed
 except Exception as _moe_err:
-    _terminal_status("⚠️", f"MoE Expert Cache failed: {_moe_err}")
+    _terminal_status("⚠️", f"MoE Subsystem init failed: {_moe_err}")
 
-# ── Expert Routing Logger: enabled in expert_cache.py natively — no attach needed ──
+# ── Metal Memory Guard (SSoT) ────────────────────────────────────────────
+# Must run AFTER model load + MoE init (needs active memory to be final).
+# Applies wired_limit (anti-swap) + cache_limit (scratch ceiling).
+from . import metal_memory_guard as _guard
+try:
+    _guard_result = _guard.init_protections(model=model, kv_bits=SETTINGS.kv_bits)
+    _terminal_status(
+        "🛡️",
+        f"Metal Guard: wired={_guard_result['wired_limit_gb']:.1f}GB | "
+        f"cache_limit={_guard_result['cache_limit_gb']:.1f}GB | "
+        f"active={_guard_result['active_gb']:.1f}GB | "
+        f"budget={_guard_result['max_working_set_gb']:.1f}GB",
+    )
+    # Mechanism 3: compile Metal shaders via a real forward pass
+    _shader_elapsed = _guard.warmup_shaders(
+        model=model,
+        tokenizer=tokenizer,
+        cache_factory=lambda: make_prompt_cache(model),
+        request_id="startup",
+    )
+    if _shader_elapsed > 0:
+        _terminal_status("🛡️", f"Metal Guard: shaders compiled in {_shader_elapsed:.2f}s")
+except Exception as _guard_err:
+    _terminal_status("⚠️", f"Metal Guard init failed (non-fatal): {_guard_err}")
+
+# ── Expert Routing Logger ─────────────────────────────────────────────────
 if FEATURE_EXPERT_ROUTING_LOG and _moe_stats.get("moe_layers", 0) > 0:
     _terminal_status("🔬", "Expert Routing Logger: active (output: logs/expert_routing.json)")
 elif FEATURE_EXPERT_ROUTING_LOG:
     _terminal_status("⚠️", "Expert Routing Logger: EXPERT_ROUTING_LOG=true but no MoE layers found")
-
-# Two-stage expert loading: expand after first successful response
-_moe_expand_pending = (
-    SETTINGS.moe_target_capacity > SETTINGS.moe_expert_capacity
-    and _moe_stats.get("moe_layers", 0) > 0
-)
-if _moe_expand_pending:
-    _terminal_status("📋",
-        f"Staged loading: {SETTINGS.moe_expert_capacity}→{SETTINGS.moe_target_capacity} "
-        f"experts after first warm response")
 _terminal_status(
     "🧠",
     (
@@ -3878,21 +3742,26 @@ def _run_startup_warmup() -> None:
     """
     _t0 = time.perf_counter()
     _mem_before = mx.get_active_memory() / 1e9
-    _terminal_status("⏱️", f"DPC warmup: iniciando | active_mem={_mem_before:.3f}GB")
+    _terminal_status("⚡", f"Warmup Cache: desconectado (reemplazado 100% por TPC) | active_mem={_mem_before:.3f}GB")
 
-    _wm.run_startup(
-        state=_DPC,
-        cache_persist_path=SETTINGS.cache_persist_path,
-        embedded_cache_persist_path=SETTINGS.embedded_cache_persist_path,
-        model=model,
-        max_kv_size=SETTINGS.max_kv_size,
-        is_vlm=is_vlm,
-        prompt_cache_main=PROMPT_CACHE,
-        prompt_cache_compact=PROMPT_CACHE_COMPACT,
-        prompt_cache_lock=prompt_cache_lock,
-        model_path=SETTINGS.model_path,
-        log_fn=_terminal_status,
-    )
+    # Warmup cache deshabilitado formalmente — TPC (tool_prefix_cache) es la única SSoT
+    # Ahorro de ~440 MB de VRAM al no cargar snapshot duplicado al boot.
+    # _wm.run_startup(
+    #     state=_DPC,
+    #     cache_persist_path=SETTINGS.cache_persist_path,
+    #     embedded_cache_persist_path=SETTINGS.embedded_cache_persist_path,
+    #     model=model,
+    #     max_kv_size=SETTINGS.max_kv_size,
+    #     is_vlm=is_vlm,
+    #     prompt_cache_main=PROMPT_CACHE,
+    #     prompt_cache_compact=PROMPT_CACHE_COMPACT,
+    #     prompt_cache_lock=prompt_cache_lock,
+    #     model_path=SETTINGS.model_path,
+    #     log_fn=_terminal_status,
+    # )
+    _DPC.warmup_done.set()
+    _DPC.disk_cache_saved = True
+
     # Load tool prefix KV cache from disk (non-blocking — first request triggers
     # compute if no saved state exists).
     if SETTINGS.cache_persist_path:
@@ -3929,17 +3798,8 @@ else:
     _WARMUP_DONE.set()
 
 # ── Metal cache limit ────────────────────────────────────────────────────────
-# Tell Metal to release freed GPU buffers above the model footprint.
-# set_cache_limit(0) is too aggressive (causes alloc/dealloc thrashing during generation).
-# ~6GB keeps model weights + warmup cached, but releases KV session buffers after use.
-_METAL_CACHE_LIMIT_BYTES = int(6.5 * (1024 ** 3))  # 6.5 GB ≈ model + warmup
-try:
-    _set_cache_limit = getattr(mx, 'set_cache_limit', None) or getattr(mx.metal, 'set_cache_limit', None)
-    if _set_cache_limit:
-        _set_cache_limit(_METAL_CACHE_LIMIT_BYTES)
-        _terminal_status("🧹", f"Metal cache limit: {_METAL_CACHE_LIMIT_BYTES / 1e9:.1f}GB (model + warmup)")
-except Exception:
-    pass
+# Managed by metal_memory_guard.init_protections() (see above).
+# Dynamic cache_limit calculated as 25% of device_total (~6.4 GB on 24GB M4 Pro).
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -4004,48 +3864,7 @@ def _adaptive_prefill_chunk(base_chunk: int, kv_length: int, available_bytes: fl
     return chunk
 
 
-# ── Memory pressure gate for first Metal shader compilation ───────────────
-# Metal compiles GPU shaders on the first forward pass. Under memory pressure
-# this can take 30s+ instead of 8s. We gate the first prefill to ensure the
-# OS has had time to rebalance memory after model load (16+ GB).
-#
-# Measurement basis: bench_warmup_diag.py showed:
-#   22% free → 10.9s shader compile
-#   85% free →  0.8s shader compile
-#
-# API: vm_stat (BSD, stable since OS X 10.0, forward-compatible with
-# Sequoia/Tahoe). Does NOT use malloc_zone_pressure_relief (private API)
-# or os_proc_available_memory (iOS-only).
-_shader_warmup_done = False
-_SHADER_WARMUP_FREE_THRESHOLD = 4    # % system free+inactive — derived from measurement:
-                                      # shader+prefill overhead = 0.45GB (1.9% of 24GB)
-                                      # 4% = 2x safety margin over measured overhead
-_SHADER_WARMUP_MAX_WAIT_S = 3        # max seconds to wait (OS won't free more with MoE resident)
-_SHADER_WARMUP_POLL_INTERVAL_S = 1   # seconds between polls
-
-
-def _get_system_free_memory_pct() -> float:
-    """System free+inactive memory as % of total via vm_stat (stable BSD API).
-
-    Returns percentage (0-100). Returns 100.0 on any failure (fail-open: skip wait).
-    """
-    try:
-        import subprocess
-        out = subprocess.check_output(["vm_stat"], text=True, timeout=2)
-        free_pages = 0
-        inactive_pages = 0
-        for line in out.splitlines():
-            if "Pages free" in line:
-                free_pages = int(line.split(":")[1].strip().rstrip("."))
-            elif "Pages inactive" in line:
-                inactive_pages = int(line.split(":")[1].strip().rstrip("."))
-        total_pages = os.sysconf("SC_PHYS_PAGES")
-        if total_pages > 0:
-            return ((free_pages + inactive_pages) / total_pages) * 100
-    except Exception:
-        pass
-    return 100.0  # fail-open
-
+# ── VM telemetry for adaptive prefill ─────────────────────────────────────
 
 def _get_vm_counters() -> Dict[str, int]:
     """Capture pageouts, pageins, swapins, swapouts from vm_stat (stable BSD API).
@@ -4070,49 +3889,6 @@ def _get_vm_counters() -> Dict[str, int]:
     return counters
 
 
-
-def _memory_pressure_gate(request_id: str) -> None:
-    """Wait for sufficient free memory before first-ever Metal shader compilation.
-
-    Only runs ONCE per process lifetime. Subsequent calls are no-ops.
-    """
-    global _shader_warmup_done
-    if _shader_warmup_done:
-        return
-    _shader_warmup_done = True
-
-    free_pct = _get_system_free_memory_pct()
-    if free_pct >= _SHADER_WARMUP_FREE_THRESHOLD:
-        _pipeline_log("METAL", request_id,
-            f"SHADER_WARMUP_GATE: SKIPPED (adequate memory) | "
-            f"free={free_pct:.0f}% >= {_SHADER_WARMUP_FREE_THRESHOLD}%")
-        return
-
-    _pipeline_log("METAL", request_id,
-        f"SHADER_WARMUP_GATE: memory pressure detected | "
-        f"free={free_pct:.0f}% < {_SHADER_WARMUP_FREE_THRESHOLD}% | "
-        f"waiting up to {_SHADER_WARMUP_MAX_WAIT_S}s for OS to settle...")
-
-    import gc as _gc
-    waited = 0
-    while waited < _SHADER_WARMUP_MAX_WAIT_S:
-        _gc.collect()
-        mx.clear_cache()
-        time.sleep(_SHADER_WARMUP_POLL_INTERVAL_S)
-        waited += _SHADER_WARMUP_POLL_INTERVAL_S
-        free_pct = _get_system_free_memory_pct()
-        if free_pct >= _SHADER_WARMUP_FREE_THRESHOLD:
-            _pipeline_log("METAL", request_id,
-                f"SHADER_WARMUP_GATE: memory settled | "
-                f"free={free_pct:.0f}% | waited={waited}s")
-            return
-
-    _pipeline_log("METAL", request_id,
-        f"SHADER_WARMUP_GATE: timeout after {waited}s | "
-        f"free={free_pct:.0f}% (still < {_SHADER_WARMUP_FREE_THRESHOLD}%) | "
-        f"proceeding anyway")
-
-
 def _adaptive_prefill(
     rest_tokens: list,
     prompt_cache: list,
@@ -4130,9 +3906,6 @@ def _adaptive_prefill(
     if leave_last_token and len(rest_tokens) <= 1:
         return rest_tokens
 
-    # Gate: ensure OS has settled memory before first Metal shader compilation
-    _memory_pressure_gate(request_id)
-
     tokens_to_prefill = rest_tokens[:-1] if leave_last_token else rest_tokens
     last_token = rest_tokens[-1:] if leave_last_token else []
 
@@ -4146,10 +3919,26 @@ def _adaptive_prefill(
     _prefill_t0 = time.time()
     _last_progress_tokens = 0
     _PROGRESS_INTERVAL = 2000  # Log every N tokens
-    _diag_pre_prefill = _cache_diag.snapshot(prompt_cache, rest_tokens, "before_adaptive_prefill")
+    _diag_pre_prefill = _cache_diag.snapshot(prompt_cache, rest_tokens, "before_adaptive_prefill") if FEATURE_CACHE_DIAG else None
 
-    _vm_before = _get_vm_counters()
+    _vm_before = _get_vm_counters() if FEATURE_CACHE_DIAG else None
     _fwd_eval_total_s = 0.0
+
+    # ANE telemetry snapshot
+    _ane_start_cnt = 0
+    _gpu_start_cnt = 0
+    _wrapped_ane_layers = []
+    if getattr(model, "_ane_injected", False):
+        try:
+            from lab.ane_code.ane_shim import _get_inner_layers, _ANEWrappedSelfAttention
+            for _lyr in _get_inner_layers(model):
+                _at = getattr(_lyr, "self_attn", None)
+                if isinstance(_at, _ANEWrappedSelfAttention):
+                    _wrapped_ane_layers.append(_at)
+            _ane_start_cnt = sum(_w.ane_dispatches for _w in _wrapped_ane_layers)
+            _gpu_start_cnt = sum(_w.gpu_fallbacks for _w in _wrapped_ane_layers)
+        except Exception:
+            pass
 
     while processed < total:
         # Compute available memory
@@ -4191,7 +3980,8 @@ def _adaptive_prefill(
             else:
                 mx.eval(c)
         _fwd_eval_total_s += (time.perf_counter() - _fwd_t0)
-        mx.clear_cache()
+        if chunk_reductions > 0:
+            _guard.force_clear_cache("chunk_pressure")
 
         # GPU yield: let other Metal clients (Chrome VideoToolbox) process between chunks
         if _GPU_YIELD_SECONDS > 0:
@@ -4215,24 +4005,33 @@ def _adaptive_prefill(
             f"chunk reductions={chunk_reductions} | req={request_id[:12] if request_id else '?'}",
         )
 
-    _vm_after = _get_vm_counters()
-    _d_pageouts = _vm_after["pageouts"] - _vm_before["pageouts"]
-    _d_swapouts = _vm_after["swapouts"] - _vm_before["swapouts"]
-    _d_swapins = _vm_after["swapins"] - _vm_before["swapins"]
-    _fwd_eval_ms = _fwd_eval_total_s * 1000.0
-    _total_prefill_ms = (time.time() - _prefill_t0) * 1000.0
-    _eval_tps = total / (_fwd_eval_total_s if _fwd_eval_total_s > 0 else 0.001)
+    if FEATURE_CACHE_DIAG and _vm_before is not None:
+        _vm_after = _get_vm_counters()
+        _d_pageouts = _vm_after["pageouts"] - _vm_before["pageouts"]
+        _d_swapouts = _vm_after["swapouts"] - _vm_before["swapouts"]
+        _d_swapins = _vm_after["swapins"] - _vm_before["swapins"]
+        _fwd_eval_ms = _fwd_eval_total_s * 1000.0
+        _total_prefill_ms = (time.time() - _prefill_t0) * 1000.0
+        _eval_tps = total / (_fwd_eval_total_s if _fwd_eval_total_s > 0 else 0.001)
 
-    _pipeline_log(
-        "PREFILL_TELEMETRY",
-        request_id,
-        f"tokens={total} | wall={_total_prefill_ms:.1f}ms | fwd_eval={_fwd_eval_ms:.1f}ms | "
-        f"eval_speed={_eval_tps:.1f} tok/s | "
-        f"vm_delta: pageouts={_d_pageouts}, swapouts={_d_swapouts}, swapins={_d_swapins}",
-    )
+        # ANE telemetry delta
+        _ane_delta = 0
+        _gpu_delta = 0
+        if _wrapped_ane_layers:
+            _ane_delta = sum(_w.ane_dispatches for _w in _wrapped_ane_layers) - _ane_start_cnt
+            _gpu_delta = sum(_w.gpu_fallbacks for _w in _wrapped_ane_layers) - _gpu_start_cnt
+            _terminal_status("🍏", f"ANE dispatch: {_ane_delta} ANE | {_gpu_delta} GPU fallback | req={request_id[:12] if request_id else '?'}")
 
-    _cache_diag.compare(_diag_pre_prefill, prompt_cache, rest_tokens, "adaptive_prefill", request_id,
-        extra={"tokens": total, "chunks": chunk_reductions})
+        _pipeline_log(
+            "PREFILL_TELEMETRY",
+            request_id,
+            f"tokens={total} | wall={_total_prefill_ms:.1f}ms | fwd_eval={_fwd_eval_ms:.1f}ms | "
+            f"eval_speed={_eval_tps:.1f} tok/s | ane={_ane_delta} | gpu_fallback={_gpu_delta} | "
+            f"vm_delta: pageouts={_d_pageouts}, swapouts={_d_swapouts}, swapins={_d_swapins}",
+        )
+
+        _cache_diag.compare(_diag_pre_prefill, prompt_cache, rest_tokens, "adaptive_prefill", request_id,
+            extra={"tokens": total, "chunks": chunk_reductions})
     return last_token
 
 
@@ -4628,8 +4427,7 @@ class SidecarHandler(BaseHTTPRequestHandler):
         finally:
             if acquired:
                 # Free ephemeral KV cache immediately
-                mx.clear_cache()
-                import gc; gc.collect()
+                _guard.post_request_cleanup(request_id)
                 if generation_started_at:
                     held_ms = (time.time() - generation_started_at) * 1000
                     _terminal_status(
@@ -6396,6 +6194,7 @@ class APIHandler(BaseHTTPRequestHandler):
                                 enable_thinking=enable_thinking,
                                 model_path=SETTINGS.model_path,
                                 log_fn=_terminal_status,
+                                prefill_step_size=PREFILL_STEP_SIZE,
                             )
                             if _pc_clone is not None and _ptoks:
                                 _ptok_len = len(_ptoks)
@@ -6405,6 +6204,10 @@ class APIHandler(BaseHTTPRequestHandler):
                                     prompt_cache = _pc_clone
                                     rest_tokens = model_tokens[_ptok_len:]
                                     _tpc_injected = True
+                                    _kv_off = _ptok_len
+                                    matched_prefix_len = _ptok_len
+                                    cache_match_type = "tpc_hit"
+                                    cache_selection_source = "tpc"
                                     _terminal_status(
                                         "🔧",
                                         f"TPC: injected | prefix={_ptok_len} tok | "
@@ -6436,86 +6239,7 @@ class APIHandler(BaseHTTPRequestHandler):
 
             rest_count = len(rest_tokens) if rest_tokens is not None else _m_len
 
-            # ── PIPELINE: EMERGENCY COMPRESSION (A5) ───────────────────────
-            # If rest_tokens exceeds MAX_SAFE_PREFILL after normal compression + cache,
-            # re-compress with aggressive settings (guard=2) and re-do the pipeline.
-            # This is self-healing: the response ARRIVES without error or retry.
-            # Origin: OOM crash 2026-04-26 (wiki/MLXServer/challenges/out-of-memory-v83-fix)
-            if (
-                _emergency_compressor_available
-                and _compressor_module is not None
-                and not _is_embedded_agent
-                and rest_count is not None
-            ):
-                # For Anthropic: skip LLMLingua compression (BERT 512-token limit)
-                # but KEEP the overflow signal to prevent OOM crashes.
-                if self._is_anthropic:
-                    _emergency_result = None
-                else:
-                    _emergency_result = emergency_compress_if_needed(
-                        raw_messages=raw_messages,
-                        rest_tokens_count=rest_count,
-                        compressor_module=_compressor_module,
-                        session_key=_comp_session if '_comp_session' in dir() else request_id,
-                        log_fn=_terminal_status,
-                        request_id=request_id,
-                    )
-                if _emergency_result is not None:
-                    # Emergency compression succeeded — re-run pipeline from healing
-                    raw_messages = _emergency_result
-                    _pipeline_timings["emergency_compress"] = time.time()
-
-                    # Re-heal, re-canonicalize, re-tokenize
-                    def _heal_log_emg(line):
-                        with console_lock:
-                            _console_emit(line)
-                    healed_messages = _heal_messages(raw_messages, HEALING_STORE, HEALING_STORE_LOCK, log_fn=_heal_log_emg)
-                    original_messages, canonical_messages = _canonicalize_messages(healed_messages, SETTINGS.cache_canonicalize_tool_context)
-                    original_messages = _hoist_system_messages(original_messages)
-                    canonical_messages = _hoist_system_messages(canonical_messages)
-                    messages = _prepare_messages_for_template(original_messages, SETTINGS.normalize_write_tool_content_for_prompt)
-                    cache_messages = _prepare_messages_for_template(canonical_messages, SETTINGS.normalize_write_tool_content_for_prompt)
-
-                    if hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template:
-                        prompt = tokenizer.apply_chat_template(
-                            messages, tokenize=False, add_generation_prompt=True,
-                            tools=tools, enable_thinking=enable_thinking,
-                            preserve_thinking=FEATURE_PRESERVE_THINKING,
-                        )
-                        cache_prompt_raw = tokenizer.apply_chat_template(
-                            cache_messages, tokenize=False, add_generation_prompt=True,
-                            tools=tools, enable_thinking=enable_thinking,
-                            preserve_thinking=FEATURE_PRESERVE_THINKING,
-                        )
-                    else:
-                        prompt = messages[-1]["content"] if messages else ""
-                        cache_prompt_raw = cache_messages[-1]["content"] if cache_messages else ""
-
-                    cache_prompt = _scrub_cache_key(cache_prompt_raw, SETTINGS.cache_canonicalize_tool_context)
-                    prompt_tokens = _tokenize_prompt(cache_prompt)
-                    model_tokens = _tokenize_prompt(prompt)
-
-                    # Re-do cache lookup with compressed tokens
-                    with prompt_cache_lock:
-                        (
-                            prompt_cache, _rest_tokens_canonical,
-                            cache_session_tokens, cache_match_type,
-                            matched_prefix_len, cache_selection_source,
-                        ) = SESSION_INDEX.select_best_cache(
-                            model_name=SETTINGS.model_path,
-                            prompt_tokens=prompt_tokens,
-                            session_ctx=session_ctx,
-                            prompt_cache_store=_active_cache_store,
-                        )
-                        _kv_off = _kv_cache_offset(prompt_cache)
-                        rest_tokens = model_tokens[
-                            _kv_off if _kv_off is not None else matched_prefix_len :
-                        ]
-
-                    rest_count = len(rest_tokens) if rest_tokens is not None else len(model_tokens)
-                    _terminal_status("🚨",
-                        f"EMERGENCY COMPRESSOR: pipeline re-done | new rest_tokens={rest_count} | "
-                        f"cache_hit={cache_match_type} | matched={matched_prefix_len}/{len(prompt_tokens)}")
+            # ── Emergency compression removed — was pipeline stage A5 ─────
 
             # ── DIAGNOSTIC: prompt_tokens vs model_tokens divergence ──────
             # FIXME: temporary — remove after diagnosing 146K vs 34K bug on dense models
@@ -6535,9 +6259,9 @@ class APIHandler(BaseHTTPRequestHandler):
             # Uses "prompt is too long" wording to trigger Claude Code's reactive compact.
             _memory_pressure = False
             _pressure_reason = ""
-            if should_signal_overflow(rest_count):
+            if _should_signal_overflow(rest_count):
                 _memory_pressure = True
-                _pressure_reason = f"rest={rest_count} tokens exceed safe prefill limit ({_max_safe_prefill()})"
+                _pressure_reason = f"rest={rest_count} tokens exceed safe prefill limit ({_max_safe_prefill_tokens})"
             else:
                 try:
                     _get_mem = getattr(mx, 'get_active_memory', None) or getattr(mx.metal, 'get_active_memory', None)
@@ -6570,8 +6294,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(_overflow_error)
                 if acquired:
-                    mx.clear_cache()
-                    import gc; gc.collect()
+                    _guard.force_clear_cache("overflow_error")
                     model_lock.release()
                     acquired = False
                 return
@@ -6681,10 +6404,10 @@ class APIHandler(BaseHTTPRequestHandler):
             # _insert_cache_entries → no need for seed file refresh. ────────
 
             _terminal_status(
-                "⚙️",
-                f"Generation started | wait={wait_seconds:.2f}s | prefill={rest_count} | "
+                "⏳",
+                f"Prefill started | wait={wait_seconds:.2f}s | rest_tokens={rest_count} | "
                 f"session={session_ctx.session_id[:16]} ({cache_selection_source}) | family={SETTINGS.model_family}",
-                request_id=request_id, stage="GEN",
+                request_id=request_id, stage="PREFILL",
             )
             # Expert Routing: start tracking this request (non-streaming path)
             if FEATURE_EXPERT_ROUTING_LOG:
@@ -6769,6 +6492,12 @@ class APIHandler(BaseHTTPRequestHandler):
                     client_temp=float(body.get("temperature")) if _client_has_custom_temp else None,
                     log_fn=_terminal_status,
                     pipeline_log_fn=_pipeline_log if FEATURE_FULL_LOGGING else None,
+                )
+
+                _terminal_status(
+                    "⚙️",
+                    f"Generation started (decoding on GPU) | max_tokens={max_tokens} | thinking={enable_thinking}",
+                    request_id=request_id, stage="GEN",
                 )
 
                 for response in _stream_generate_unified(
@@ -6971,17 +6700,6 @@ class APIHandler(BaseHTTPRequestHandler):
                             f"POST-COMPACT PRE-WARMUP failed: {_pw_err} | req={request_id[:8]}")
 
 
-
-                # Expert Breathing: restore full capacity after generation
-                global _breathing_active
-                if _breathing_active:
-                    try:
-                        from .expert_cache import breathe_up
-                        breathe_up(model, log_fn=_terminal_status)
-                    except Exception as _bu_err:
-                        _terminal_status("⚠️", f"BREATHE UP failed: {_bu_err} | req={request_id[:8]}")
-                    finally:
-                        _breathing_active = False
 
                 if _frozen_summary:
                     message_text = f"{_frozen_summary}\n\n---\n\n{message_text}"
@@ -7227,6 +6945,11 @@ class APIHandler(BaseHTTPRequestHandler):
 
                 _server_loop_warned = False
                 _server_loop_warned_token = 0
+                _terminal_status(
+                    "⚙️",
+                    f"Generation started (decoding on GPU) | max_tokens={max_tokens} | thinking={enable_thinking}",
+                    request_id=request_id, stage="GEN",
+                )
 
                 try:
                     for response in _stream_generate_unified(
@@ -7821,16 +7544,6 @@ class APIHandler(BaseHTTPRequestHandler):
                         _terminal_status("⚠️",
                             f"POST-COMPACT PRE-WARMUP failed: {_pw_err} | req={request_id[:8]}")
 
-                # Expert Breathing: restore full capacity after generation
-                if _breathing_active:
-                    try:
-                        from .expert_cache import breathe_up
-                        breathe_up(model, log_fn=_terminal_status)
-                    except Exception as _bu_err:
-                        _terminal_status("⚠️", f"BREATHE UP failed: {_bu_err} | req={request_id[:8]}")
-                    finally:
-                        _breathing_active = False
-
         except BrokenPipeError:
             _terminal_status(
                 "⚠️",
@@ -7901,8 +7614,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
                 try:
-                    mx.clear_cache()
-                    import gc; gc.collect()
+                    _guard.force_clear_cache("oom_error")
                 except Exception:
                     pass
             else:
@@ -8011,60 +7723,26 @@ class APIHandler(BaseHTTPRequestHandler):
                 # MAIN cache is always untouched.
 
                 _mem_profiler.snapshot(request_id, "POST_GENERATION", is_anthropic=self._is_anthropic, rest_tokens=rest_count if 'rest_count' in dir() else None, output_tokens=output_tokens if 'output_tokens' in dir() else None, kv_cache_offset=_kv_off if '_kv_off' in dir() else None)
-                mx.clear_cache()
-                import gc; gc.collect()
+                _guard.post_request_cleanup(request_id)
                 if FEATURE_FULL_LOGGING:
-                    _pipeline_log("METAL", request_id, f"mx.clear_cache() + gc.collect() called"
+                    _pipeline_log("METAL", request_id, f"post_request_cleanup via guard"
                         f"{' | COMPACT slot retained in PROMPT_CACHE_COMPACT' if _is_embedded_agent else ''}")
                     if generation_started_at is not None:
                         _held_ms = (time.time() - generation_started_at) * 1000
                         _pipeline_log("METAL", request_id, f"model_lock released | held_for={_held_ms/1000:.2f}s")
 
-                # ── TWO-STAGE EXPERT EXPANSION ────────────────────────────
-                # After first successful response, expand expert capacity.
-                # First request runs at cap=100 (safe for 33K cold prefill),
-                # subsequent requests use expanded cap with warm cache.
-                global _moe_expand_pending
-                if _moe_expand_pending and output_tokens > 0:
-                    try:
-                        from .expert_cache import expand_expert_capacity
-                        _terminal_status("🔄",
-                            f"Expanding experts: {SETTINGS.moe_expert_capacity}"
-                            f"→{SETTINGS.moe_target_capacity}...")
-                        _expand_stats = expand_expert_capacity(
-                            model,
-                            target_capacity=SETTINGS.moe_target_capacity,
-                            profile_path=SETTINGS.moe_expert_profile or None,
-                        )
-                        if _expand_stats.get("expanded"):
-                            _terminal_status("✅",
-                                f"Expert expansion complete: "
-                                f"{_expand_stats['old_capacity']}→{_expand_stats['new_capacity']} | "
-                                f"+{_expand_stats['new_experts_loaded']} experts | "
-                                f"{_expand_stats['elapsed_seconds']}s | "
-                                f"mem={_expand_stats['active_memory_gb']}GB")
-                    except Exception as _exp_err:
-                        _terminal_status("⚠️", f"Expert expansion failed: {_exp_err}")
-                    _moe_expand_pending = False
-
-                # ── Expert Frequency Flush (Full Residency support) ──────────────
-                # Drains _indices_buffer → session_frequency AND → _routing_data.
-                # MUST run before end_expert_routing() so _routing_label is still set.
+                # ── MoE Post-Generation Hook ──────────────────────────────
                 try:
-                    from .expert_cache import flush_frequency_only
-                    flush_frequency_only(model)
-                except ImportError:
-                    pass  # dense model — no expert cache
-                except Exception as _flush_err:
-                    _terminal_status("⚠️", f"Expert frequency flush failed: {_flush_err}")
-
-                # Expert Routing: end tracking AFTER flush (label must be set during flush)
-                if FEATURE_EXPERT_ROUTING_LOG:
-                    try:
-                        from .expert_cache import end_expert_routing
-                        end_expert_routing()
-                    except (ImportError, Exception):
-                        pass
+                    from .expert_cache import moe_post_generation_hook
+                    moe_post_generation_hook(
+                        model=model,
+                        output_tokens=output_tokens,
+                        settings=SETTINGS,
+                        request_id=request_id,
+                        log_fn=_terminal_status,
+                    )
+                except Exception as _moe_post_err:
+                    _terminal_status("⚠️", f"MoE post-generation hook error: {_moe_post_err}")
 
                 model_lock.release()
 
