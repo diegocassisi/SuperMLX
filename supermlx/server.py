@@ -107,7 +107,7 @@ SSoT: server.py es la única fuente de verdad (SSoT) para la ejecución de infer
 
   OpenClaw / Claude Code ──→ LiteLLM Proxy :4000 ──→ MLX Engine :8080
                                                         │
-                                _detect_compact_runner()
+                                _is_embedded_agent = False (OpenClaw removed)
                                  │              │
                            MAIN path       COMPACT path
                                  │              │
@@ -225,7 +225,7 @@ ArraysCache._ac_rollback = _ac_rollback
 ArraysCache.trim = _ac_trim
 ArraysCache.is_trimmable = _ac_is_trimmable
 
-print("[INIT] ArraysCache monkey-patched: checkpoint/rollback/trim (Marconi pattern)")
+logger.info("[INIT] ArraysCache monkey-patched: checkpoint/rollback/trim (Marconi pattern)")
 
 # Optional VLM support (Blaizzy/mlx-vlm). If unavailable, is_vlm is always False.
 try:
@@ -4921,7 +4921,7 @@ class APIHandler(BaseHTTPRequestHandler):
 
         tools = body.get("tools")
 
-        # KRIPPER DUAL-SLOT: Detect OpenClaw's compact runner.
+        # DUAL-SLOT: _is_embedded_agent hardcoded False (OpenClaw removed).
         # OpenClaw compact runner detection removed — OpenClaw no longer in use.
         # _is_embedded_agent kept as False for the ~40 downstream branches
         # that still reference it. Full cleanup deferred to modularization pass.
