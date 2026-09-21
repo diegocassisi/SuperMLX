@@ -499,16 +499,6 @@ def _is_hermes_housekeeping_request(messages: List[Dict[str, Any]]) -> bool:
     return False
 
 
-def _detect_compact_runner(messages: List[Dict[str, Any]], tools: Any) -> bool:
-    """Detects if the incoming request is from OpenClaw's compact runner.
-
-    DISABLED: OpenClaw is no longer in use. Hermes and Claude Code handle their
-    own compaction and don't need the embedded agent treatment (separate cache,
-    128-token thinking limit, RAG skip, etc.). All requests now go through the
-    normal MAIN pipeline.
-    """
-    return False
-
 
 def _flatten_content(content):
     if isinstance(content, str):

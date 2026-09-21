@@ -802,7 +802,7 @@ from .message_pipeline import (
     _get_healing_hash, _heal_messages,
     _break_tool_call_loop,
     _count_roles, _summarize_tool_results, _estimate_token_count,
-    _is_slug_gen_request, _is_title_gen_request, _is_rag_bypass_request, _detect_compact_runner,
+    _is_slug_gen_request, _is_title_gen_request, _is_rag_bypass_request,
     _is_hermes_housekeeping_request,
     _prepare_messages_for_template,
     _scrub_cache_key,
@@ -4922,18 +4922,11 @@ class APIHandler(BaseHTTPRequestHandler):
         tools = body.get("tools")
 
         # KRIPPER DUAL-SLOT: Detect OpenClaw's compact runner.
-        # The compact runner sends ZERO tools and a system prompt with compaction keywords.
-        # The old detector (len(tools) <= 2) was incorrect — compact sends 0 tools,
-        # not 2 — and MAIN requests in conversational mode also may have 0 tools.
-        # This detector is multi-signal and much more reliable.
+        # OpenClaw compact runner detection removed — OpenClaw no longer in use.
+        # _is_embedded_agent kept as False for the ~40 downstream branches
+        # that still reference it. Full cleanup deferred to modularization pass.
         _raw_messages_for_detect = body.get("messages", [])
-        _is_embedded_agent = _detect_compact_runner(
-            messages=_raw_messages_for_detect,
-            tools=tools,
-        )
-        if _is_embedded_agent and FEATURE_FULL_LOGGING:
-            _pipeline_log("TOOLS", request_id,
-                f"COMPACT_RUNNER: detected (system-prompt keywords + 0 tools) — routed to PROMPT_CACHE_COMPACT")
+        _is_embedded_agent = False
 
         _is_housekeeping = _is_hermes_housekeeping_request(_raw_messages_for_detect)
         _is_compact = bool(body.pop("_supermlx_compact", False))
