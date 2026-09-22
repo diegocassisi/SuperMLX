@@ -89,15 +89,80 @@ def _sample_token(
     return int(mx.random.categorical(mx.log(probs)).item()), probs
 
 
-def _verify_draft_token(
-    draft_token: int,
+@mx.compile
+def _verify_compiled_greedy(
+    target_logits: mx.array,
+    draft_token: mx.array,
+) -> Tuple[mx.array, mx.array]:
+    """
+    Verificación greedy compilada en Metal GPU sin roundtrip a CPU.
+    target_logits: [vocab_size]
+    draft_token: scalar tensor int32
+    Retorna: (accepted: bool tensor, chosen_token: int32 tensor)
+    """
+    target_token = mx.argmax(target_logits)
+    accepted = (draft_token == target_token)
+    return accepted, target_token
+
+
+@mx.compile
+def _verify_compiled_stochastic(
     p_probs: mx.array,
     q_probs: mx.array,
-    temperature: float,
+    draft_token: mx.array,
+    uniform_rand: mx.array,
+) -> Tuple[mx.array, mx.array]:
+    """
+    Verificación estocástica de Leviathan (rejection sampling) compilada en GPU.
+    Retorna: (accepted: bool tensor, chosen_token: int32 tensor)
+    """
+    p_val = p_probs[draft_token]
+    q_val = q_probs[draft_token]
+    accepted = (uniform_rand * q_val) < mx.minimum(p_val, q_val)
+
+    residual = mx.maximum(p_probs - q_probs, 0.0)
+    residual_log = mx.log(mx.maximum(residual, 1e-12))
+    fallback_token = mx.random.categorical(residual_log)
+
+    chosen_token = mx.where(accepted, draft_token, fallback_token)
+    return accepted, chosen_token
+
+
+def _verify_draft_token(
+    draft_token: int,
+    p_probs: Optional[mx.array] = None,
+    q_probs: Optional[mx.array] = None,
+    temperature: float = 0.0,
+    compiled: bool = False,
+    target_logits: Optional[mx.array] = None,
 ) -> Tuple[bool, int]:
+    if compiled:
+        draft_tok_arr = mx.array(draft_token, dtype=mx.int32)
+        if temperature <= 0.0:
+            logits = target_logits if target_logits is not None else p_probs
+            if logits is None:
+                raise ValueError("Target logits or p_probs required for greedy verification")
+            acc, chosen = _verify_compiled_greedy(logits, draft_tok_arr)
+            mx.eval(acc, chosen)
+            return bool(acc.item()), int(chosen.item())
+        else:
+            if p_probs is None or q_probs is None:
+                raise ValueError("p_probs and q_probs required for stochastic verification")
+            u = mx.random.uniform()
+            acc, chosen = _verify_compiled_stochastic(p_probs, q_probs, draft_tok_arr, u)
+            mx.eval(acc, chosen)
+            return bool(acc.item()), int(chosen.item())
+
     if temperature <= 0.0:
-        target = int(mx.argmax(p_probs).item())
+        target_src = target_logits if target_logits is not None else p_probs
+        if target_src is None:
+            raise ValueError("Target logits or p_probs required for greedy verification")
+        target = int(mx.argmax(target_src).item())
         return draft_token == target, target
+
+    if p_probs is None or q_probs is None:
+        raise ValueError("p_probs and q_probs required for uncompiled stochastic verification")
+
     p_val = p_probs[draft_token]
     q_val = q_probs[draft_token]
     # q_val is positive because the draft was sampled from q.
@@ -164,6 +229,7 @@ class MTPSpeculativeEngine:
         sampler: Optional[Any] = None,
         adaptive_temperature: bool = False,
         tokenizer: Optional[Any] = None,
+        compiled_verification: Optional[bool] = None,
     ) -> None:
         self.model = model
         self.temperature = temperature
@@ -173,18 +239,24 @@ class MTPSpeculativeEngine:
         self.sampler = sampler
         self.adaptive_temperature = adaptive_temperature
         self.tokenizer = tokenizer
+        self.compiled_verification = (
+            compiled_verification
+            if compiled_verification is not None
+            else getattr(SETTINGS, "mtp_compiled_verification", True)
+        )
         self._last_nudge_token: int = 0
         self._last_closure_nudge_token: int = 0
         self._loop_nudge_applied: bool = False
         self._loop_nudge_token: int = 0
         self._generated_tokens_history: List[int] = []
         logger.info(
-            "[CONFIG] MTPSpeculativeEngine inicializado: temp=%.2f, top_p=%.2f, min_p=%.2f, top_k=%d, adaptive_temp=%s",
+            "[CONFIG] MTPSpeculativeEngine inicializado: temp=%.2f, top_p=%.2f, min_p=%.2f, top_k=%d, adaptive_temp=%s, compiled_verify=%s",
             self.temperature,
             self.top_p,
             self.min_p,
             self.top_k,
             self.adaptive_temperature,
+            self.compiled_verification,
         )
 
     def _get_sampling_params(self) -> Tuple[float, float, float, int]:
@@ -483,19 +555,24 @@ class MTPSpeculativeEngine:
             bonus_logits = target_logits[0, 1]
 
             curr_temp, curr_top_p, curr_min_p, curr_top_k = self._get_sampling_params()
-            p_probs = _distribution_from_logits(
-                verify_logits,
-                temperature=curr_temp,
-                top_p=curr_top_p,
-                min_p=curr_min_p,
-                top_k=curr_top_k,
-            )
+            if self.compiled_verification and curr_temp <= 0.0:
+                p_probs = None
+            else:
+                p_probs = _distribution_from_logits(
+                    verify_logits,
+                    temperature=curr_temp,
+                    top_p=curr_top_p,
+                    min_p=curr_min_p,
+                    top_k=curr_top_k,
+                )
 
             is_accepted, committed_token = _verify_draft_token(
                 draft_token=draft_tok,
                 p_probs=p_probs,
                 q_probs=q2_probs,
                 temperature=curr_temp,
+                compiled=self.compiled_verification,
+                target_logits=verify_logits,
             )
             drafts_attempted += 1
 
@@ -634,6 +711,7 @@ def stream_generate_mtp(
     prompt_cache: Optional[List[Any]] = None,
     mtp_cache: Optional[List[Any]] = None,
     adaptive_temperature: Optional[bool] = None,
+    compiled_verification: Optional[bool] = None,
     **kwargs: Any,
 ) -> Generator[Any, None, None]:
     """
@@ -650,6 +728,13 @@ def stream_generate_mtp(
             adaptive_temperature = getattr(SETTINGS, "mtp_adaptive_temperature", True)
         except Exception:
             adaptive_temperature = True
+
+    if compiled_verification is None:
+        try:
+            from supermlx.config import SETTINGS
+            compiled_verification = getattr(SETTINGS, "mtp_compiled_verification", True)
+        except Exception:
+            compiled_verification = True
 
     if not isinstance(tokenizer, TokenizerWrapper):
         tokenizer = TokenizerWrapper(tokenizer)
@@ -677,6 +762,7 @@ def stream_generate_mtp(
         sampler=sampler,
         adaptive_temperature=adaptive_temperature,
         tokenizer=tokenizer,
+        compiled_verification=compiled_verification,
     )
 
     detokenizer = tokenizer.detokenizer

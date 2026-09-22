@@ -3472,6 +3472,29 @@ else:
         except Exception as _ane_err:
             _terminal_status("⚠️", f"ANE setup error: {_ane_err} — falling back to standard GPU path")
 
+    # ── ANE Shared Expert Offload (MoE parallel decode) ────────────────────
+    _se_guard_val = getattr(SETTINGS, "enable_ane_shared_expert", False) or os.environ.get("ENABLE_ANE_SHARED_EXPERT", "").strip().lower() in {"1", "true", "yes"}
+    print(f"\n{'='*60}")
+    print(f"[DIAG] ANE Shared Expert guard: {_se_guard_val}")
+    print(f"[DIAG] SETTINGS.enable_ane_shared_expert = {getattr(SETTINGS, 'enable_ane_shared_expert', 'MISSING')}")
+    print(f"[DIAG] ENV ENABLE_ANE_SHARED_EXPERT = {os.environ.get('ENABLE_ANE_SHARED_EXPERT', 'NOT SET')}")
+    print(f"{'='*60}\n")
+    if _se_guard_val:
+        try:
+            from lab.ane_code.ane_shim import inject_shared_expert_ane
+            print("[DIAG] inject_shared_expert_ane imported OK, calling...")
+            _se_ok = inject_shared_expert_ane(model)
+            print(f"[DIAG] inject_shared_expert_ane returned: {_se_ok}")
+            if _se_ok:
+                _terminal_status("🍏", "ANE shared expert offload enabled (parallel MoE decode)")
+            else:
+                _terminal_status("⚠️", "ANE shared expert injection failed — MoE stays GPU-only")
+        except Exception as _se_err:
+            import traceback
+            print(f"[DIAG] ANE shared expert EXCEPTION: {_se_err}")
+            traceback.print_exc()
+            _terminal_status("⚠️", f"ANE shared expert setup error: {_se_err} — MoE stays GPU-only")
+
     # ── Resolve think token IDs (once, at load) ───────────────────────────
     _think_start_id, _think_end_id = get_think_token_ids(tokenizer)
     if _think_start_id is not None:
