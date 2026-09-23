@@ -7,6 +7,7 @@ ENTRADAS:
 - prompt_tokens: mx.array de tokens iniciales.
 - max_tokens: int, presupuesto de generación.
 - temperature, top_p, min_p: parámetros de sampling.
+- on_token_callback: Optional callback del FlightController para intervenciones in-flight.
 SALIDAS:
 - Generator con tokens emitidos, estadísticas de aceptación (alpha), tokens/s y conteos.
 REGLAS INVIOLABLES:
@@ -14,6 +15,8 @@ REGLAS INVIOLABLES:
 - Prohibido print(). Usar exclusivamente logger con prefijos estándar ([INICIO], [CONFIG], [CALC], [DECISION], [RESULT], [ERROR]).
 - Obligatorio tipado estricto en funciones públicas.
 - Obligatorio recolectar telemetría de tasa de aceptación (alpha = accepted_drafts / total_drafts).
+- Este módulo implementa MECANISMO (cómo inyectar tokens en el cache). La POLÍTICA (cuándo/qué inyectar)
+  vive en supermlx.flight_controller.FlightController.
 SSoT: Leviathan, Mattson, Liang (2023) / Chen et al. (2023) Speculative Decoding Theorem.
 
 ASTRA Modification
@@ -164,6 +167,7 @@ class MTPSpeculativeEngine:
         sampler: Optional[Any] = None,
         adaptive_temperature: bool = False,
         tokenizer: Optional[Any] = None,
+        on_token_callback: Optional[Any] = None,
     ) -> None:
         self.model = model
         self.temperature = temperature
@@ -173,11 +177,7 @@ class MTPSpeculativeEngine:
         self.sampler = sampler
         self.adaptive_temperature = adaptive_temperature
         self.tokenizer = tokenizer
-        self._last_nudge_token: int = 0
-        self._last_closure_nudge_token: int = 0
-        self._loop_nudge_applied: bool = False
-        self._loop_nudge_token: int = 0
-        self._generated_tokens_history: List[int] = []
+        self._on_token_callback = on_token_callback
         logger.info(
             "[CONFIG] MTPSpeculativeEngine inicializado: temp=%.2f, top_p=%.2f, min_p=%.2f, top_k=%d, adaptive_temp=%s",
             self.temperature,
@@ -217,6 +217,81 @@ class MTPSpeculativeEngine:
             min_p = getattr(self.sampler.spark_controller, "spark_min_p", min_p)
 
         return temp, top_p, min_p, top_k
+
+    def _inject_tokens(
+        self,
+        inject_token_ids: List[int],
+        cache: List[Any],
+        mtp_cache: List[Any],
+        confirmed_token: int,
+        tokens_generated: int,
+        drafts_accepted: int,
+        drafts_attempted: int,
+        curr_alpha: float,
+    ) -> Tuple[List[Dict[str, Any]], int, int, Any, List[Any], int, Any]:
+        """Inject tokens into KV cache and prepare next draft.
+
+        This is the MECHANISM for injection. The POLICY (when/what to inject)
+        lives in FlightController.
+
+        Performs:
+        1. Forward pass to insert tokens into trunk KV cache
+        2. Build token dicts to yield (caller does actual yield)
+        3. Reset MTP cache
+        4. Generate new draft from the last injected token
+
+        Returns:
+            (tokens_to_yield, new_confirmed, hidden, new_mtp_cache, tokens_generated, draft_tok, q2_probs)
+        """
+        # Forward confirmed_token + all nudge tokens except last through trunk
+        tokens_to_forward = [confirmed_token] + list(inject_token_ids[:-1])
+        fwd_arr = mx.array([tokens_to_forward], dtype=mx.int32)
+        fwd_logits, fwd_hidden = self.model.forward_with_hidden(
+            fwd_arr, cache=cache
+        )
+        mx.eval(fwd_logits, fwd_hidden)
+
+        # Build token dicts to yield (caller does actual yield from generate())
+        tokens_to_yield: List[Dict[str, Any]] = []
+        for n_tok in inject_token_ids:
+            tokens_generated += 1
+            # Notify flight controller of injected token
+            if self._on_token_callback:
+                cb = self._on_token_callback
+                if hasattr(cb, '__self__') and hasattr(cb.__self__, 'record_token'):
+                    cb.__self__.record_token(int(n_tok))
+            tokens_to_yield.append({
+                "token": int(n_tok),
+                "is_speculative": False,
+                "accepted": True,
+                "tokens_generated": tokens_generated,
+                "drafts_accepted": drafts_accepted,
+                "drafts_attempted": drafts_attempted,
+                "alpha": curr_alpha,
+            })
+
+        # Last injected token becomes the new confirmed token
+        new_confirmed = int(inject_token_ids[-1])
+        hidden_at_confirmed = fwd_hidden[:, -1:, :]
+        new_mtp_cache = self.model.make_mtp_cache()
+
+        # Generate new speculative draft from the last injected token
+        mtp_logits = self.model.mtp_forward(
+            hidden_at_confirmed,
+            mx.array([[new_confirmed]]),
+            mtp_cache=new_mtp_cache,
+        )
+        mx.eval(mtp_logits)
+        next_temp, next_top_p, next_min_p, next_top_k = self._get_sampling_params()
+        draft_tok, q2_probs = _sample_token(
+            mtp_logits[0, -1],
+            temperature=next_temp,
+            top_p=next_top_p,
+            min_p=next_min_p,
+            top_k=next_top_k,
+        )
+
+        return tokens_to_yield, new_confirmed, hidden_at_confirmed, new_mtp_cache, tokens_generated, draft_tok, q2_probs
 
     def generate(
         self,
@@ -263,10 +338,16 @@ class MTPSpeculativeEngine:
         tokens_generated = 1
         drafts_attempted = 0
         drafts_accepted = 0
-        self._loop_nudge_applied = False
-        self._loop_nudge_token = 0
         curr_alpha = 0.0
-        self._generated_tokens_history = [int(token_t1)]
+
+        # Helper: notify flight controller of generated tokens
+        def _fc_record(token_id: int) -> None:
+            if self._on_token_callback:
+                cb = self._on_token_callback
+                if hasattr(cb, '__self__') and hasattr(cb.__self__, 'record_token'):
+                    cb.__self__.record_token(token_id)
+
+        _fc_record(int(token_t1))
 
         yield {
             "token": token_t1,
@@ -306,168 +387,26 @@ class MTPSpeculativeEngine:
         )
 
         while tokens_generated < max_tokens:
-            # ── IN-SITU N-GRAM LOOP CHECK & STEERING NUDGE ───────────────
-            _n_hist = len(self._generated_tokens_history)
-            _is_thinking = (
-                hasattr(self.sampler, "tracker")
-                and getattr(self.sampler.tracker, "is_thinking", False)
-            ) if self.sampler is not None else False
-
-            trigger_loop_nudge = False
-            trigger_loop_hard_break = False
-
-            if (
-                SETTINGS.ngram_loop_detection
-                and _n_hist >= SETTINGS.ngram_size * 2
-                and _n_hist % SETTINGS.ngram_check_interval == 0
-            ):
-                _tail = tuple(self._generated_tokens_history[-SETTINGS.ngram_size:])
-                _search_region = self._generated_tokens_history[:-SETTINGS.ngram_size]
-                _window_start = max(0, len(_search_region) - SETTINGS.ngram_window)
-                _search_region = _search_region[_window_start:]
-                _repeat_count = 0
-                for _si in range(len(_search_region) - SETTINGS.ngram_size + 1):
-                    if tuple(_search_region[_si:_si + SETTINGS.ngram_size]) == _tail:
-                        _repeat_count += 1
-                        if _repeat_count >= SETTINGS.ngram_max_repeats:
-                            break
-
-                if _repeat_count >= SETTINGS.ngram_max_repeats:
-                    if SETTINGS.ngram_nudge_enabled and not self._loop_nudge_applied and _is_thinking:
-                        trigger_loop_nudge = True
-                    else:
-                        if self._loop_nudge_applied:
-                            if (_n_hist - self._loop_nudge_token) >= SETTINGS.ngram_grace_tokens:
-                                logger.warning(
-                                    "[DECISION] 🛑 N-Gram loop persistió tras gracia (%d tok). Corte duro.",
-                                    _n_hist - self._loop_nudge_token,
-                                )
-                                trigger_loop_hard_break = True
-                        else:
-                            trigger_loop_hard_break = True
-
-            if trigger_loop_hard_break:
-                logger.warning(
-                    "[DECISION] 🛑 NGRAM LOOP HARD BREAK en token %d (%d-gram repetido)",
-                    _n_hist,
-                    SETTINGS.ngram_size,
-                )
-                break
-
-            # ── IN-SITU EPISTEMIC / CLOSURE / LOOP NUDGE INJECTION ───────────────
-            if (
-                self.tokenizer is not None
-                and _is_thinking
-            ):
-                _thinking_count = getattr(self.sampler.tracker, "thinking_count", tokens_generated)
-                is_closure_nudge = False
-                is_loop_nudge = False
-                trigger_nudge = False
-
-                # 0. Máxima Prioridad: N-Gram Loop Steering Nudge (Grounding Thought)
-                if trigger_loop_nudge:
-                    is_loop_nudge = True
-                    trigger_nudge = True
-                    raw_nudge_text = SETTINGS.ngram_nudge_text
-                # 1. Prioridad: Evaluación de Cierre cada closure_nudge_interval (ej. 15000 tokens)
-                elif (
-                    SETTINGS.closure_nudge_interval > 0
-                    and _thinking_count >= SETTINGS.closure_nudge_interval
-                    and (_thinking_count - self._last_closure_nudge_token) >= SETTINGS.closure_nudge_interval
-                ):
-                    is_closure_nudge = True
-                    trigger_nudge = True
-                    raw_nudge_text = SETTINGS.closure_nudge_text
-                # 2. Pausa de Rigor Epistemológico estándar cada epistemic_nudge_interval (ej. 2000 tokens)
-                elif (
-                    SETTINGS.feature_epistemic_nudge
-                    and _thinking_count >= SETTINGS.epistemic_nudge_min_tokens
-                    and (_thinking_count - self._last_nudge_token) >= SETTINGS.epistemic_nudge_interval
-                ):
-                    trigger_nudge = True
-                    raw_nudge_text = SETTINGS.epistemic_nudge_text
-
-                if trigger_nudge:
-                    clean_text = raw_nudge_text.strip()
-                    nudge_text = f"\n\n{clean_text}\n"
-                    nudge_tokens = self.tokenizer.encode(nudge_text)
-                    if nudge_tokens:
-                        # Forward del confirmed_token previo + todo el nudge EXCEPTO el último token
-                        tokens_to_forward = [confirmed_token] + list(nudge_tokens[:-1])
-                        fwd_arr = mx.array([tokens_to_forward], dtype=mx.int32)
-                        fwd_logits, fwd_hidden = self.model.forward_with_hidden(
-                            fwd_arr, cache=cache
+            # ── FLIGHT CONTROLLER HOOK ────────────────────────────────────
+            if self._on_token_callback is not None:
+                action = self._on_token_callback(tokens_generated, confirmed_token)
+                if action is not None:
+                    if action.hard_break:
+                        break
+                    if action.inject_tokens:
+                        # Inject tokens into KV cache and resume speculative decoding
+                        inject_result = self._inject_tokens(
+                            action.inject_tokens, cache, mtp_cache,
+                            confirmed_token, tokens_generated,
+                            drafts_accepted, drafts_attempted, curr_alpha,
                         )
-                        mx.eval(fwd_logits, fwd_hidden)
-
-                        for n_tok in nudge_tokens:
-                            tokens_generated += 1
-                            self._generated_tokens_history.append(int(n_tok))
-                            yield {
-                                "token": int(n_tok),
-                                "is_speculative": False,
-                                "accepted": True,
-                                "tokens_generated": tokens_generated,
-                                "drafts_accepted": drafts_accepted,
-                                "drafts_attempted": drafts_attempted,
-                                "alpha": curr_alpha,
-                            }
-
-                        # El último token del nudge queda como confirmed_token para entrar en Step 4
-                        confirmed_token = int(nudge_tokens[-1])
-                        hidden_at_confirmed = fwd_hidden[:, -1:, :]
-                        mtp_cache = self.model.make_mtp_cache()
-                        self._last_nudge_token = _thinking_count
-                        if is_closure_nudge:
-                            self._last_closure_nudge_token = _thinking_count
-                        if is_loop_nudge:
-                            self._loop_nudge_applied = True
-                            self._loop_nudge_token = _n_hist
-
-                        # Acoplar Thermal Spark durante la pausa reflexiva o loop break si está configurado
-                        if (
-                            hasattr(self.sampler, "spark_controller")
-                            and self.sampler.spark_controller is not None
-                            and self.sampler.spark_controller.enabled
-                        ):
-                            self.sampler.spark_controller.spark_remaining_tokens = SETTINGS.spark_pulse_duration
-                            self.sampler.spark_controller.last_spark_token = _thinking_count
-                            if is_loop_nudge:
-                                self.sampler.spark_controller.last_cause = "ngram_loop_nudge"
-                            elif is_closure_nudge:
-                                self.sampler.spark_controller.last_cause = "closure_nudge"
-                            else:
-                                self.sampler.spark_controller.last_cause = "epistemic_nudge"
-
-                        # Generar nuevo draft especulativo a partir del último token del nudge
-                        mtp_logits = self.model.mtp_forward(
-                            hidden_at_confirmed,
-                            mx.array([[confirmed_token]]),
-                            mtp_cache=mtp_cache,
-                        )
-                        mx.eval(mtp_logits)
-                        next_temp, next_top_p, next_min_p, next_top_k = self._get_sampling_params()
-                        draft_tok, q2_probs = _sample_token(
-                            mtp_logits[0, -1],
-                            temperature=next_temp,
-                            top_p=next_top_p,
-                            min_p=next_min_p,
-                            top_k=next_top_k,
-                        )
-                        if is_loop_nudge:
-                            nudge_label = "Loop Steering Nudge"
-                        elif is_closure_nudge:
-                            nudge_label = "Closure Nudge"
-                        else:
-                            nudge_label = "Epistemic Nudge"
-                        logger.info(
-                            "[SPARK] ⚡ %s inyectado en token %d (%d tokens)",
-                            nudge_label,
-                            _thinking_count,
-                            len(nudge_tokens),
-                        )
+                        tokens_to_yield, confirmed_token, hidden_at_confirmed, mtp_cache, tokens_generated, draft_tok, q2_probs = inject_result
+                        # Yield injected tokens to consumer
+                        for tok_dict in tokens_to_yield:
+                            yield tok_dict
                         if tokens_generated >= max_tokens:
                             break
+                        continue
 
             # 4. Fase VERIFY en batch de 2 tokens: [confirmed_token, draft_tok]
             # n_confirmed=1 le indica a GatedDeltaNet que guarde snapshot SSM entre ellos.
@@ -506,7 +445,7 @@ class MTPSpeculativeEngine:
 
                 # Emitir draft token confirmado
                 tokens_generated += 1
-                self._generated_tokens_history.append(int(draft_tok))
+                _fc_record(int(draft_tok))
                 yield {
                     "token": draft_tok,
                     "is_speculative": True,
@@ -533,7 +472,7 @@ class MTPSpeculativeEngine:
                     top_k=curr_top_k,
                 )
                 tokens_generated += 1
-                self._generated_tokens_history.append(int(bonus_tok))
+                _fc_record(int(bonus_tok))
                 yield {
                     "token": bonus_tok,
                     "is_speculative": False,
@@ -575,7 +514,7 @@ class MTPSpeculativeEngine:
 
                 # Emitir el token corregido
                 tokens_generated += 1
-                self._generated_tokens_history.append(int(committed_token))
+                _fc_record(int(committed_token))
                 yield {
                     "token": committed_token,
                     "is_speculative": False,
@@ -668,6 +607,10 @@ def stream_generate_mtp(
     top_p = getattr(sampler, "top_p", 1.0) if sampler is not None else 1.0
     top_k = getattr(sampler, "top_k", 0) if sampler is not None else 0
 
+    # Flight controller: policy for in-flight interventions (nudge, loop, spark)
+    from supermlx.flight_controller import FlightController
+    controller = FlightController(tokenizer=tokenizer, sampler=sampler)
+
     engine = MTPSpeculativeEngine(
         model=model,
         temperature=temp,
@@ -677,6 +620,7 @@ def stream_generate_mtp(
         sampler=sampler,
         adaptive_temperature=adaptive_temperature,
         tokenizer=tokenizer,
+        on_token_callback=controller.evaluate,
     )
 
     detokenizer = tokenizer.detokenizer
