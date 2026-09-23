@@ -68,6 +68,15 @@ def compute_prefix_hash(
     return h.hexdigest()
 
 
+def save_prefix_hash(prefix_hash: str, cache_dir: Path) -> None:
+    """Write prefix hash to a .hash file alongside the cache safetensors.
+
+    Args:
+        prefix_hash: MD5 hex string of the prefix tokens + model identity.
+        cache_dir: Directory where the cache safetensors file lives.
+    """
+    hash_path = cache_dir / "warmup_cache.hash"
+    hash_path.write_text(prefix_hash)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
