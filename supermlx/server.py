@@ -254,7 +254,7 @@ DOTENV_PATH = SCRIPT_DIR / ".env"
 if DOTENV_PATH.exists():
     load_dotenv(dotenv_path=DOTENV_PATH, override=True)
 
-__version__ = "2.0.0-dev"
+__version__ = "2.1.0-dev"
 
 
 # ── Configuration (extracted to config.py) ────────────────────────────────────
@@ -4627,10 +4627,18 @@ class APIHandler(BaseHTTPRequestHandler):
             self.wfile.write(json.dumps({"input_tokens": 0}).encode("utf-8"))
             return
 
+        # ── Ephemeral endpoint: TPC reuse WITHOUT session cache write ──
+        # Auxiliary tasks (background_review, compact, etc.) hit this route
+        # to benefit from the TPC prefix but never evict PROMPT_CACHE slots.
+        _is_ephemeral_route = route in (
+            "/v1/ephemeral/messages", "/ephemeral/messages",
+            "/v1/ephemeral/chat/completions", "/ephemeral/chat/completions",
+        )
+
         # ── Anthropic Messages API: inline translation ───────────────
         # Translate the Anthropic body to OpenAI format and fall through
         # to the same pipeline that handles /v1/chat/completions.
-        if route in ("/v1/messages", "/messages"):
+        if route in ("/v1/messages", "/messages") or route in ("/v1/ephemeral/messages", "/ephemeral/messages"):
             try:
                 cl = int(self.headers["Content-Length"])
                 raw = json.loads(self.rfile.read(cl).decode("utf-8"))
@@ -4762,11 +4770,18 @@ class APIHandler(BaseHTTPRequestHandler):
                 body["temperature"] = SETTINGS.compaction_temperature
                 body.pop("thinking", None)
 
+            # Ephemeral route flag → skip session cache save
+            if _is_ephemeral_route:
+                body["_supermlx_ephemeral"] = True
+
             # Jump past the body-parse block that follows.
             self._handle_chat_completion(body)
             return
 
-        if route not in ("/v1/chat/completions", "/chat/completions"):
+        if route not in (
+            "/v1/chat/completions", "/chat/completions",
+            "/v1/ephemeral/chat/completions", "/ephemeral/chat/completions",
+        ):
             try:
                 self.send_error(404, "Not Found")
             except BrokenPipeError:
@@ -4781,6 +4796,9 @@ class APIHandler(BaseHTTPRequestHandler):
         except Exception:
             self.send_error(400, "Bad Request")
             return
+        # Ephemeral route flag → skip session cache save
+        if _is_ephemeral_route:
+            body["_supermlx_ephemeral"] = True
         self._handle_chat_completion(body)
 
     def _handle_chat_completion(self, body):
@@ -4933,8 +4951,13 @@ class APIHandler(BaseHTTPRequestHandler):
 
         _is_housekeeping = _is_hermes_housekeeping_request(_raw_messages_for_detect)
         _is_compact = bool(body.pop("_supermlx_compact", False))
+        _is_ephemeral = bool(body.pop("_supermlx_ephemeral", False))
         _frozen_summary = str(body.pop("_frozen_summary", "") or "")
-        if _is_compact:
+        if _is_ephemeral:
+            _is_housekeeping = True  # ephemeral endpoint: use TPC, skip PROMPT_CACHE save
+            _pipeline_log("CACHE", request_id,
+                "EPHEMERAL: route /v1/ephemeral/* — TPC active, session cache save skipped")
+        elif _is_compact:
             _is_housekeeping = True  # reuse same skip_cache_store path
             _pipeline_log("CACHE", request_id,
                 f"HERMES_COMPACT: cache store will be skipped — compact mode active (enable_thinking=False, temp={SETTINGS.compaction_temperature:.2f})")
@@ -4943,7 +4966,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 "HERMES_HOUSEKEEPING: detected — cache store will be skipped to avoid contaminating conversation cache")
 
         reasoning_control = _extract_enable_thinking(body, default_thinking=SETTINGS.default_thinking)
-        enable_thinking = False if _is_compact else reasoning_control["enable_thinking"]
+        enable_thinking = False if (_is_compact or _is_ephemeral) else reasoning_control["enable_thinking"]
 
         # ── PIPELINE LOG: INBOUND ──────────────────────────────────────────
         _pipeline_t0 = time.time()
@@ -5385,7 +5408,7 @@ class APIHandler(BaseHTTPRequestHandler):
                               "model_tokens_count": len(model_tokens)})
 
             # Housekeeping split-prefill: compute exact boundary for clean conversation history
-            if _is_housekeeping and SETTINGS.feature_housekeeping_staging:
+            if _is_housekeeping and SETTINGS.feature_housekeeping_staging and not _is_ephemeral:
                 _hk_idx = find_housekeeping_split_index(messages)
                 if _hk_idx > 0 and hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template:
                     try:
@@ -7716,20 +7739,31 @@ def run():
     _mem_profiler.init(SETTINGS.log_root)
     import mlx.core as _mx_banner
     _mlx_ver = getattr(_mx_banner, '__version__', 'unknown')
-    print("\n" + "=" * 50)
+    _host = SETTINGS.mlx_host
+    _port = SETTINGS.mlx_port
+    _base = f"http://{_host}:{_port}"
+    print("\n" + "=" * 82)
     print(f"🟢 SYSTEM READY — SuperMLX v{__version__}")
-    print(f"   • MLX:          v{_mlx_ver}")
-    print(f"   • Mode:         {'VLM (vision)' if is_vlm else 'LM (text-only)'}")
-    print(f"   • MLX Engine:   http://{SETTINGS.mlx_host}:{SETTINGS.mlx_port}")
-    #print(f"   • LiteLLM:      http://0.0.0.0:{SETTINGS.proxy_port}")
+    print(f"   MLX v{_mlx_ver}  •  {'VLM (vision)' if is_vlm else 'LM (text-only)'}")
+    print("-" * 82)
+    _col = 49  # column width for endpoint text before TPC
+    print(f"   {'ENDPOINT':<{_col}}TPC   SESSION   THINKING")
+    print("   OpenAI")
+    print(f"     {_base + '/v1/chat/completions':<{_col - 2}}✅      ✅        ✅")
+    print(f"     {_base + '/v1/ephemeral/chat/completions':<{_col - 2}}✅      ❌        ❌")
+    print("   Anthropic")
+    print(f"     {_base + '/v1/messages':<{_col - 2}}✅      ✅        ✅")
+    print(f"     {_base + '/v1/ephemeral/messages':<{_col - 2}}✅      ❌        ❌")
     if sidecar_httpd:
         rag_tag = " + RAG" if (SETTINGS.sidecar_enable_rag and _rag_available) else ""
-        print(f"   • Sidecar:      http://{SETTINGS.mlx_host}:{SETTINGS.sidecar_port}{rag_tag}")
+        print(f"   Sidecar{rag_tag}")
+        _sc_url = f"http://{_host}:{SETTINGS.sidecar_port}"
+        print(f"     {_sc_url:<{_col - 2}}❌      ❌        per-req")
     elif SETTINGS.sidecar_port > 0:
-        print(f"   • Sidecar:      FAILED (port {SETTINGS.sidecar_port})")
+        print(f"   Sidecar: FAILED (port {SETTINGS.sidecar_port})")
     else:
-        print(f"   • Sidecar:      DISABLED")
-    print("=" * 50 + "\n")
+        print(f"   Sidecar: DISABLED")
+    print("=" * 82 + "\n")
 
     try:
         httpd.serve_forever()
