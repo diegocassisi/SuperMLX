@@ -119,36 +119,45 @@ def bench_mtp(model, tokenizer, label: str = "current", prompt: str = PROMPT_SHO
         drafts_attempted = 0
 
         tic = time.perf_counter()
-        for resp in stream_generate_mtp(
+        tic_gen = None
+        for n, resp in enumerate(stream_generate_mtp(
             model, tokenizer, mx.array(prompt_tokens),
             max_tokens=MAX_TOKENS,
-        ):
-            tokens.append(resp.token)
+        )):
+            if n == 0:
+                ttft = time.perf_counter() - tic
+                tic_gen = time.perf_counter()
+            else:
+                tokens.append(resp.token)
             drafts_accepted = getattr(resp, "drafts_accepted", 0)
             drafts_attempted = getattr(resp, "drafts_attempted", 0)
-        elapsed = time.perf_counter() - tic
+        elapsed_gen = time.perf_counter() - tic_gen if tic_gen else 0.001
+        elapsed_total = time.perf_counter() - tic
 
         alpha = 100.0 * drafts_accepted / max(drafts_attempted, 1)
-        tps = len(tokens) / max(elapsed, 0.001)
+        gen_tps = len(tokens) / max(elapsed_gen, 0.001)
+        e2e_tps = (len(tokens) + 1) / max(elapsed_total, 0.001)
         results.append(dict(
             run=run + 1,
-            tokens=len(tokens),
-            elapsed_s=round(elapsed, 2),
-            tps=round(tps, 1),
+            tokens=len(tokens) + 1,
+            ttft_s=round(ttft, 3),
+            gen_tps=round(gen_tps, 1),
+            e2e_tps=round(e2e_tps, 1),
             alpha=round(alpha, 1),
             accepted=drafts_accepted,
             attempted=drafts_attempted,
         ))
         logger.info(
-            "[RESULT] Run %d/%d: %d tokens in %.2fs (%.1f t/s) alpha=%.1f%% (%d/%d)",
-            run + 1, RUNS, len(tokens), elapsed, tps, alpha, drafts_accepted, drafts_attempted,
+            "[RESULT] Run %d/%d: %d tokens in %.2fs (gen=%.1f t/s, e2e=%.1f t/s, ttft=%.2fs) alpha=%.1f%% (%d/%d)",
+            run + 1, RUNS, len(tokens) + 1, elapsed_total, gen_tps, e2e_tps, ttft, alpha, drafts_accepted, drafts_attempted,
         )
 
-    avg_tps = sum(r["tps"] for r in results) / len(results)
+    avg_gen_tps = sum(r["gen_tps"] for r in results) / len(results)
+    avg_e2e_tps = sum(r["e2e_tps"] for r in results) / len(results)
     avg_alpha = sum(r["alpha"] for r in results) / len(results)
     logger.info(
-        "[RESULT] === %s AVERAGE: %.1f t/s, alpha=%.1f%% ===",
-        label.upper(), avg_tps, avg_alpha,
+        "[RESULT] === %s AVERAGE: gen=%.1f t/s, e2e=%.1f t/s, alpha=%.1f%% ===",
+        label.upper(), avg_gen_tps, avg_e2e_tps, avg_alpha,
     )
 
     output_path = PROJECT_ROOT / "benchmarks" / f"mtp_bench_{label}.json"
@@ -156,9 +165,10 @@ def bench_mtp(model, tokenizer, label: str = "current", prompt: str = PROMPT_SHO
     with open(output_path, "w") as f:
         json.dump(dict(label=label, model=MODEL_PATH, prompt_tokens=len(prompt_tokens),
                        max_tokens=MAX_TOKENS, runs=results,
-                       avg_tps=round(avg_tps, 1), avg_alpha=round(avg_alpha, 1)), f, indent=2)
+                       avg_gen_tps=round(avg_gen_tps, 1), avg_e2e_tps=round(avg_e2e_tps, 1),
+                       avg_alpha=round(avg_alpha, 1)), f, indent=2)
     logger.info("[DATA] Results saved to %s", output_path)
-    return avg_tps, avg_alpha
+    return avg_gen_tps, avg_alpha
 
 
 def bench_autoregressive(model, tokenizer, label: str = "autoregressive", prompt: str = PROMPT_SHORT):
@@ -172,26 +182,36 @@ def bench_autoregressive(model, tokenizer, label: str = "autoregressive", prompt
     for run in range(RUNS):
         tokens = []
         tic = time.perf_counter()
-        for resp in stream_generate(
-            model, tokenizer, PROMPT, max_tokens=MAX_TOKENS,
-        ):
-            tokens.append(resp.token)
-        elapsed = time.perf_counter() - tic
+        tic_gen = None
+        for n, resp in enumerate(stream_generate(
+            model, tokenizer, prompt, max_tokens=MAX_TOKENS,
+        )):
+            if n == 0:
+                ttft = time.perf_counter() - tic
+                tic_gen = time.perf_counter()
+            else:
+                tokens.append(resp.token)
+        elapsed_gen = time.perf_counter() - tic_gen if tic_gen else 0.001
+        elapsed_total = time.perf_counter() - tic
 
-        tps = len(tokens) / max(elapsed, 0.001)
-        results.append(dict(run=run + 1, tokens=len(tokens), elapsed_s=round(elapsed, 2), tps=round(tps, 1)))
-        logger.info("[RESULT] AR Run %d/%d: %d tokens in %.2fs (%.1f t/s)", run + 1, RUNS, len(tokens), elapsed, tps)
+        gen_tps = len(tokens) / max(elapsed_gen, 0.001)
+        e2e_tps = (len(tokens) + 1) / max(elapsed_total, 0.001)
+        results.append(dict(run=run + 1, tokens=len(tokens) + 1, ttft_s=round(ttft, 3), gen_tps=round(gen_tps, 1), e2e_tps=round(e2e_tps, 1)))
+        logger.info("[RESULT] AR Run %d/%d: %d tokens in %.2fs (gen=%.1f t/s, e2e=%.1f t/s, ttft=%.2fs)",
+                    run + 1, RUNS, len(tokens) + 1, elapsed_total, gen_tps, e2e_tps, ttft)
 
-    avg_tps = sum(r["tps"] for r in results) / len(results)
-    logger.info("[RESULT] === AUTOREGRESSIVE AVERAGE: %.1f t/s ===", avg_tps)
+    avg_gen_tps = sum(r["gen_tps"] for r in results) / len(results)
+    avg_e2e_tps = sum(r["e2e_tps"] for r in results) / len(results)
+    logger.info("[RESULT] === AUTOREGRESSIVE AVERAGE: gen=%.1f t/s, e2e=%.1f t/s ===", avg_gen_tps, avg_e2e_tps)
 
     output_path = PROJECT_ROOT / "benchmarks" / f"mtp_bench_{label}.json"
     output_path.parent.mkdir(exist_ok=True)
     with open(output_path, "w") as f:
         json.dump(dict(label=label, model=MODEL_PATH, prompt_tokens=len(prompt_tokens),
-                       max_tokens=MAX_TOKENS, runs=results, avg_tps=round(avg_tps, 1)), f, indent=2)
+                       max_tokens=MAX_TOKENS, runs=results,
+                       avg_gen_tps=round(avg_gen_tps, 1), avg_e2e_tps=round(avg_e2e_tps, 1)), f, indent=2)
     logger.info("[DATA] Results saved to %s", output_path)
-    return avg_tps
+    return avg_gen_tps
 
 
 if __name__ == "__main__":
