@@ -116,7 +116,16 @@ def _load_mtp_weights(paths: List[Path]) -> Dict[str, Any]:
         loaded = mx.load(str(path))
         for key, value in loaded.items():
             local_key = _strip_mtp_prefix(key) or key
-            mapped[local_key] = value
+            if local_key == "layers.0.mlp.experts.gate_up_proj":
+                mid = value.shape[-2] // 2
+                mapped["layers.0.mlp.switch_mlp.gate_proj.weight"] = value[..., :mid, :]
+                mapped["layers.0.mlp.switch_mlp.up_proj.weight"] = value[..., mid:, :]
+            elif local_key == "layers.0.mlp.experts.down_proj":
+                mapped["layers.0.mlp.switch_mlp.down_proj.weight"] = value
+            elif "norm" in local_key and value.ndim == 1 and value.min() < 0:
+                mapped[local_key] = value + 1.0
+            else:
+                mapped[local_key] = value
     logger.info("[DATA] ✓ Tensores MTP cargados: %d claves procesadas", len(mapped))
     return mapped
 
@@ -352,10 +361,12 @@ def inject_qwen3_5_mtp_support(
             inputs: mx.array,
             cache: Optional[List[Any]] = None,
             n_confirmed: int = 0,
+            logits_to_keep: Optional[int] = None,
         ) -> Tuple[mx.array, mx.array]:
             """
-            Ejecuta el forward del trunk extrayendo pre_norm de forma 100% thread-safe.
+            Ejecuta el forward del trunk extrayendo hidden states de forma 100% thread-safe.
             Soporta n_confirmed > 0 para snapshot de estado SSM/conv en rollback.
+            logits_to_keep: None=todos, 0=ninguno (solo hidden), 1=última posición.
             """
             inner = self.model  # Qwen3_5TextModel
             hidden_states = inner.embed_tokens(inputs)
@@ -370,12 +381,15 @@ def inject_qwen3_5_mtp_support(
                 mask = ssm_mask if layer.is_linear else fa_mask
                 hidden_states = layer(hidden_states, mask=mask, cache=c, n_confirmed=n_confirmed)
 
-            # pre_norm es el estado sin normalizar antes de la norma final
-            pre_norm = hidden_states
-            # post_norm aplica la norma inmutable de la instancia
-            post_norm = inner.norm(pre_norm)
-            logits = self._lm_logits(post_norm)
-            return logits, pre_norm
+            # post_norm: estado normalizado que el cabezal MTP espera (contrato Qwen3.5)
+            post_norm = inner.norm(hidden_states)
+            if logits_to_keep == 0:
+                return None, post_norm
+            if logits_to_keep is not None:
+                logits = self._lm_logits(post_norm[:, -logits_to_keep:])
+            else:
+                logits = self._lm_logits(post_norm)
+            return logits, post_norm
 
         def mtp_forward(
             self,
@@ -384,6 +398,7 @@ def inject_qwen3_5_mtp_support(
             cache: Optional[Any] = None,
             mtp_cache: Optional[Any] = None,
             return_hidden: bool = False,
+            logits_to_keep: Optional[int] = None,
         ) -> mx.array | Tuple[mx.array, mx.array]:
             layer_cache = mtp_cache if mtp_cache is not None else cache
             if isinstance(layer_cache, list):
@@ -401,7 +416,13 @@ def inject_qwen3_5_mtp_support(
             hidden = self.mtp.layers[0](mixed, mask=mask, cache=layer_cache)
 
             # 4. Proyección final a logits de vocabulario
-            logits = self._lm_logits(self.mtp.norm(hidden))
+            if logits_to_keep == 0:
+                return None if not return_hidden else (None, hidden)
+            normed = self.mtp.norm(hidden)
+            if logits_to_keep is not None:
+                logits = self._lm_logits(normed[:, -logits_to_keep:])
+            else:
+                logits = self._lm_logits(normed)
 
             if not return_hidden:
                 return logits

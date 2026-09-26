@@ -168,6 +168,7 @@ class MTPSpeculativeEngine:
         adaptive_temperature: bool = False,
         tokenizer: Optional[Any] = None,
         on_token_callback: Optional[Any] = None,
+        prefill_step_size: int = 512,
     ) -> None:
         self.model = model
         self.temperature = temperature
@@ -178,6 +179,7 @@ class MTPSpeculativeEngine:
         self.adaptive_temperature = adaptive_temperature
         self.tokenizer = tokenizer
         self._on_token_callback = on_token_callback
+        self.prefill_step_size = prefill_step_size
         logger.info(
             "[CONFIG] MTPSpeculativeEngine inicializado: temp=%.2f, top_p=%.2f, min_p=%.2f, top_k=%d, adaptive_temp=%s",
             self.temperature,
@@ -319,12 +321,36 @@ class MTPSpeculativeEngine:
         if mtp_cache is None:
             mtp_cache = self.model.make_mtp_cache()
 
-        # 2. Prefill inicial del prompt
+        # 2. Prefill del prompt: trunk + cabezal MTP sincronizados por bloques.
+        # El cabezal MTP necesita los pares (hidden[i], token[i+1]) del prompt
+        # para tener contexto de atención. Sin esto, su attention está vacía.
         if prompt_tokens.ndim == 1:
             prompt_tokens = prompt_tokens[None]
 
-        logits, pre_norm = self.model.forward_with_hidden(prompt_tokens, cache=cache)
-        mx.eval(logits, pre_norm)
+        previous_hidden = None
+        for offset in range(0, prompt_tokens.shape[1], self.prefill_step_size):
+            chunk = prompt_tokens[:, offset:offset + self.prefill_step_size]
+            is_last_chunk = (offset + chunk.shape[1] == prompt_tokens.shape[1])
+            logits, hidden = self.model.forward_with_hidden(
+                chunk, cache=cache, logits_to_keep=1 if is_last_chunk else 0)
+
+            # Alimentar pares (hidden[i], token[i+1]) al cabezal MTP
+            if previous_hidden is not None:
+                head_hidden = mx.concatenate([previous_hidden, hidden[:, :-1]], axis=1)
+                head_tokens = chunk
+            else:
+                head_hidden = hidden[:, :-1]
+                head_tokens = chunk[:, 1:]
+
+            if head_tokens.size:
+                self.model.mtp_forward(
+                    head_hidden, head_tokens, mtp_cache=mtp_cache, logits_to_keep=0)
+
+            mx.eval(hidden, [c.state for c in cache],
+                    [c.state for c in mtp_cache if getattr(c, "offset", 0) > 0])
+            previous_hidden = hidden[:, -1:]
+
+        pre_norm = previous_hidden
 
         curr_temp, curr_top_p, curr_min_p, curr_top_k = self._get_sampling_params()
         token_t1, _ = _sample_token(
@@ -416,7 +442,6 @@ class MTPSpeculativeEngine:
                 cache=cache,
                 n_confirmed=1,
             )
-            mx.eval(target_logits, hidden)
 
             verify_logits = target_logits[0, 0]
             bonus_logits = target_logits[0, 1]
@@ -488,14 +513,22 @@ class MTPSpeculativeEngine:
                 if tokens_generated >= max_tokens:
                     break
 
-                # Siguiente ciclo: el estado oculto confirmado para el MTP es la posición 1 (draft_tok)
+                # Siguiente ciclo: alimentar ambos pares al MTP head para mantener coherencia posicional.
+                # Par 1: (hidden_confirmed, draft_tok) — solo actualiza cache, sin proyectar a vocab.
+                hidden_at_confirmed = hidden[:, 0:1, :]
+                self.model.mtp_forward(
+                    hidden_at_confirmed,
+                    mx.array([[draft_tok]]),
+                    mtp_cache=mtp_cache,
+                    logits_to_keep=0,
+                )
+                # Par 2: (hidden_draft, bonus_tok) — genera el siguiente draft.
                 hidden_at_draft = hidden[:, 1:2, :]
                 mtp_logits = self.model.mtp_forward(
                     hidden_at_draft,
                     mx.array([[bonus_tok]]),
                     mtp_cache=mtp_cache,
                 )
-                mx.eval(mtp_logits)
                 next_temp, next_top_p, next_min_p, next_top_k = self._get_sampling_params()
                 next_draft_tok, q2_probs = _sample_token(
                     mtp_logits[0, -1],
@@ -537,7 +570,6 @@ class MTPSpeculativeEngine:
                     mx.array([[committed_token]]),
                     mtp_cache=mtp_cache,
                 )
-                mx.eval(mtp_logits)
                 next_temp, next_top_p, next_min_p, next_top_k = self._get_sampling_params()
                 next_draft_tok, q2_probs = _sample_token(
                     mtp_logits[0, -1],
