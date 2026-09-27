@@ -86,7 +86,7 @@ SSoT: server.py es la única fuente de verdad (SSoT) para la ejecución de infer
 
   Persistence (DPC):
     CACHE_PERSIST_PATH              ("")        Disk path for MAIN cache
-    EMBEDDED_CACHE_PERSIST_PATH     ("")        Disk path for COMPACT cache
+    (EMBEDDED_CACHE_PERSIST_PATH removed — COMPACT cache eliminated in FASE-C1)
 
   Memory:
     MEMORY_GUARD_THRESHOLD_GB       (auto)      total_ram - 8GB (0 = disabled)
@@ -96,32 +96,27 @@ SSoT: server.py es la única fuente de verdad (SSoT) para la ejecución de infer
 ─── MEMORY BUDGET (24GB M4 Pro) ──────────────────────────────────────────────
 
     Model Qwen3.5-9B-4bit:    ~5.0 GB
-    2 MAIN KV entries:        ~9.0 GB  (2 × 4.5GB)
-    1 COMPACT KV entry:       ~4.5 GB
+    2 MAIN KV entries:        ~9.0 GB  (2 x 4.5GB)
     Scratch prefill:          ~5.0 GB
     ──────────────────────────────────
-    Peak total:               ~23.5 GB → safe with Memory Guard at 19.2GB
-    Concurrent agents:        1–2 with warm cache
+    Peak total:               ~19.0 GB → safe with Memory Guard at 19.2GB
+    Concurrent agents:        1-2 with warm cache
 
 ─── ARCHITECTURE ─────────────────────────────────────────────────────────────
 
-  OpenClaw / Claude Code ──→ LiteLLM Proxy :4000 ──→ MLX Engine :8080
-                                                        │
-                                _is_embedded_agent = False (OpenClaw removed)
-                                 │              │
-                           MAIN path       COMPACT path
-                                 │              │
-                          PROMPT_CACHE    PROMPT_CACHE_COMPACT
-                           (LRU max=2)      (LRU max=1)
-                                 │              │
-                          ┌──────┴──────┐       │
-                          │Memory Guard │       │
-                          │(Metal RAM)  │       │
-                          └──────┬──────┘       │
-                                 ↓              ↓
-                              stream_generate(model, prompt_cache=...)
-                                                 ▲
-  External tools ──→ Sidecar :8081 ──────────────┘
+  Claude Code ──→ MLX Engine :8080
+                       │
+                  PROMPT_CACHE
+                   (LRU max=2)
+                       │
+                 ┌─────┴─────┐
+                 │Mem Guard   │
+                 │(Metal RAM) │
+                 └─────┬─────┘
+                       ↓
+                    stream_generate(model, prompt_cache=...)
+                                      ▲
+  External tools ──→ Sidecar :8081 ───┘
                      (ephemeral cache, optional RAG, same model_lock)
 """
 import os
@@ -764,7 +759,6 @@ def _memory_guard_pre_prefill(request_id: str = "") -> int:
         # Step 2: Evict KV cache entries
         with prompt_cache_lock:
             evicted += PROMPT_CACHE.evict_unpinned()
-            evicted += PROMPT_CACHE_COMPACT.evict_unpinned()
         _guard.force_clear_cache("memory_guard_eviction")
         post_bytes = get_mem()
         if FEATURE_FULL_LOGGING:
@@ -1495,13 +1489,6 @@ PROMPT_CACHE = LRUPromptCache(
     ttl_seconds=SETTINGS.prompt_cache_ttl_seconds,
 )
 
-# KRIPPER DUAL-SLOT: LRU dedicado para el compact runner de OpenClaw.
-# Isolado de PROMPT_CACHE para que nunca evicte el slot MAIN.
-# max_size=1: compact generates a one-shot summary, no history needed.
-PROMPT_CACHE_COMPACT = LRUPromptCache(
-    max_size=1,
-    ttl_seconds=SETTINGS.prompt_cache_ttl_seconds,
-)
 
 # Last tools list and system body from a MAIN (non-compact) request.
 # Used by _prewarm_post_compact to build canonical cache keys that match
@@ -2210,7 +2197,7 @@ _GPU_YIELD_SECONDS = float(os.environ.get("GPU_YIELD_MS", "0")) / 1000.0
 
 
 
-def _pre_prefill_memory_relief(request_id: str, rest_count: int, is_embedded_agent: bool = False) -> None:
+def _pre_prefill_memory_relief(request_id: str, rest_count: int) -> None:
     """Free OS and Metal memory before large prefills to reduce peak pressure.
 
     Delegates memory relief to metal_memory_guard (SSoT).
@@ -2220,7 +2207,7 @@ def _pre_prefill_memory_relief(request_id: str, rest_count: int, is_embedded_age
     _guard.pre_prefill_gate(rest_count, kv_bits=SETTINGS.kv_bits, request_id=request_id)
 
     # Expert Breathing: contract experts for large MAIN prefills (delegated to expert_cache)
-    if not is_embedded_agent and rest_count >= _BREATHE_DOWN_REST_THRESHOLD:
+    if rest_count >= _BREATHE_DOWN_REST_THRESHOLD:
         try:
             from .expert_cache import moe_pre_prefill_hook
             moe_pre_prefill_hook(
@@ -2486,7 +2473,6 @@ def _prewarm_post_compact(
     # 5. Evict dead MAIN + COMPACT caches, insert with canonical key
     with prompt_cache_lock:
         PROMPT_CACHE.evict_unpinned()
-        PROMPT_CACHE_COMPACT.evict_unpinned()
         PROMPT_CACHE.insert_cache(SETTINGS.model_path, canonical_key, new_cache)
 
     _guard.force_clear_cache("post_compact_warmup")
@@ -2513,7 +2499,6 @@ def _post_generation_cache_update(
     matched_prefix_len: int,
     session_ctx: Any,
     session_id_for_turn: str,
-    is_embedded_agent: bool,
     hybrid_checkpoint: Optional[HybridGenerationCheckpoint] = None,
     skip_cache_store: bool = False,
     housekeeping_pre_snapshot: Optional[Dict] = None,
@@ -2675,43 +2660,26 @@ def _post_generation_cache_update(
                 pass
 
 
-    if not is_embedded_agent:
-        # MAIN: any first-turn request with enough tokens qualifies for warmup save.
-        # The old _STARTUP_MSG_PATTERN required phrases like "/new" or "session startup"
-        # that Claude Code never sends — so warmup_cache.safetensors was never created.
-        # Now: messages==2 (first turn) AND no cache on disk yet (or hash invalidated).
-        # The 5000-token guard in _insert_cache_entries still filters noise.
-        _is_real_startup = (
-            len(messages) == 2
-            and not _DPC.disk_cache_saved
-        )
-        _insert_cache_entries(
-            model_name=SETTINGS.model_path,
-            session_ctx=session_ctx,
-            cache_key=cache_key,
-            prompt_cache=prompt_cache,
-            generated_tokens=generated_tokens,
-            tool_calls=tool_calls,
-            cache_hit_ratio=_cache_hit_ratio,
-            is_warmup_candidate=_is_real_startup,
-        )
-    else:
-        # COMPACT RUNNER: insert into isolated PROMPT_CACHE_COMPACT
-        _insert_cache_entries(
-            model_name=SETTINGS.model_path,
-            session_ctx=session_ctx,
-            cache_key=cache_key,
-            prompt_cache=prompt_cache,
-            generated_tokens=generated_tokens,
-            tool_calls=tool_calls,
-            cache_hit_ratio=_cache_hit_ratio,
-            prompt_cache_store_override=PROMPT_CACHE_COMPACT,
-        )
-        if FEATURE_FULL_LOGGING:
-            _pipeline_log("CACHE", request_id,
-                f"COMPACT_RUNNER: inserted into PROMPT_CACHE_COMPACT | "
-                f"MAIN cache slots preserved: {len(PROMPT_CACHE._entries)}")
-
+    # MAIN path (always — compact runner removed in FASE-C1)
+    # MAIN: any first-turn request with enough tokens qualifies for warmup save.
+    # The old _STARTUP_MSG_PATTERN required phrases like "/new" or "session startup"
+    # that Claude Code never sends — so warmup_cache.safetensors was never created.
+    # Now: messages==2 (first turn) AND no cache on disk yet (or hash invalidated).
+    # The 5000-token guard in _insert_cache_entries still filters noise.
+    _is_real_startup = (
+        len(messages) == 2
+        and not _DPC.disk_cache_saved
+    )
+    _insert_cache_entries(
+        model_name=SETTINGS.model_path,
+        session_ctx=session_ctx,
+        cache_key=cache_key,
+        prompt_cache=prompt_cache,
+        generated_tokens=generated_tokens,
+        tool_calls=tool_calls,
+        cache_hit_ratio=_cache_hit_ratio,
+        is_warmup_candidate=_is_real_startup,
+    )
     # M5: Update session turn record for next-turn stable-prefix lookup
     if session_id_for_turn:
         _update_session_turn_store(session_id_for_turn, messages, prompt_tokens)
@@ -2752,7 +2720,6 @@ def _log_generation_telemetry(
     tool_calls: Optional[List],
     enable_thinking: bool,
     finish_reason: str,
-    is_embedded_agent: bool,
     timing: Dict[str, Any],
     thinking_token_count: Optional[int] = None,
 ) -> None:
@@ -2797,7 +2764,7 @@ def _log_generation_telemetry(
                 f"think_block_stripped=true ({_reas} tokens hidden from client)")
         _pipeline_log("RESP", request_id,
             f"message_to_client={_non_reas} tokens | finish_reason={finish_reason}")
-        _agent_tag_out = "EMBEDDED" if is_embedded_agent else "MAIN"
+        _agent_tag_out = "MAIN"
         if tool_calls:
             for _tc in tool_calls:
                 _tc_name = _tc.get("function", {}).get("name", "?")
@@ -2947,7 +2914,6 @@ def _insert_cache_entries(
 
     # ── AUTO-SAVE MAIN CACHE TO DISK ──────────────────────────────────────────
     _active_store = prompt_cache_store_override if prompt_cache_store_override is not None else PROMPT_CACHE
-    _is_compact_save = (prompt_cache_store_override is PROMPT_CACHE_COMPACT)
 
     if _is_compact_save:
         # ── AUTO-SAVE EMBEDDED/COMPACT CACHE ──────────────────────────────
@@ -4942,12 +4908,7 @@ class APIHandler(BaseHTTPRequestHandler):
 
         tools = body.get("tools")
 
-        # DUAL-SLOT: _is_embedded_agent hardcoded False (OpenClaw removed).
-        # OpenClaw compact runner detection removed — OpenClaw no longer in use.
-        # _is_embedded_agent kept as False for the ~40 downstream branches
-        # that still reference it. Full cleanup deferred to modularization pass.
         _raw_messages_for_detect = body.get("messages", [])
-        _is_embedded_agent = False
 
         _is_housekeeping = _is_hermes_housekeeping_request(_raw_messages_for_detect)
         _is_compact = bool(body.pop("_supermlx_compact", False))
@@ -5024,7 +4985,7 @@ class APIHandler(BaseHTTPRequestHandler):
                           "stream": body.get("stream", False), "model": body.get("model", "?"),
                           "enable_thinking": enable_thinking})
             # ── PIPELINE LOG: MSG_IN ──────────────────────────────────────────
-            _agent_tag = "EMBEDDED" if _is_embedded_agent else "MAIN"
+            "MAIN"
             _msg_in_content = None
             _msg_in_source = "user"
             for _m in reversed(raw_messages_inbound):
@@ -5156,7 +5117,7 @@ class APIHandler(BaseHTTPRequestHandler):
             # KRIPPER FASE 3: Guard — never compress compact runner requests.
             # The compact runner sends the full session history intentionally;
             # compressing it would corrupt the summary output.
-            if _compressor_available and FEATURE_COMPRESSOR and not _is_embedded_agent and not self._is_anthropic:
+            if _compressor_available and FEATURE_COMPRESSOR and not self._is_anthropic:
                 _pre_compress_count = len(raw_messages)
                 _pre_compress_est = _estimate_token_count(raw_messages)
                 try:
@@ -5212,7 +5173,7 @@ class APIHandler(BaseHTTPRequestHandler):
             # pollute the summary with irrelevant codebase chunks.
             # FASE 4: Also skip RAG for memory flush, summarization, and other
             # lightweight internal operations that don't need domain context.
-            _skip_rag = _is_embedded_agent or _is_rag_bypass_request(raw_messages) or self._is_anthropic
+            _skip_rag = _is_rag_bypass_request(raw_messages) or self._is_anthropic
             _rag_meta = {"best_score": 999.0, "chunks_found": 0, "query_used": "", "search_ms": 0}
             if _rag_available and FEATURE_RAG_ENRICHMENT and not _skip_rag:
                 _rag_t0 = time.time()
@@ -5239,7 +5200,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     if FEATURE_FULL_LOGGING:
                         _pipeline_log("RAG", request_id, f"ERROR: {_re}")
             elif _skip_rag and FEATURE_FULL_LOGGING and FEATURE_LOG_RAG:
-                _reason = "compact_runner" if _is_embedded_agent else ("anthropic" if self._is_anthropic else "rag_bypass(flush/summarize)")
+                ("anthropic" if self._is_anthropic else "rag_bypass(flush/summarize)")
                 _pipeline_log("RAG", request_id, f"SKIPPED | reason={_reason}")
 
             # ── PIPELINE: CASCADE ROUTING ──────────────────────────────────
@@ -5250,7 +5211,7 @@ class APIHandler(BaseHTTPRequestHandler):
             _cascade_triggered = False
 
             if (FEATURE_CASCADE and CASCADE_API_URL and CASCADE_API_KEY
-                    and not _is_embedded_agent and not _skip_rag and not _block_cascade):
+                    and not _skip_rag and not _block_cascade):
                 _rag_best = _rag_meta.get("best_score", 999.0)
                 _rag_chunks = _rag_meta.get("chunks_found", 0)
                 _should_cascade = (
@@ -5484,28 +5445,25 @@ class APIHandler(BaseHTTPRequestHandler):
         # Compact runner (context compaction) needs short output.
         # Cap total budget to avoid wasting 35s on thinking for a summary.
         # Note: title generation is intercepted earlier by the NL fast path.
-        if _is_embedded_agent:
-            max_tokens = 256
         is_streaming = body.get("stream", False)
 
         # ── CONTEXT STATUS — unconditional, every turn ────────────────────
-        if not _is_embedded_agent:
-            _ctx_total = len(model_tokens)
-            _ctx_max = SETTINGS.max_kv_size
-            _ctx_pct = (_ctx_total / max(1, _ctx_max)) * 100
-            _ctx_headroom = max(0, _ctx_max - _ctx_total)
-            _ctx_ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-            _ctx_line = (
-                f"  📊 [CONTEXT STATUS] {_ctx_ts} req={request_id[:8]} | "
-                f"context={_ctx_total}/{_ctx_max} ({_ctx_pct:.1f}%) | "
-                f"output_budget={max_tokens} | headroom={_ctx_headroom}"
-            )
-            if _ctx_pct >= 50:
-                _ctx_line = f"{_ANSI_RED}{_ctx_line}{_ANSI_RESET}"
-            else:
-                _ctx_line = f"{_ANSI_YELLOW}{_ctx_line}{_ANSI_RESET}"
-            with console_lock:
-                _console_emit(_ctx_line)
+        _ctx_total = len(model_tokens)
+        _ctx_max = SETTINGS.max_kv_size
+        _ctx_pct = (_ctx_total / max(1, _ctx_max)) * 100
+        _ctx_headroom = max(0, _ctx_max - _ctx_total)
+        _ctx_ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        _ctx_line = (
+            f"  📊 [CONTEXT STATUS] {_ctx_ts} req={request_id[:8]} | "
+            f"context={_ctx_total}/{_ctx_max} ({_ctx_pct:.1f}%) | "
+            f"output_budget={max_tokens} | headroom={_ctx_headroom}"
+        )
+        if _ctx_pct >= 50:
+            _ctx_line = f"{_ANSI_RED}{_ctx_line}{_ANSI_RESET}"
+        else:
+            _ctx_line = f"{_ANSI_YELLOW}{_ctx_line}{_ANSI_RESET}"
+        with console_lock:
+            _console_emit(_ctx_line)
 
         acquired = False
         generated_tokens = []
@@ -5532,19 +5490,14 @@ class APIHandler(BaseHTTPRequestHandler):
             wait_seconds = generation_started_at - queue_started_at
             with prompt_cache_lock:
                 # KRIPPER DUAL-SLOT: Route to the correct LRU based on agent type.
-                # COMPACT runner → PROMPT_CACHE_COMPACT (isolated, max_size=1)
                 # MAIN agent    → PROMPT_CACHE         (HOT slot, never touched by compact)
                 # This replaces the old evict_unpinned() approach which destroyed MAIN
                 # cache before compact, causing 70-110s cold-starts on the next MAIN request.
-                _active_cache_store = PROMPT_CACHE_COMPACT if _is_embedded_agent else PROMPT_CACHE
+                PROMPT_CACHE
                 _mem_profiler.snapshot(request_id, "PRE_CACHE", is_anthropic=self._is_anthropic, prompt_tokens=len(prompt_tokens) if prompt_tokens else None, model_tokens=len(model_tokens) if model_tokens else None)
-                if _is_embedded_agent and FEATURE_FULL_LOGGING:
-                    _pipeline_log("CACHE", request_id,
-                        "COMPACT_RUNNER: using PROMPT_CACHE_COMPACT — MAIN cache untouched")
-
                 # --- M2: Compute stable prefix from message-level diff ---
                 _session_id_for_turn = (session_ctx.session_id or "").strip()
-                if _session_id_for_turn and not _is_embedded_agent:
+                if _session_id_for_turn:
                     (
                         stable_prefix_token_len_computed,
                         stable_prefix_msg_count_computed,
@@ -5971,10 +5924,7 @@ class APIHandler(BaseHTTPRequestHandler):
                                         else:
                                             # No trimmable layers — genuine cold start
                                             prompt_cache = None
-                                            if _is_embedded_agent:
-                                                PROMPT_CACHE_COMPACT.evict_unpinned()
-                                            else:
-                                                PROMPT_CACHE.evict_unpinned()
+                                            PROMPT_CACHE.evict_unpinned()
                                             import gc; gc.collect()
                                             rest_tokens = model_tokens
                                             _terminal_status("⚠️",
@@ -5983,10 +5933,7 @@ class APIHandler(BaseHTTPRequestHandler):
                                                 request_id=request_id, stage="WARN")
                                 elif _kv_off is not None and _kv_off > _HYBRID_WASH_KV_LIMIT:
                                     prompt_cache = None
-                                    if _is_embedded_agent:
-                                        PROMPT_CACHE_COMPACT.evict_unpinned()
-                                    else:
-                                        PROMPT_CACHE.evict_unpinned()
+                                    PROMPT_CACHE.evict_unpinned()
                                     import gc; gc.collect()
                                     rest_tokens = model_tokens
                                     _terminal_status("⚠️",
@@ -6005,10 +5952,7 @@ class APIHandler(BaseHTTPRequestHandler):
                                     # canonical_key, breaking the checkpoint invariant).
                                     # Cold start produces a clean cache with correct checkpoints.
                                     prompt_cache = None
-                                    if _is_embedded_agent:
-                                        PROMPT_CACHE_COMPACT.evict_unpinned()
-                                    else:
-                                        PROMPT_CACHE.evict_unpinned()
+                                    PROMPT_CACHE.evict_unpinned()
                                     import gc; gc.collect()
                                     rest_tokens = model_tokens
                                     _terminal_status("⚠️",
@@ -6031,10 +5975,7 @@ class APIHandler(BaseHTTPRequestHandler):
                                 if _current_hash != _stored_hash:
                                     # Model prefix diverged despite canonical match — cold start.
                                     prompt_cache = None
-                                    if _is_embedded_agent:
-                                        PROMPT_CACHE_COMPACT.evict_unpinned()
-                                    else:
-                                        PROMPT_CACHE.evict_unpinned()
+                                    PROMPT_CACHE.evict_unpinned()
                                     import gc; gc.collect()
                                     rest_tokens = model_tokens
                                     _terminal_status("⚠️",
@@ -6093,7 +6034,7 @@ class APIHandler(BaseHTTPRequestHandler):
             # -----------------------
 
             # ── CAPTURE TOOLS + SYSTEM for post-compact pre-warmup ────────
-            if not _is_embedded_agent and tools:
+            if tools:
                 global _LAST_MAIN_TOOLS, _LAST_MAIN_SYSTEM_BODY
                 _LAST_MAIN_TOOLS = tools
                 for _m in messages:
@@ -6125,8 +6066,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 # Only for MAIN agent requests with tools (not compact runner).
                 _tpc_injected = False
                 if (
-                    not _is_embedded_agent
-                    and tools
+                    tools
                     and not is_vlm
                     and _tpc.is_configured()
                 ):
@@ -6391,7 +6331,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     self.send_header("X-Pipeline-Heal-Ms", f"{_pipeline_timings.get('heal', 0):.1f}")
                 self.end_headers()
 
-                _pre_prefill_memory_relief(request_id, rest_count, is_embedded_agent=_is_embedded_agent)
+                _pre_prefill_memory_relief(request_id, rest_count)
 
                 # Housekeeping Split-Prefill: advance and commit clean conversation history to PROMPT_CACHE
                 if (
@@ -6436,7 +6376,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 generated_parts = []
                 # ThinkingTracker: reset for this request (SSoT)
                 _thinking_tracker.reset(enable_thinking=enable_thinking)
-                _max_thinking_ns = 128 if _is_embedded_agent else SETTINGS.max_thinking_tokens
+                SETTINGS.max_thinking_tokens
                 progress_last_at = time.time()
 
                 from .sampling import DynamicTaskDetector
@@ -6626,7 +6566,6 @@ class APIHandler(BaseHTTPRequestHandler):
                         matched_prefix_len=matched_prefix_len,
                         session_ctx=session_ctx,
                         session_id_for_turn=_session_id_for_turn,
-                        is_embedded_agent=_is_embedded_agent,
                         hybrid_checkpoint=hybrid_generation_checkpoint,
                         skip_cache_store=_is_housekeeping,
                         housekeeping_pre_snapshot=_housekeeping_pre_snapshot,
@@ -6639,24 +6578,10 @@ class APIHandler(BaseHTTPRequestHandler):
                 # with the summary so the next request doesn't cold-start 50K tokens.
                 # Guard: skip if MAIN already has a warm cache larger than TPC —
                 # title/slug generators are classified as compact runners but don't
-                # invalidate MAIN (they run in PROMPT_CACHE_COMPACT).
                 _main_max_len = max(
                     (len(e.tokens) for e in PROMPT_CACHE._entries.values()), default=0
                 ) if PROMPT_CACHE._entries else 0
                 _tpc_len = len(_tpc._prefix_tokens) if _tpc.is_initialized() else 0
-                if _is_embedded_agent and message_text and len(message_text) > 100 and _main_max_len <= _tpc_len:
-                    try:
-                        _prewarm_post_compact(
-                            summary_text=message_text,
-                            messages=messages,
-                            request_id=request_id,
-                        )
-                    except Exception as _pw_err:
-                        _terminal_status("⚠️",
-                            f"POST-COMPACT PRE-WARMUP failed: {_pw_err} | req={request_id[:8]}")
-
-
-
                 if _frozen_summary:
                     message_text = f"{_frozen_summary}\n\n---\n\n{message_text}"
 
@@ -6714,7 +6639,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     _log_generation_telemetry(
                         request_id, generation_started_at, generated_tokens,
                         message_text, tool_calls, enable_thinking, finish_reason,
-                        _is_embedded_agent, timing,
+                        timing,
                         thinking_token_count=_thinking_tracker.thinking_count if enable_thinking else None,
                     )
             else:
@@ -6735,7 +6660,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 # ThinkingTracker: reset for this request (SSoT)
                 _thinking_tracker.reset(enable_thinking=enable_thinking)
                 _tool_call_tracker = ToolCallTracker()  # Fresh tracker per request
-                _max_thinking = 128 if _is_embedded_agent else SETTINGS.max_thinking_tokens  # 0=unlimited
+                SETTINGS.max_thinking_tokens  # 0=unlimited
                 if _anthropic_streaming:
                     _msg_id = f"msg_{uuid.uuid4().hex[:24]}"
                     _msg_start = _sse_event("message_start", {
@@ -6835,7 +6760,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 )
                 _keepalive_thread.start()
 
-                _pre_prefill_memory_relief(request_id, rest_count, is_embedded_agent=_is_embedded_agent)
+                _pre_prefill_memory_relief(request_id, rest_count)
 
                 # Housekeeping Split-Prefill: advance and commit clean conversation history to PROMPT_CACHE
                 if (
@@ -7440,7 +7365,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     _log_generation_telemetry(
                         request_id, generation_started_at, generated_tokens,
                         message_text, tool_calls, enable_thinking, finish_reason,
-                        _is_embedded_agent, timing,
+                        timing,
                         thinking_token_count=_thinking_tracker.thinking_count if enable_thinking else None,
                     )
 
@@ -7473,7 +7398,6 @@ class APIHandler(BaseHTTPRequestHandler):
                         matched_prefix_len=matched_prefix_len,
                         session_ctx=session_ctx,
                         session_id_for_turn=_session_id_for_turn,
-                        is_embedded_agent=_is_embedded_agent,
                         hybrid_checkpoint=hybrid_generation_checkpoint,
                         skip_cache_store=_is_housekeeping,
                         housekeeping_pre_snapshot=_housekeeping_pre_snapshot,
@@ -7489,17 +7413,6 @@ class APIHandler(BaseHTTPRequestHandler):
                     (len(e.tokens) for e in PROMPT_CACHE._entries.values()), default=0
                 ) if PROMPT_CACHE._entries else 0
                 _tpc_len = len(_tpc._prefix_tokens) if _tpc.is_initialized() else 0
-                if _is_embedded_agent and message_text and len(message_text) > 100 and _main_max_len <= _tpc_len:
-                    try:
-                        _prewarm_post_compact(
-                            summary_text=message_text,
-                            messages=messages,
-                            request_id=request_id,
-                        )
-                    except Exception as _pw_err:
-                        _terminal_status("⚠️",
-                            f"POST-COMPACT PRE-WARMUP failed: {_pw_err} | req={request_id[:8]}")
-
         except BrokenPipeError:
             _terminal_status(
                 "⚠️",
@@ -7535,7 +7448,6 @@ class APIHandler(BaseHTTPRequestHandler):
                             matched_prefix_len=matched_prefix_len,
                             session_ctx=session_ctx,
                             session_id_for_turn=_session_id_for_turn,
-                            is_embedded_agent=_is_embedded_agent,
                             hybrid_checkpoint=hybrid_generation_checkpoint,
                         )
                     _terminal_status(
@@ -7674,15 +7586,13 @@ class APIHandler(BaseHTTPRequestHandler):
             # "uncommitted encoder" crash), finally may not run, so the "leaked semaphore" warning
             # at shutdown is expected; fixing the Metal crash resolves it.
             if acquired:
-                # KRIPPER DUAL-SLOT: compact runner's KV cache is stored in PROMPT_CACHE_COMPACT
                 # (not released). No need to null-out prompt_cache here — the LRU manages it.
                 # MAIN cache is always untouched.
 
                 _mem_profiler.snapshot(request_id, "POST_GENERATION", is_anthropic=self._is_anthropic, rest_tokens=rest_count if 'rest_count' in dir() else None, output_tokens=output_tokens if 'output_tokens' in dir() else None, kv_cache_offset=_kv_off if '_kv_off' in dir() else None)
                 _guard.post_request_cleanup(request_id)
                 if FEATURE_FULL_LOGGING:
-                    _pipeline_log("METAL", request_id, f"post_request_cleanup via guard"
-                        f"{' | COMPACT slot retained in PROMPT_CACHE_COMPACT' if _is_embedded_agent else ''}")
+                    _pipeline_log("METAL", request_id, f"post_request_cleanup via guard")
                     if generation_started_at is not None:
                         _held_ms = (time.time() - generation_started_at) * 1000
                         _pipeline_log("METAL", request_id, f"model_lock released | held_for={_held_ms/1000:.2f}s")
