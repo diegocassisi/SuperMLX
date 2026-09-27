@@ -4793,7 +4793,7 @@ class APIHandler(BaseHTTPRequestHandler):
                           "stream": body.get("stream", False), "model": body.get("model", "?"),
                           "enable_thinking": enable_thinking})
             # ── PIPELINE LOG: MSG_IN ──────────────────────────────────────────
-            "MAIN"
+            _agent_tag = "MAIN"
             _msg_in_content = None
             _msg_in_source = "user"
             for _m in reversed(raw_messages_inbound):
@@ -5008,7 +5008,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     if FEATURE_FULL_LOGGING:
                         _pipeline_log("RAG", request_id, f"ERROR: {_re}")
             elif _skip_rag and FEATURE_FULL_LOGGING and FEATURE_LOG_RAG:
-                ("anthropic" if self._is_anthropic else "rag_bypass(flush/summarize)")
+                _reason = ("anthropic" if self._is_anthropic else "rag_bypass(flush/summarize)")
                 _pipeline_log("RAG", request_id, f"SKIPPED | reason={_reason}")
 
             # ── PIPELINE: CASCADE ROUTING ──────────────────────────────────
@@ -5301,7 +5301,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 # MAIN agent    → PROMPT_CACHE         (HOT slot, never touched by compact)
                 # This replaces the old evict_unpinned() approach which destroyed MAIN
                 # cache before compact, causing 70-110s cold-starts on the next MAIN request.
-                PROMPT_CACHE
+                _active_cache_store = PROMPT_CACHE
                 _mem_profiler.snapshot(request_id, "PRE_CACHE", is_anthropic=self._is_anthropic, prompt_tokens=len(prompt_tokens) if prompt_tokens else None, model_tokens=len(model_tokens) if model_tokens else None)
                 # --- M2: Compute stable prefix from message-level diff ---
                 _session_id_for_turn = (session_ctx.session_id or "").strip()
@@ -6184,7 +6184,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 generated_parts = []
                 # ThinkingTracker: reset for this request (SSoT)
                 _thinking_tracker.reset(enable_thinking=enable_thinking)
-                SETTINGS.max_thinking_tokens
+                _max_thinking_ns = SETTINGS.max_thinking_tokens
                 progress_last_at = time.time()
 
                 from .sampling import DynamicTaskDetector
@@ -6468,7 +6468,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 # ThinkingTracker: reset for this request (SSoT)
                 _thinking_tracker.reset(enable_thinking=enable_thinking)
                 _tool_call_tracker = ToolCallTracker()  # Fresh tracker per request
-                SETTINGS.max_thinking_tokens  # 0=unlimited
+                _max_thinking = SETTINGS.max_thinking_tokens  # 0=unlimited
                 if _anthropic_streaming:
                     _msg_id = f"msg_{uuid.uuid4().hex[:24]}"
                     _msg_start = _sse_event("message_start", {
