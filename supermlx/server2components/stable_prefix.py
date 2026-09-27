@@ -58,7 +58,7 @@ class _SessionTurnRecord:
 # Global store: session_id -> _SessionTurnRecord
 # Protected by prompt_cache_lock (same lock used for PROMPT_CACHE).
 SESSION_TURN_STORE: Dict[str, _SessionTurnRecord] = {}
-_max_idle_seconds: int = SETTINGS.prompt_cache_session_max_idle_seconds
+_max_idle_seconds: int = 1800  # default; overridden by init()
 
 
 def _normalize_message_content_for_diff(msg: Dict[str, Any]) -> str:
