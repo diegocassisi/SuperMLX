@@ -72,7 +72,13 @@ class RadixPromptCache:
     def total_tokens(self) -> int:
         return self._total_tokens
 
-    def match_prefix(self, tokens: list[int], slot: str = "main") -> tuple[list[int], Any]:
+    def match_prefix(
+        self,
+        tokens: list[int],
+        slot: str = "main",
+        min_match_ratio: float = 0.05,
+        min_match_tokens: int = 16,
+    ) -> tuple[list[int], Any]:
         """
         Recorre el árbol correspondiente a 'slot' y devuelve:
         (matched_prefix_tokens, kv_cache_del_nodo_mas_profundo_con_kv).
@@ -80,7 +86,14 @@ class RadixPromptCache:
         Si ocurre un match parcial dentro de un nodo (shared < len(child.tokens)),
         realiza el split del nodo en el acto, permitiendo bifurcaciones futuras
         sin degradar a rest_count completo.
+
+        Aplica dos guards críticos para prevenir contaminación KV:
+        1. Content verification: comprueba token por token que matched == tokens[:len(matched)].
+        2. Prefix-match-ratio guard: descarta matches con ratio < 5% en prompts de tamaño >= min_match_tokens.
         """
+        if not tokens:
+            return [], None
+
         node = self.get_root(slot)
         matched: list[int] = []
         best_kv = None
@@ -109,6 +122,25 @@ class RadixPromptCache:
 
             remaining = remaining[shared:]
             node = child
+
+        # ── GUARD 1: Verificación estricta de contenido real de tokens ──
+        if matched and tokens[: len(matched)] != matched:
+            logger.error(
+                "[RADIX CONTAMINATION GUARD] Divergencia detectada: tokens de cache no coinciden con prompt real!"
+            )
+            return [], None
+
+        # ── GUARD 2: Prefix-match-ratio guard (portado de cache_lru.py) ──
+        # Evita atar el KV a prefijos triviales (< 5%) en prompts largos.
+        if matched and len(tokens) >= min_match_tokens:
+            match_ratio = len(matched) / len(tokens)
+            if match_ratio < min_match_ratio:
+                logger.debug(
+                    "[RADIX GUARD] Match ratio trivial (%.3f < %.3f) — descartado como miss",
+                    match_ratio,
+                    min_match_ratio,
+                )
+                return [], None
 
         return matched, best_kv
 
