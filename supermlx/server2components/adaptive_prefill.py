@@ -26,6 +26,17 @@ try:
 except ImportError:
     mx = None
 
+
+def _metal_mem_str() -> str:
+    """Return a compact Metal memory status string. Best-effort, never raises."""
+    try:
+        active_gb = mx.get_active_memory() / 1e9
+        peak_gb = mx.get_peak_memory() / 1e9
+        cache_gb = mx.get_cache_memory() / 1e9
+        return f"metal={active_gb:.2f}GB peak={peak_gb:.2f}GB cache={cache_gb:.2f}GB"
+    except Exception:
+        return ""
+
 # ── Module-level state (set via init()) ──────────────────────────────────────
 _settings: Any = None
 _terminal_status: Optional[Callable] = None
