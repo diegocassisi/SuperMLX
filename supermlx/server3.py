@@ -415,6 +415,7 @@ FEATURE_HOUSEKEEPING_CACHE_BORROW = _env_bool("HOUSEKEEPING_CACHE_BORROW", True)
 # warmup_manager: disk I/O primitives for KV cache persistence (used by TPC + FIX-31 recovery).
 # TPC (tool_prefix_cache.py) is the SSoT for prefix caching.
 from . import warmup_manager as _wm
+from . import metal_memory_guard as _guard
 from .cache_engine import (
     HybridGenerationCheckpoint,
     capture_hybrid_generation_checkpoint,
