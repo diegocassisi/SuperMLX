@@ -135,6 +135,10 @@ import sys
 import shutil
 import signal
 import math
+import logging
+import traceback
+
+logger = logging.getLogger("supermlx.server3")
 from datetime import datetime
 # Overflow guard: reject requests that would exceed safe prefill limits (used by Compact Guard)
 _max_safe_prefill_tokens = int(os.environ.get("MAX_SAFE_PREFILL_TOKENS", "82192"))
@@ -1469,6 +1473,7 @@ tokenizer = None
 processor = None
 is_vlm = False
 vlm_config = None
+_thinking_tracker = None
 
 _terminal_status(
     "🚀",
@@ -2490,12 +2495,17 @@ class APIHandler(BaseHTTPRequestHandler):
         model_tokens = ctx.model_tokens or []
         prompt = ctx.prompt
         cache_key = ctx.cache_key or list(prompt_tokens)
+        raw_messages = ctx.raw_messages or []
         messages = ctx.canonical_messages or ctx.raw_messages
         tools = ctx.body.get("tools")
         enable_thinking = ctx.enable_thinking
         _is_compact = ctx.is_compact
         _is_ephemeral = ctx.is_ephemeral
         _is_housekeeping = ctx.is_housekeeping
+        _housekeeping_conv_model_boundary = ctx.housekeeping_conv_model_boundary
+        _housekeeping_conv_prompt_tokens = ctx.housekeeping_conv_prompt_tokens
+        _housekeeping_staging_hit = getattr(ctx, "housekeeping_staging_hit", False)
+        _pipeline_timings = ctx.pipeline_timings or {}
         _frozen_summary = str(ctx.body.get("_frozen_summary", "") or "")
         session_ctx = ctx.session_ctx
         _session_id_for_turn = ctx.session_id or ""
@@ -3578,7 +3588,7 @@ class APIHandler(BaseHTTPRequestHandler):
                             "args_keys": list(_aargs.keys()),
                             "arg_lens": _aarg_lens,
                             "args_json_len": len(_aargs_json),
-                            "args_json_hash": _hl.md5(_aargs_json.encode()).hexdigest()[:8],
+                            "args_json_hash": hashlib.md5(_aargs_json.encode()).hexdigest()[:8],
                         })
                 # TOOL_COMPAT: normalize aliases
                 if tool_calls:
