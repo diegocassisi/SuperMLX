@@ -2724,144 +2724,116 @@ def _insert_cache_entries(
     # ── AUTO-SAVE MAIN CACHE TO DISK ──────────────────────────────────────────
     _active_store = prompt_cache_store_override if prompt_cache_store_override is not None else PROMPT_CACHE
 
-    if _is_compact_save:
-        # ── AUTO-SAVE EMBEDDED/COMPACT CACHE ──────────────────────────────
-        # Guardar el estado del compact runner en EMBEDDED_CACHE_PERSIST_PATH.
-        # Only if: persist path configured, not yet saved (or low hit rate), and enough tokens.
-        embedded_persist_path = Path(SETTINGS.embedded_cache_persist_path) if SETTINGS.embedded_cache_persist_path else None
-        _emb_should_save = False
-        _emb_save_reason = ""
-        if embedded_persist_path and len(cache_key) > 1000:
-            if not _DPC.embedded_cache_saved:
-                _emb_should_save = True
-                _emb_save_reason = f"first_save (hit={cache_hit_ratio:.0%})"
-            elif cache_hit_ratio < 0.85:
-                _emb_should_save = True
-                _emb_save_reason = f"stale_cache (hit={cache_hit_ratio:.0%} < 85%)"
-        if _emb_should_save:
-            _DPC.embedded_cache_saved = True
-            _terminal_status(
-                "💾",
-                f"Auto-save EMBEDDED: → {embedded_persist_path.name} | reason={_emb_save_reason} | tokens={len(cache_key)}",
+    # ── AUTO-SAVE MAIN CACHE TO DISK ──────────────────────────────────────────
+    persist_path = Path(SETTINGS.cache_persist_path) if SETTINGS.cache_persist_path else None
+
+    # ── WARMUP CACHE AUTO-SAVE: DESCONECTADO (REEMPLAZADO POR TPC) ─────────────
+    # El sistema utiliza Tool Prefix Cache (TPC) como única fuente de verdad (SSoT)
+    # para la persistencia del prefijo (logs/tool_prefix_cache.safetensors).
+    # El guardado de warmup_cache.safetensors queda formalmente desconectado.
+    _should_save = False
+
+    if _should_save:
+        _DPC.disk_cache_saved = True
+        # ── FIX: Save PROMPT-ONLY tokens, not prompt+response ────────────
+        # cache_key at this point = prompt_tokens + generated_tokens.
+        # Saving generated_tokens to disk contaminates the warmup cache:
+        # on restart, the KV states encode the previous response, causing
+        # hallucinations on the first request. Strip response tokens.
+        _prompt_only_key = cache_key[: -len(generated_tokens)] if generated_tokens else list(cache_key)
+        _terminal_status("💾", f"Auto-save: capturing prompt-only cache → {persist_path.name} | reason={_save_reason} | tokens={len(_prompt_only_key)} (stripped {len(generated_tokens)} response tok)")
+        # Trim prompt_cache to remove generated token KV states.
+        # CRITICAL: if deepcopy or trim fails, ABORT the save entirely.
+        # A contaminated cache (with response tokens baked in) causes tool
+        # hallucinations on restart — far worse than a cold start.
+        _save_cache = None
+        if generated_tokens and can_trim_prompt_cache(prompt_cache):
+            try:
+                import copy as _copy_mod
+                _save_cache = _copy_mod.deepcopy(prompt_cache)
+                _pre_trim_off = _kv_cache_offset(_save_cache)
+                trim_prompt_cache(_save_cache, len(generated_tokens))
+                _post_trim_off = _kv_cache_offset(_save_cache)
+                # Verify trim actually reduced the offset
+                if (_post_trim_off is not None and _pre_trim_off is not None
+                        and _post_trim_off >= _pre_trim_off):
+                    _terminal_status("⚠️", f"Auto-save ABORTED: trim did not reduce offset ({_pre_trim_off} → {_post_trim_off})")
+                    _save_cache = None
+            except Exception as _trim_err:
+                _terminal_status("⚠️", f"Auto-save ABORTED: deepcopy/trim failed ({_trim_err})")
+                _save_cache = None  # NEVER fallback to saving contaminated cache
+        elif not generated_tokens:
+            # No response tokens to strip — safe to save as-is
+            _save_cache = prompt_cache
+        else:
+            # Hybrid cache (e.g., Qwen3.5: ArraysCache + KVCache):
+            # can_trim_prompt_cache() requires ALL layers trimmable, but
+            # ArraysCache (linear attention) is never trimmable.
+            # Fix: deepcopy + trim only the trimmable layers (KVCache).
+            # Non-trimmable layers (ArraysCache) have no .keys →
+            # _warmup_save_cache skips them anyway.
+            _any_trimmable = any(
+                hasattr(layer, 'is_trimmable') and layer.is_trimmable()
+                for layer in prompt_cache
             )
-            threading.Thread(
-                target=_warmup_save_cache,
-                args=(list(cache_key), prompt_cache, embedded_persist_path),
-                kwargs={"prefix_hash": None},
-                daemon=True,
-                name="disk-embedded-cache-save",
-            ).start()
-    else:
-        # ── AUTO-SAVE MAIN CACHE TO DISK ──────────────────────────────────────────
-        persist_path = Path(SETTINGS.cache_persist_path) if SETTINGS.cache_persist_path else None
-
-        # ── WARMUP CACHE AUTO-SAVE: DESCONECTADO (REEMPLAZADO POR TPC) ─────────────
-        # El sistema utiliza Tool Prefix Cache (TPC) como única fuente de verdad (SSoT)
-        # para la persistencia del prefijo (logs/tool_prefix_cache.safetensors).
-        # El guardado de warmup_cache.safetensors queda formalmente desconectado.
-        _should_save = False
-
-        if _should_save:
-            _DPC.disk_cache_saved = True
-            # ── FIX: Save PROMPT-ONLY tokens, not prompt+response ────────────
-            # cache_key at this point = prompt_tokens + generated_tokens.
-            # Saving generated_tokens to disk contaminates the warmup cache:
-            # on restart, the KV states encode the previous response, causing
-            # hallucinations on the first request. Strip response tokens.
-            _prompt_only_key = cache_key[: -len(generated_tokens)] if generated_tokens else list(cache_key)
-            _terminal_status("💾", f"Auto-save: capturing prompt-only cache → {persist_path.name} | reason={_save_reason} | tokens={len(_prompt_only_key)} (stripped {len(generated_tokens)} response tok)")
-            # Trim prompt_cache to remove generated token KV states.
-            # CRITICAL: if deepcopy or trim fails, ABORT the save entirely.
-            # A contaminated cache (with response tokens baked in) causes tool
-            # hallucinations on restart — far worse than a cold start.
-            _save_cache = None
-            if generated_tokens and can_trim_prompt_cache(prompt_cache):
+            if _any_trimmable:
                 try:
                     import copy as _copy_mod
                     _save_cache = _copy_mod.deepcopy(prompt_cache)
-                    _pre_trim_off = _kv_cache_offset(_save_cache)
-                    trim_prompt_cache(_save_cache, len(generated_tokens))
-                    _post_trim_off = _kv_cache_offset(_save_cache)
-                    # Verify trim actually reduced the offset
+                    # Read offset from TRIMMABLE layers only (KVCache),
+                    # not ArraysCache whose internal shape[2] is static.
+                    _pre_trim_off = None
+                    for layer in _save_cache:
+                        if hasattr(layer, 'is_trimmable') and layer.is_trimmable() and hasattr(layer, 'offset'):
+                            _pre_trim_off = int(layer.offset)
+                            break
+                    _n_trimmed = 0
+                    for layer in _save_cache:
+                        if hasattr(layer, 'is_trimmable') and layer.is_trimmable() and hasattr(layer, 'trim'):
+                            layer.trim(len(generated_tokens))
+                            _n_trimmed += 1
+                    _post_trim_off = None
+                    for layer in _save_cache:
+                        if hasattr(layer, 'is_trimmable') and layer.is_trimmable() and hasattr(layer, 'offset'):
+                            _post_trim_off = int(layer.offset)
+                            break
                     if (_post_trim_off is not None and _pre_trim_off is not None
                             and _post_trim_off >= _pre_trim_off):
-                        _terminal_status("⚠️", f"Auto-save ABORTED: trim did not reduce offset ({_pre_trim_off} → {_post_trim_off})")
+                        _terminal_status("⚠️", f"Auto-save ABORTED: per-layer trim did not reduce offset ({_pre_trim_off} → {_post_trim_off})")
                         _save_cache = None
+                    else:
+                        _terminal_status("💾", f"Auto-save: per-layer trim OK | trimmed={_n_trimmed}/{len(_save_cache)} layers | offset {_pre_trim_off} → {_post_trim_off}")
+                        # FIX-31 v7 + DPC: Update frozen cache with this CLEAN
+                        # trimmed copy so pollution restore has full prompt
+                        # coverage (not just seed tokens).
+                        _DPC.frozen_cache = _save_cache
+                        _DPC.frozen_tokens = list(_prompt_only_key)
+                        _terminal_status("🧊", f"DPC: frozen cache updated | {len(_save_cache)} layers | {len(_prompt_only_key)} tokens")
+                        # FIX-31 DIAG: verify frozen cache is clean after update
+                        _cache_diag.compare(None, _save_cache, list(_prompt_only_key), "frozen_update", "",
+                            extra={"layers": len(_save_cache), "tokens": len(_prompt_only_key)})
                 except Exception as _trim_err:
-                    _terminal_status("⚠️", f"Auto-save ABORTED: deepcopy/trim failed ({_trim_err})")
-                    _save_cache = None  # NEVER fallback to saving contaminated cache
-            elif not generated_tokens:
-                # No response tokens to strip — safe to save as-is
-                _save_cache = prompt_cache
-            else:
-                # Hybrid cache (e.g., Qwen3.5: ArraysCache + KVCache):
-                # can_trim_prompt_cache() requires ALL layers trimmable, but
-                # ArraysCache (linear attention) is never trimmable.
-                # Fix: deepcopy + trim only the trimmable layers (KVCache).
-                # Non-trimmable layers (ArraysCache) have no .keys →
-                # _warmup_save_cache skips them anyway.
-                _any_trimmable = any(
-                    hasattr(layer, 'is_trimmable') and layer.is_trimmable()
-                    for layer in prompt_cache
-                )
-                if _any_trimmable:
-                    try:
-                        import copy as _copy_mod
-                        _save_cache = _copy_mod.deepcopy(prompt_cache)
-                        # Read offset from TRIMMABLE layers only (KVCache),
-                        # not ArraysCache whose internal shape[2] is static.
-                        _pre_trim_off = None
-                        for layer in _save_cache:
-                            if hasattr(layer, 'is_trimmable') and layer.is_trimmable() and hasattr(layer, 'offset'):
-                                _pre_trim_off = int(layer.offset)
-                                break
-                        _n_trimmed = 0
-                        for layer in _save_cache:
-                            if hasattr(layer, 'is_trimmable') and layer.is_trimmable() and hasattr(layer, 'trim'):
-                                layer.trim(len(generated_tokens))
-                                _n_trimmed += 1
-                        _post_trim_off = None
-                        for layer in _save_cache:
-                            if hasattr(layer, 'is_trimmable') and layer.is_trimmable() and hasattr(layer, 'offset'):
-                                _post_trim_off = int(layer.offset)
-                                break
-                        if (_post_trim_off is not None and _pre_trim_off is not None
-                                and _post_trim_off >= _pre_trim_off):
-                            _terminal_status("⚠️", f"Auto-save ABORTED: per-layer trim did not reduce offset ({_pre_trim_off} → {_post_trim_off})")
-                            _save_cache = None
-                        else:
-                            _terminal_status("💾", f"Auto-save: per-layer trim OK | trimmed={_n_trimmed}/{len(_save_cache)} layers | offset {_pre_trim_off} → {_post_trim_off}")
-                            # FIX-31 v7 + DPC: Update frozen cache with this CLEAN
-                            # trimmed copy so pollution restore has full prompt
-                            # coverage (not just seed tokens).
-                            _DPC.frozen_cache = _save_cache
-                            _DPC.frozen_tokens = list(_prompt_only_key)
-                            _terminal_status("🧊", f"DPC: frozen cache updated | {len(_save_cache)} layers | {len(_prompt_only_key)} tokens")
-                            # FIX-31 DIAG: verify frozen cache is clean after update
-                            _cache_diag.compare(None, _save_cache, list(_prompt_only_key), "frozen_update", "",
-                                extra={"layers": len(_save_cache), "tokens": len(_prompt_only_key)})
-                    except Exception as _trim_err:
-                        _terminal_status("⚠️", f"Auto-save ABORTED: per-layer trim failed ({_trim_err})")
-                        _save_cache = None
-                else:
-                    _terminal_status("⚠️", f"Auto-save SKIPPED: no trimmable layers ({type(prompt_cache[0]).__name__ if prompt_cache else 'empty'})")
+                    _terminal_status("⚠️", f"Auto-save ABORTED: per-layer trim failed ({_trim_err})")
                     _save_cache = None
-            if _save_cache is not None:
-                # DPC: compute prefix hash from the prompt-only tokens for auto-healing
-                _prefix_hash = _wm.compute_prefix_hash(
-                    _prompt_only_key,
-                    model_path=SETTINGS.model_path,
-                    kv_bits=SETTINGS.kv_bits,
-                )
-                threading.Thread(
-                    target=_warmup_save_cache,
-                    args=(_prompt_only_key, _save_cache, persist_path),
-                    kwargs={"prefix_hash": _prefix_hash},
-                    daemon=True,
-                    name="dpc-cache-save",
-                ).start()
             else:
-                _DPC.disk_cache_saved = False  # Allow retry on next request
+                _terminal_status("⚠️", f"Auto-save SKIPPED: no trimmable layers ({type(prompt_cache[0]).__name__ if prompt_cache else 'empty'})")
+                _save_cache = None
+        if _save_cache is not None:
+            # DPC: compute prefix hash from the prompt-only tokens for auto-healing
+            _prefix_hash = _wm.compute_prefix_hash(
+                _prompt_only_key,
+                model_path=SETTINGS.model_path,
+                kv_bits=SETTINGS.kv_bits,
+            )
+            threading.Thread(
+                target=_warmup_save_cache,
+                args=(_prompt_only_key, _save_cache, persist_path),
+                kwargs={"prefix_hash": _prefix_hash},
+                daemon=True,
+                name="dpc-cache-save",
+            ).start()
+        else:
+            _DPC.disk_cache_saved = False  # Allow retry on next request
 
 
 
