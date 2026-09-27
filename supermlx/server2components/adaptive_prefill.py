@@ -36,6 +36,9 @@ _model: Any = None
 _prefill_step_size: int = 256
 _feature_cache_diag: bool = True
 _feature_full_logging: bool = True
+_get_metal_budget_gb: Optional[Callable] = None
+_ADAPTIVE_PREFILL_SAFETY_MARGIN: float = 0.85
+_GPU_YIELD_SECONDS: float = 0.0
 
 
 def init(
@@ -49,11 +52,15 @@ def init(
     prefill_step_size: int = 256,
     feature_cache_diag: bool = True,
     feature_full_logging: bool = True,
+    get_metal_budget_gb: Optional[Callable] = None,
+    adaptive_prefill_safety_margin: float = 0.85,
+    gpu_yield_seconds: float = 0.0,
 ) -> None:
     """Initialize with shared state from server2."""
     global _settings, _terminal_status, _pipeline_log, _guard
     global _cache_diag, _model, _prefill_step_size
     global _feature_cache_diag, _feature_full_logging
+    global _get_metal_budget_gb, _ADAPTIVE_PREFILL_SAFETY_MARGIN, _GPU_YIELD_SECONDS
 
     _settings = settings
     _terminal_status = terminal_status
@@ -64,6 +71,9 @@ def init(
     _prefill_step_size = prefill_step_size
     _feature_cache_diag = feature_cache_diag
     _feature_full_logging = feature_full_logging
+    _get_metal_budget_gb = get_metal_budget_gb
+    _ADAPTIVE_PREFILL_SAFETY_MARGIN = adaptive_prefill_safety_margin
+    _GPU_YIELD_SECONDS = gpu_yield_seconds
 
 
 def _start_prefill_progress(
@@ -229,7 +239,7 @@ def _adaptive_prefill(
     if getattr(_model, "_ane_injected", False):
         try:
             from lab.ane_code.ane_shim import _get_inner_layers, _ANEWrappedSelfAttention
-            for _lyr in _get_inner_layers(model):
+            for _lyr in _get_inner_layers(_model):
                 _at = getattr(_lyr, "self_attn", None)
                 if isinstance(_at, _ANEWrappedSelfAttention):
                     _wrapped_ane_layers.append(_at)

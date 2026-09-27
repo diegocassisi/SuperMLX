@@ -5106,6 +5106,9 @@ def run():
         prefill_step_size=PREFILL_STEP_SIZE,
         feature_cache_diag=FEATURE_CACHE_DIAG,
         feature_full_logging=FEATURE_FULL_LOGGING,
+        get_metal_budget_gb=_get_metal_budget_gb,
+        adaptive_prefill_safety_margin=_ADAPTIVE_PREFILL_SAFETY_MARGIN,
+        gpu_yield_seconds=_GPU_YIELD_SECONDS,
     )
 
     # ── Module init: post_generation ──────────────────────────────────────
