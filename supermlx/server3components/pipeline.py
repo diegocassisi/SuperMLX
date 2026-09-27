@@ -342,15 +342,7 @@ def cache_lookup(ctx: RequestContext, state: ServerState, radix: RadixPromptCach
 
         matched_model_len = len(matched)
         if stored_hash is not None and stored_off is not None:
-            if stored_off != len(matched):
-                logger.warning(
-                    "[CACHE_LOOKUP] Desalineamiento estructural detectado: stored_off (%d) != len(matched) (%d). "
-                    "Descartando como miss funcional (fail-closed).",
-                    stored_off, len(matched)
-                )
-                kv = None
-                matched = []
-            elif stored_off <= len(ctx.model_tokens):
+            if stored_off <= len(ctx.model_tokens):
                 current_model_hash = hash(tuple(ctx.model_tokens[:stored_off]))
                 if current_model_hash != stored_hash:
                     logger.warning(
