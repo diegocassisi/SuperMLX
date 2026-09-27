@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import math
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -23,16 +24,24 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-# Module-level callable for terminal status output
+# Module-level state (set via init())
 _terminal_status_fn: Optional[Callable] = None
 _settings: Any = None
+_guard: Any = None
+_hsm: Any = None  # HousekeepingStagingManager
+_prompt_cache_ref: Any = None  # Reference to PROMPT_CACHE for self-check
 
 
-def init(*, settings: Any, terminal_status_fn: Callable) -> None:
+def init(*, settings: Any, terminal_status_fn: Callable,
+         guard: Any = None, housekeeping_staging_manager: Any = None,
+         prompt_cache_ref: Any = None) -> None:
     """Initialize with shared state from server2."""
-    global _terminal_status_fn, _settings
+    global _terminal_status_fn, _settings, _guard, _hsm, _prompt_cache_ref
     _terminal_status_fn = terminal_status_fn
     _settings = settings
+    _guard = guard
+    _hsm = housekeeping_staging_manager
+    _prompt_cache_ref = prompt_cache_ref
 
 
 def _block_chain_hashes(
@@ -85,8 +94,8 @@ class LRUPromptCache:
         stale_keys = [k for k, v in self._entries.items() if self._is_expired(v)]
         for k in stale_keys:
             self._delete(k[0], k[1])
-        if "HOUSEKEEPING_STAGING_MANAGER" in globals() and "PROMPT_CACHE" in globals() and self is PROMPT_CACHE:
-            HOUSEKEEPING_STAGING_MANAGER.prune(
+        if _hsm is not None and _prompt_cache_ref is not None and self is _prompt_cache_ref:
+            _hsm.prune(
                 self,
                 now=now,
                 ttl_seconds=getattr(_settings, "housekeeping_staging_ttl_seconds", 300.0),

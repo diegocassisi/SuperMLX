@@ -2376,6 +2376,13 @@ try:
 except Exception as _guard_err:
     _terminal_status("⚠️", f"Metal Guard init failed (non-fatal): {_guard_err}")
 
+# ── Late init: wire _guard + HSM into cache_lru (defined after model load) ──
+_cache_lru_init(
+    settings=SETTINGS, terminal_status_fn=_terminal_status,
+    guard=_guard, housekeeping_staging_manager=HOUSEKEEPING_STAGING_MANAGER,
+    prompt_cache_ref=PROMPT_CACHE,
+)
+
 # ── Expert Routing Logger ─────────────────────────────────────────────────
 if FEATURE_EXPERT_ROUTING_LOG and _moe_stats.get("moe_layers", 0) > 0:
     _terminal_status("🔬", "Expert Routing Logger: active (output: logs/expert_routing.json)")
