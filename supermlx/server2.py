@@ -431,15 +431,17 @@ from .housekeeping_staging import (
 HOUSEKEEPING_STAGING_MANAGER = HousekeepingStagingManager()
 
 
-# ── CASCADE ROUTING ──────────────────────────────────────────────────────────
-# Forward a frontier API cuando RAG confidence es baja (no hay knowledge local).
-# Env: FEATURE_CASCADE=true | CASCADE_API_KEY=<key> | CASCADE_API_URL=<url>
-FEATURE_CASCADE                = _env_bool("FEATURE_CASCADE", False)
-CASCADE_API_URL                = _env_str("CASCADE_API_URL", "")
-CASCADE_API_KEY                = _env_str("CASCADE_API_KEY", "")
-CASCADE_MODEL                  = _env_str("CASCADE_MODEL", "")
-CASCADE_RAG_THRESHOLD          = _env_float("CASCADE_RAG_THRESHOLD", 2.0)
-CASCADE_TIMEOUT_S              = _env_int("CASCADE_TIMEOUT_S", 60)
+# ── CASCADE ROUTING: DESCONECTADO ─────────────────────────────────────────────
+# Extracted to server2components/cascade_routing.py and DISABLED.
+# Was: forward to frontier API (Gemini) when RAG confidence is low.
+# Re-enable by importing cascade_routing and calling init().
+FEATURE_CASCADE = False  # DESCONECTADO
+CASCADE_API_URL = ""
+CASCADE_API_KEY = ""
+CASCADE_MODEL = ""
+CASCADE_RAG_THRESHOLD = 2.0
+CASCADE_TIMEOUT_S = 60
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -725,88 +727,12 @@ _write_request_log = _rlog.write_request_log
 
 
 
-# ── CASCADE: Forward to Frontier API ─────────────────────────────────────────
+# _cascade_forward_request: REMOVED — was in cascade_routing.py (DESCONECTADO)
+def _cascade_forward_request(*args, **kwargs):
+    """Cascade routing is DISCONNECTED. This stub prevents NameError."""
+    raise RuntimeError("Cascade routing is DISCONNECTED")
 
-def _cascade_forward_request(body: Dict[str, Any], request_id: str,
-                             handler=None, is_streaming: bool = False) -> Optional[Dict[str, Any]]:
-    """Forward request to a frontier API (Gemini, etc.) when RAG confidence is low.
 
-    Uses urllib (stdlib) — zero extra dependencies. The frontier API must be
-    OpenAI-compatible (/v1/chat/completions or equivalent).
-
-    Two modes:
-        - Non-streaming (is_streaming=False): returns parsed JSON response dict.
-        - Streaming (is_streaming=True): proxies SSE lines directly to handler.wfile,
-          returns None. Requires handler to be passed.
-
-    Raises: Exception on timeout, HTTP error, or parse failure.
-    """
-    import urllib.request
-    import urllib.error
-
-    # Build the request payload — pass through most fields from the original body
-    cascade_body = {
-        "model": CASCADE_MODEL,
-        "messages": body.get("messages", []),
-        "stream": is_streaming,
-    }
-    # Pass through optional fields if present
-    for _key in ("temperature", "top_p", "max_tokens", "tools", "tool_choice"):
-        if _key in body:
-            cascade_body[_key] = body[_key]
-
-    _payload = json.dumps(cascade_body, ensure_ascii=False).encode("utf-8")
-
-    _req = urllib.request.Request(
-        CASCADE_API_URL,
-        data=_payload,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {CASCADE_API_KEY}",
-        },
-        method="POST",
-    )
-
-    _t0 = time.time()
-    try:
-        if is_streaming and handler is not None:
-            # ── STREAMING: proxy SSE lines directly to client ──
-            handler.send_response(200)
-            handler.send_header("Content-Type", "text/event-stream")
-            handler.send_header("Cache-Control", "no-cache")
-            handler.send_header("X-Cascade-Active", "true")
-            handler.send_header("X-Cascade-Model", CASCADE_MODEL)
-            handler.end_headers()
-
-            with urllib.request.urlopen(_req, timeout=CASCADE_TIMEOUT_S) as resp:
-                for line in resp:
-                    handler.wfile.write(line)
-            handler.wfile.flush()
-
-            _elapsed_ms = int((time.time() - _t0) * 1000)
-            _pipeline_log("CASCADE", request_id,
-                f"frontier streamed | status=200 | {_elapsed_ms}ms")
-            return None  # Response already sent via SSE
-        else:
-            # ── NON-STREAMING: parse and return JSON ──
-            with urllib.request.urlopen(_req, timeout=CASCADE_TIMEOUT_S) as resp:
-                _resp_data = resp.read().decode("utf-8")
-                _elapsed_ms = int((time.time() - _t0) * 1000)
-                _pipeline_log("CASCADE", request_id,
-                    f"frontier responded | status={resp.status} | {_elapsed_ms}ms | "
-                    f"resp_len={len(_resp_data)}")
-                return json.loads(_resp_data)
-    except urllib.error.HTTPError as e:
-        _err_body = ""
-        try:
-            _err_body = e.read().decode("utf-8")[:500]
-        except Exception:
-            pass
-        raise RuntimeError(
-            f"Cascade HTTP {e.code}: {e.reason} | body={_err_body}"
-        ) from e
-    except urllib.error.URLError as e:
-        raise RuntimeError(f"Cascade connection error: {e.reason}") from e
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2806,61 +2732,10 @@ class APIHandler(BaseHTTPRequestHandler):
                 _reason = ("anthropic" if self._is_anthropic else "rag_bypass(flush/summarize)")
                 _pipeline_log("RAG", request_id, f"SKIPPED | reason={_reason}")
 
-            # ── PIPELINE: CASCADE ROUTING ──────────────────────────────────
-            # If RAG confidence is low AND cascade is enabled, forward to frontier.
-            # Signals: RAG best_score > threshold, or explicit X-Force-Cascade header.
-            _force_cascade = self.headers.get("X-Force-Cascade", "").lower() in ("true", "1", "yes")
-            _block_cascade = self.headers.get("X-No-Cascade", "").lower() in ("true", "1", "yes")
+            # ── PIPELINE: CASCADE ROUTING (DESCONECTADO) ──────────────
+            # Cascade routing extracted and disabled. Feature was forwarding
+            # to frontier API when RAG confidence was low.
             _cascade_triggered = False
-
-            if (FEATURE_CASCADE and CASCADE_API_URL and CASCADE_API_KEY
-                    and not _skip_rag and not _block_cascade):
-                _rag_best = _rag_meta.get("best_score", 999.0)
-                _rag_chunks = _rag_meta.get("chunks_found", 0)
-                _should_cascade = (
-                    _force_cascade
-                    or (_rag_chunks == 0 and _rag_best >= CASCADE_RAG_THRESHOLD)
-                    or (_rag_best >= CASCADE_RAG_THRESHOLD)
-                )
-                if _should_cascade:
-                    _cascade_triggered = True
-                    _cascade_reason = "forced" if _force_cascade else f"rag_score={_rag_best:.3f}>={CASCADE_RAG_THRESHOLD}"
-                    _pipeline_log("CASCADE", request_id,
-                        f"ACTIVATED | reason={_cascade_reason} | "
-                        f"rag_chunks={_rag_chunks} | best_score={_rag_best:.3f} | "
-                        f"target={CASCADE_MODEL}@{CASCADE_API_URL[:60]}")
-                    try:
-                        _is_stream_request = body.get("stream", False)
-                        _cascade_response = _cascade_forward_request(
-                            body=body,
-                            request_id=request_id,
-                            handler=self,
-                            is_streaming=_is_stream_request,
-                        )
-                        if _is_stream_request:
-                            # Streaming: response already proxied via SSE
-                            _pipeline_log("CASCADE", request_id,
-                                f"COMPLETED (stream) | model={CASCADE_MODEL}")
-                            return  # Done — SSE already sent to client
-                        else:
-                            # Non-streaming: serialize and send JSON
-                            _resp_bytes = json.dumps(_cascade_response, ensure_ascii=False).encode("utf-8")
-                            self.send_response(200)
-                            self.send_header("Content-Type", "application/json")
-                            self.send_header("X-Cascade-Active", "true")
-                            self.send_header("X-Cascade-Reason", _cascade_reason)
-                            self.send_header("X-Cascade-Model", CASCADE_MODEL)
-                            self.send_header("Content-Length", str(len(_resp_bytes)))
-                            self.end_headers()
-                            self.wfile.write(_resp_bytes)
-                            _pipeline_log("CASCADE", request_id,
-                                f"COMPLETED | model={CASCADE_MODEL} | "
-                                f"response_bytes={len(_resp_bytes)}")
-                            return  # Done — skip local model entirely
-                    except Exception as _ce:
-                        _pipeline_log("CASCADE", request_id,
-                            f"FAILED — falling back to local | error={_ce}")
-                        _cascade_triggered = False  # Fallback to local generation
 
             # --- APPLY STATELESS HEALING ---
             _heal_t0 = time.time()
