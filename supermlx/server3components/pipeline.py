@@ -63,6 +63,43 @@ def _tokenize_text(tokenizer: Any, text: str) -> list[int]:
         return tokenizer.encode(text)
 
 
+def materialize_cache(cache: Any) -> None:
+    """Evalúa forzosamente y sincroniza todos los tensores del KV cache en el hilo actual.
+
+    Obligatorio en entornos multi-hilo (ThreadingHTTPServer) para evitar que tensores
+    lazy conserven dependencias de Stream(gpu, N) ligadas al hilo de origen.
+    """
+    if not cache:
+        return
+    try:
+        import mlx.core as mx  # type: ignore[import-untyped]
+    except ImportError:
+        return
+
+    arrays_to_eval = []
+    try:
+        for c in cache:
+            if hasattr(c, "state") and c.state is not None:
+                if isinstance(c.state, mx.array):
+                    arrays_to_eval.append(c.state)
+                elif isinstance(c.state, (list, tuple)):
+                    arrays_to_eval.extend([a for a in c.state if isinstance(a, mx.array)])
+            if hasattr(c, "cache") and c.cache is not None:
+                if isinstance(c.cache, (list, tuple)):
+                    arrays_to_eval.extend([a for a in c.cache if isinstance(a, mx.array)])
+            if hasattr(c, "keys") and isinstance(c.keys, mx.array):
+                arrays_to_eval.append(c.keys)
+            if hasattr(c, "values") and isinstance(c.values, mx.array):
+                arrays_to_eval.append(c.values)
+        if arrays_to_eval:
+            mx.eval(*arrays_to_eval)
+        if hasattr(mx, "synchronize"):
+            mx.synchronize()
+    except Exception as e:
+        logger.error("[MATERIALIZE_CACHE] Error evaluando tensores de cache: %s", str(e))
+        raise
+
+
 def preprocess(ctx: RequestContext, state: ServerState) -> None:
     """
     Fase 1: Parseo + canonicalización dual + RAG + healing + compresión.
@@ -421,6 +458,7 @@ def generate(
     if not getattr(state, "is_vlm", False) and len(rest_tokens) > 1:
         try:
             rest_tokens = _adaptive_prefill(rest_tokens, ctx.prompt_cache, ctx.request_id)
+            materialize_cache(ctx.prompt_cache)
         except Exception as ap_err:
             logger.debug("[GENERATE] Adaptive prefill fallback: %s", ap_err)
 
@@ -451,6 +489,7 @@ def generate(
     # 4. Ejecución del generador si está provisto
     if generator_fn is not None:
         generator_fn(rest_tokens, ctx, state)
+        materialize_cache(ctx.prompt_cache)
     else:
         # Fallback para pruebas o cuando el decode es gestionado externamente
         if not ctx.finish_reason:
@@ -517,6 +556,7 @@ def postprocess(
                 if restored:
                     ckpt_len = ctx.checkpoint.cache_key_len
                     checkpoint_key = base_key[:ckpt_len]
+                    materialize_cache(ctx.prompt_cache)
                     radix.insert(checkpoint_key, ctx.prompt_cache, slot=slot)
                     logger.info(
                         "[POSTPROCESS] [DECISION] Híbrido restaurado e insertado: %d tokens en slot '%s' (generated_tokens descartados)",
@@ -534,6 +574,7 @@ def postprocess(
         else:
             # ── CAMINO PURE-KV ──────────────────────────────────────────────
             full_key = base_key + (ctx.generated_tokens or [])
+            materialize_cache(ctx.prompt_cache)
             radix.insert(full_key, ctx.prompt_cache, slot=slot)
             logger.info(
                 "[POSTPROCESS] [DECISION] Pure-KV insertado: %d tokens (base=%d + gen=%d) en slot '%s'",

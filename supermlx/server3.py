@@ -839,6 +839,7 @@ from .server3components.pipeline import (
     cache_lookup as _pipeline_cache_lookup,
     generate as _pipeline_generate,
     postprocess as _pipeline_postprocess,
+    materialize_cache as _materialize_cache,
 )
 
 
@@ -2829,29 +2830,6 @@ class APIHandler(BaseHTTPRequestHandler):
 
                 _pre_prefill_memory_relief(request_id, rest_count)
 
-                # Housekeeping Split-Prefill: advance and commit clean conversation history to PROMPT_CACHE
-                if (
-                    _is_housekeeping
-                    and SETTINGS.feature_housekeeping_staging
-                    and not is_vlm
-                    and _housekeeping_conv_model_boundary is not None
-                    and not _housekeeping_staging_hit
-                    and prompt_cache is not None
-                ):
-                    (
-                        rest_tokens,
-                        _housekeeping_pre_snapshot,
-                        _housekeeping_original_tokens,
-                    ) = _split_and_commit_housekeeping_history(
-                        prompt_cache=prompt_cache,
-                        model_tokens=model_tokens,
-                        conv_model_boundary=_housekeeping_conv_model_boundary,
-                        conv_prompt_tokens=_housekeeping_conv_prompt_tokens,
-                        cache_session_tokens=cache_session_tokens,
-                        session_ctx=session_ctx,
-                        request_id=request_id,
-                    )
-                    rest_count = len(rest_tokens)
 
                 if not is_vlm:
                     # ── FASE D.3: GENERATE (adaptive prefill + checkpoint) ────
@@ -3042,6 +3020,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     tool_calls = []
                     finish_reason = "stop"
                 cache_key.extend(generated_tokens)
+                _materialize_cache(prompt_cache)
                 # ── FASE D.4: POSTPROCESS (RadixAttention insertion + telemetry) ──
                 ctx.cache_key = list(cache_key)
                 ctx.generated_tokens = list(generated_tokens)
@@ -3237,29 +3216,6 @@ class APIHandler(BaseHTTPRequestHandler):
 
                 _pre_prefill_memory_relief(request_id, rest_count)
 
-                # Housekeeping Split-Prefill: advance and commit clean conversation history to PROMPT_CACHE
-                if (
-                    _is_housekeeping
-                    and SETTINGS.feature_housekeeping_staging
-                    and not is_vlm
-                    and _housekeeping_conv_model_boundary is not None
-                    and not _housekeeping_staging_hit
-                    and prompt_cache is not None
-                ):
-                    (
-                        rest_tokens,
-                        _housekeeping_pre_snapshot,
-                        _housekeeping_original_tokens,
-                    ) = _split_and_commit_housekeeping_history(
-                        prompt_cache=prompt_cache,
-                        model_tokens=model_tokens,
-                        conv_model_boundary=_housekeeping_conv_model_boundary,
-                        conv_prompt_tokens=_housekeeping_conv_prompt_tokens,
-                        cache_session_tokens=cache_session_tokens,
-                        session_ctx=session_ctx,
-                        request_id=request_id,
-                    )
-                    rest_count = len(rest_tokens)
 
                 if not is_vlm:
                     # ── FASE D.3: GENERATE (adaptive prefill + checkpoint) ────
@@ -3853,6 +3809,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     _update_healing_store(raw_full_text, message_text, tool_calls, _heal_user_ctx)
 
                 cache_key.extend(generated_tokens)
+                _materialize_cache(prompt_cache)
                 # ── FASE D.4: POSTPROCESS (RadixAttention insertion + telemetry) ──
                 ctx.cache_key = list(cache_key)
                 ctx.generated_tokens = list(generated_tokens)
@@ -4053,6 +4010,12 @@ class APIHandler(BaseHTTPRequestHandler):
                     )
                 except Exception as _moe_post_err:
                     _terminal_status("⚠️", f"MoE post-generation hook error: {_moe_post_err}")
+                try:
+                    _pc_sync = locals().get("prompt_cache") or (getattr(ctx, "prompt_cache", None) if "ctx" in locals() else None)
+                    if _pc_sync:
+                        _materialize_cache(_pc_sync)
+                except Exception:
+                    pass
 
                 model_lock.release()
 
