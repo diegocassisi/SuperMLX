@@ -2504,6 +2504,7 @@ class APIHandler(BaseHTTPRequestHandler):
         vlm_kwargs = ctx.vlm_kwargs
         cache_key_delta_chars = len(model_tokens) - len(prompt_tokens)
         prompt_was_normalized = len(prompt_tokens) != len(model_tokens)
+        reasoning_control = _extract_enable_thinking(body, default_thinking=SETTINGS.default_thinking)
         # ── FASE D.2: CACHE_LOOKUP (RadixPromptCache + TPC) ───────────────
         _pipeline_cache_lookup(ctx, _server_state, RADIX_PROMPT_CACHE)
         _pipeline_log("CACHE_LOOKUP_RADIX", request_id,
@@ -2562,6 +2563,7 @@ class APIHandler(BaseHTTPRequestHandler):
         first_token_at = None
         queue_started_at = time.time()
         hybrid_generation_checkpoint: Optional[HybridGenerationCheckpoint] = None
+        _task_detector: Any = None
 
         # --- STABLE-PREFIX TELEMETRY DEFAULTS ---
         stable_prefix_token_len_computed = 0
