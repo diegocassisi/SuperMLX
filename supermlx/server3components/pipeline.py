@@ -334,11 +334,39 @@ def cache_lookup(ctx: RequestContext, state: ServerState, radix: RadixPromptCach
 
     # Si hay match estructural pero kv_cache es None -> MISS funcional (P4)
     if kv is not None and matched:
-        ctx.prompt_cache = kv
-        matched_len = len(matched)
-        ctx.rest_count = max(0, len(ctx.model_tokens) - matched_len) if ctx.model_tokens else max(0, len(tokens) - matched_len)
-        ctx.cache_hit_ratio = matched_len / max(len(tokens), 1)
-        return
+        # ── VERIFICACIÓN DE ALINEAMIENTO MODEL_PREFIX (FIX-31 Defense-in-Depth) ──
+        # Evita desalineamientos sutiles si el espacio canónico diverge del espacio real del modelo.
+        first_layer = kv[0] if (isinstance(kv, (list, tuple)) and len(kv) > 0) else None
+        stored_hash = getattr(kv, "__model_prefix_hash__", getattr(first_layer, "__model_prefix_hash__", None))
+        stored_off = getattr(kv, "__model_offset__", getattr(first_layer, "__model_offset__", None))
+
+        matched_model_len = len(matched)
+        if stored_hash is not None and stored_off is not None and stored_off == len(matched):
+            if stored_off <= len(ctx.model_tokens):
+                current_model_hash = hash(tuple(ctx.model_tokens[:stored_off]))
+                if current_model_hash != stored_hash:
+                    logger.warning(
+                        "[CACHE_LOOKUP] Divergencia detectada entre canonical match y model_tokens "
+                        "(stored_off=%d, stored_hash=%s, current_hash=%s). Descartando como miss funcional (fail-closed).",
+                        stored_off, stored_hash, current_model_hash
+                    )
+                    kv = None
+                    matched = []
+                else:
+                    matched_model_len = stored_off
+            else:
+                logger.warning(
+                    "[CACHE_LOOKUP] model_tokens demasiado corto para stored_off (%d < %d). Descartando como miss.",
+                    len(ctx.model_tokens), stored_off
+                )
+                kv = None
+                matched = []
+
+        if kv is not None and matched:
+            ctx.prompt_cache = kv
+            ctx.rest_count = max(0, len(ctx.model_tokens) - matched_model_len) if ctx.model_tokens else max(0, len(tokens) - len(matched))
+            ctx.cache_hit_ratio = len(matched) / max(len(tokens), 1)
+            return
 
     # 2. Fallback determinístico a TPC si no hubo hit en Radix y hay tools configuradas (Opción B)
     tpc = getattr(state, "tpc", None)
@@ -518,6 +546,12 @@ def postprocess(
                 if restored:
                     ckpt_len = ctx.checkpoint.cache_key_len
                     checkpoint_key = base_key[:ckpt_len]
+                    # Adjuntar metadata de verificación de alineamiento (FIX-31)
+                    if ctx.checkpoint.model_offset is not None and ctx.checkpoint.model_prefix_hash is not None:
+                        if isinstance(ctx.prompt_cache, list) and len(ctx.prompt_cache) > 0:
+                            if hasattr(ctx.prompt_cache[0], "__dict__"):
+                                ctx.prompt_cache[0].__model_offset__ = ctx.checkpoint.model_offset
+                                ctx.prompt_cache[0].__model_prefix_hash__ = ctx.checkpoint.model_prefix_hash
                     radix.insert(checkpoint_key, ctx.prompt_cache, slot=slot)
                     logger.info(
                         "[POSTPROCESS] [DECISION] Híbrido restaurado e insertado: %d tokens en slot '%s' (generated_tokens descartados)",
@@ -535,6 +569,14 @@ def postprocess(
         else:
             # ── CAMINO PURE-KV ──────────────────────────────────────────────
             full_key = base_key + (ctx.generated_tokens or [])
+            # Adjuntar metadata de verificación de alineamiento (FIX-31)
+            full_model_tokens = list(ctx.model_tokens or []) + list(ctx.generated_tokens or [])
+            full_model_off = len(full_model_tokens)
+            full_model_hash = hash(tuple(full_model_tokens))
+            if isinstance(ctx.prompt_cache, list) and len(ctx.prompt_cache) > 0:
+                if hasattr(ctx.prompt_cache[0], "__dict__"):
+                    ctx.prompt_cache[0].__model_offset__ = full_model_off
+                    ctx.prompt_cache[0].__model_prefix_hash__ = full_model_hash
             radix.insert(full_key, ctx.prompt_cache, slot=slot)
             logger.info(
                 "[POSTPROCESS] [DECISION] Pure-KV insertado: %d tokens (base=%d + gen=%d) en slot '%s'",

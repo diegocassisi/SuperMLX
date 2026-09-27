@@ -427,12 +427,25 @@ def _slice_kv_for_prefix(kv_cache: Any, tokens_to_trim: int, trim_fn: Optional[C
                 )
                 return None
 
+    def _clean_metadata(obj: Any) -> Any:
+        targets = [obj]
+        if isinstance(obj, (list, tuple)) and len(obj) > 0:
+            targets.append(obj[0])
+        for target in targets:
+            for attr in ("__model_offset__", "__model_prefix_hash__"):
+                if hasattr(target, attr):
+                    try:
+                        delattr(target, attr)
+                    except Exception:
+                        setattr(target, attr, None)
+        return obj
+
     # Caso 1: Soporte directo de objetos mock o custom de pruebas unitarias
     if hasattr(kv_cache, "trim") and callable(kv_cache.trim):
         try:
             copied = copy.deepcopy(kv_cache)
             copied.trim(tokens_to_trim)
-            return copied
+            return _clean_metadata(copied)
         except Exception as err:
             logger.warning("[RADIX_SPLIT] Error recortando kv_cache custom: %s", err)
 
@@ -441,7 +454,7 @@ def _slice_kv_for_prefix(kv_cache: Any, tokens_to_trim: int, trim_fn: Optional[C
         try:
             copied = copy.deepcopy(kv_cache)
             trim_fn(copied, tokens_to_trim)
-            return copied
+            return _clean_metadata(copied)
         except Exception as err:
             logger.warning("[RADIX_SPLIT] Error en trim_fn inyectada: %s", err)
 
@@ -452,10 +465,11 @@ def _slice_kv_for_prefix(kv_cache: Any, tokens_to_trim: int, trim_fn: Optional[C
             copied = copy.deepcopy(kv_cache)
             if can_trim_prompt_cache(copied):
                 trim_prompt_cache(copied, tokens_to_trim)
-                return copied
+                return _clean_metadata(copied)
     except ImportError:
         pass
     except Exception as err:
         logger.warning("[RADIX_SPLIT] Error en trim_prompt_cache nativo: %s", err)
 
     return None
+
