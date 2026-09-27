@@ -142,14 +142,14 @@ def _post_generation_cache_update(
 
     if skip_cache_store:
         if (
-            SETTINGS.feature_housekeeping_staging
+            _settings.feature_housekeeping_staging
             and not is_compact
             and session_id_for_turn
             and prompt_cache is not None
         ):
             success = _housekeeping_staging_manager.store_or_update(
                 session_id=session_id_for_turn,
-                model_name=SETTINGS.model_path,
+                model_name=_settings.model_path,
                 staged_cache=prompt_cache,
                 prompt_tokens=prompt_tokens,
                 model_tokens=model_tokens if model_tokens is not None else prompt_tokens,
@@ -176,7 +176,7 @@ def _post_generation_cache_update(
                     _restored = _rollback_arrays_cache(prompt_cache, housekeeping_pre_snapshot)
                     if _restored:
                         _prompt_cache.insert_cache(
-                            SETTINGS.model_path,
+                            _settings.model_path,
                             list(housekeeping_original_tokens),
                             prompt_cache,
                         )
@@ -194,7 +194,7 @@ def _post_generation_cache_update(
             _restored = _rollback_arrays_cache(prompt_cache, housekeeping_pre_snapshot)
             if _restored:
                 _prompt_cache.insert_cache(
-                    SETTINGS.model_path,
+                    _settings.model_path,
                     list(housekeeping_original_tokens),
                     prompt_cache,
                 )
@@ -295,10 +295,10 @@ def _post_generation_cache_update(
     # The 5000-token guard in _insert_cache_entries still filters noise.
     _is_real_startup = (
         len(messages) == 2
-        and not _DPC.disk_cache_saved
+        and not _dpc.disk_cache_saved
     )
     _insert_cache_entries(
-        model_name=SETTINGS.model_path,
+        model_name=_settings.model_path,
         session_ctx=session_ctx,
         cache_key=cache_key,
         prompt_cache=prompt_cache,
@@ -424,7 +424,7 @@ def _insert_cache_entries(
     _store = prompt_cache_store_override if prompt_cache_store_override is not None else _prompt_cache
     if (
         prompt_cache_store_override is None
-        and SETTINGS.prompt_cache_max_entries_global <= 1
+        and _settings.prompt_cache_max_entries_global <= 1
         and _store._entries
     ):
         _existing_len = max(
@@ -474,7 +474,7 @@ def _insert_cache_entries(
                         except (TypeError, AttributeError):
                             pass
 
-                if SETTINGS.prompt_cache_max_entries_global >= 2:
+                if _settings.prompt_cache_max_entries_global >= 2:
                     # Multi-slot: also deepcopy a prompt-only checkpoint into a secondary slot
                     try:
                         prompt_only_cache = copy.deepcopy(prompt_cache)
@@ -490,7 +490,7 @@ def _insert_cache_entries(
                     f"Cache preserved for tool turn: {_full_kv_off} tokens "
                     f"(retained {len(generated_tokens)} response/tool tokens | hash verified)",
                 )
-            elif SETTINGS.prompt_cache_max_entries_global >= 2 and _is_vlm:
+            elif _settings.prompt_cache_max_entries_global >= 2 and _is_vlm:
                 # Multi-slot VLM: deepcopy for a prompt-only checkpoint
                 try:
                     prompt_only_cache = copy.deepcopy(prompt_cache)
@@ -538,7 +538,7 @@ def _insert_cache_entries(
     _active_store = prompt_cache_store_override if prompt_cache_store_override is not None else _prompt_cache
 
     # ── AUTO-SAVE MAIN CACHE TO DISK ──────────────────────────────────────────
-    persist_path = Path(SETTINGS.cache_persist_path) if SETTINGS.cache_persist_path else None
+    persist_path = Path(_settings.cache_persist_path) if _settings.cache_persist_path else None
 
     # ── WARMUP CACHE AUTO-SAVE: DESCONECTADO (REEMPLAZADO POR TPC) ─────────────
     # El sistema utiliza Tool Prefix Cache (TPC) como única fuente de verdad (SSoT)
@@ -547,7 +547,7 @@ def _insert_cache_entries(
     _should_save = False
 
     if _should_save:
-        _DPC.disk_cache_saved = True
+        _dpc.disk_cache_saved = True
         # ── FIX: Save PROMPT-ONLY tokens, not prompt+response ────────────
         # cache_key at this point = prompt_tokens + generated_tokens.
         # Saving generated_tokens to disk contaminates the warmup cache:
@@ -619,8 +619,8 @@ def _insert_cache_entries(
                         # FIX-31 v7 + DPC: Update frozen cache with this CLEAN
                         # trimmed copy so pollution restore has full prompt
                         # coverage (not just seed tokens).
-                        _DPC.frozen_cache = _save_cache
-                        _DPC.frozen_tokens = list(_prompt_only_key)
+                        _dpc.frozen_cache = _save_cache
+                        _dpc.frozen_tokens = list(_prompt_only_key)
                         _terminal_status("🧊", f"DPC: frozen cache updated | {len(_save_cache)} layers | {len(_prompt_only_key)} tokens")
                         # FIX-31 DIAG: verify frozen cache is clean after update
                         _cache_diag.compare(None, _save_cache, list(_prompt_only_key), "frozen_update", "",
@@ -635,8 +635,8 @@ def _insert_cache_entries(
             # DPC: compute prefix hash from the prompt-only tokens for auto-healing
             _prefix_hash = _wm.compute_prefix_hash(
                 _prompt_only_key,
-                model_path=SETTINGS.model_path,
-                kv_bits=SETTINGS.kv_bits,
+                model_path=_settings.model_path,
+                kv_bits=_settings.kv_bits,
             )
             threading.Thread(
                 target=_warmup_save_cache_fn,
@@ -646,7 +646,7 @@ def _insert_cache_entries(
                 name="dpc-cache-save",
             ).start()
         else:
-            _DPC.disk_cache_saved = False  # Allow retry on next request
+            _dpc.disk_cache_saved = False  # Allow retry on next request
 
 
 
