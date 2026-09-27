@@ -264,7 +264,7 @@ SETTINGS = build_settings(script_dir=SCRIPT_DIR)
 # Prompt compression: historial largo → LanceDB → solo contexto relevante.
 # Requiere rag_enricher.py + lancedb + sentence-transformers.
 # Env: FEATURE_COMPRESSOR=true | COMPRESSION_THRESHOLD=6000 | COMPRESSION_GUARD=6
-FEATURE_COMPRESSOR            = _env_str("FEATURE_COMPRESSOR", "false").lower() in ("1", "true", "yes")
+# FEATURE_COMPRESSOR: now in rag_facade
 
 
 # Hermes compact prompt swap: when Hermes sends a compaction request,
@@ -316,8 +316,8 @@ PREFILL_STEP_SIZE             = int(_env_str("PREFILL_STEP_SIZE", "256"))
 # RAG codebase enrichment: inyecta chunks relevantes del codebase en el context.
 # Requiere rag_enricher.py + lancedb + sentence-transformers.
 # Env: FEATURE_RAG_ENRICHMENT=true | RAG_WORKSPACE_ROOT=/path/to/workspace
-FEATURE_RAG_ENRICHMENT        = _env_str("FEATURE_RAG_ENRICHMENT", "false").lower() in ("1", "true", "yes")
-FEATURE_RAG_WORKSPACE_ROOT    = _env_str("RAG_WORKSPACE_ROOT", "")
+# FEATURE_RAG_ENRICHMENT: now in rag_facade
+# FEATURE_RAG_WORKSPACE_ROOT: now in rag_facade
 
 # Diagnostic HTTP headers (X-Pipeline-Compression-Ms, X-Pipeline-RAG-Ms, etc.)
 FEATURE_DIAGNOSTIC_HEADERS = True
@@ -376,8 +376,8 @@ def _tool_audit_write(request_id: str, stage: str, data: dict) -> None:
 # No attach/detach needed — routing state is module-level inside expert_cache.
 
 # Compressor: config (env-var driven above, these are runtime defaults for rag_enricher)
-FEATURE_COMPRESSION_THRESHOLD = _env_int("COMPRESSION_THRESHOLD", 6000)
-FEATURE_COMPRESSION_GUARD     = _env_int("COMPRESSION_GUARD", 6)
+# FEATURE_COMPRESSION_THRESHOLD: now in rag_facade
+# FEATURE_COMPRESSION_GUARD: now in rag_facade
 
 # ── Compression Cache: extracted to server2components/compress_cache.py ────────
 from .server2components import compress_cache as _cc
@@ -385,7 +385,7 @@ _compress_cache_get = _cc.cache_get
 _compress_cache_put = _cc.cache_put
 _compress_with_cache = _cc.compress_with_cache
 
-FEATURE_RAG_RELEVANCE_THRESHOLD = 1.6  # Qwen3-Embed asymmetric (docs without prefix). Tested 0.8: filters too much
+# FEATURE_RAG_RELEVANCE_THRESHOLD: now in rag_facade
 
 # Tool Call Loop Breaker: detect and break infinite tool-call retry loops.
 # When the model retries the same failed tool N consecutive times, inject a
@@ -815,11 +815,11 @@ def _cascade_forward_request(body: Dict[str, Any], request_id: str,
 # These globals track runtime availability after dependency checks.
 # ══════════════════════════════════════════════════════════════════════════════
 
-_compressor_available = False
-_compressor_module = None     # Will be set to rag_enricher module
+# _compressor_available: set after rag_facade.init()
+# _compressor_module: set after rag_facade.init()
 
-_rag_available = False
-_rag_module = None            # Will be set to rag_enricher module (same module)
+# _rag_available: set after rag_facade.init()
+# _rag_module: set after rag_facade.init()
 
 _terminal_status = _rlog.terminal_status
 
@@ -2323,66 +2323,19 @@ _terminal_status("🗜️", f"KV Cache Quantization (native mlx-lm): {_kv_desc}"
 # Failures are logged but never crash startup — graceful degradation.
 # ══════════════════════════════════════════════════════════════════════════════
 # --- RAG Enricher ---
-if FEATURE_RAG_ENRICHMENT:
-    try:
-        from . import rag_enricher as _rag_mod
-        _rag_mod.RELEVANCE_THRESHOLD = FEATURE_RAG_RELEVANCE_THRESHOLD
-        _rag_module = _rag_mod
-        _rag_available = True
-        _terminal_status(
-            "🔍",
-            f"RAG Enricher: ACTIVATED"
-            f" | top_k={_rag_mod.TOP_K}"
-            f" | relevance_threshold={FEATURE_RAG_RELEVANCE_THRESHOLD}"
-            f" | embedding={_rag_mod.EMBED_MODEL_NAME} (MPS)"
-        )
-        # RAG index: blocking — SYSTEM READY appears only when the index is ready.
-        if FEATURE_RAG_WORKSPACE_ROOT:
-            try:
-                _terminal_status("🔍", f"RAG: indexando workspace | root={FEATURE_RAG_WORKSPACE_ROOT}")
-                _rag_mod.init(codebase_root=FEATURE_RAG_WORKSPACE_ROOT)
-                _terminal_status("✅", "RAG: workspace index ready")
-            except Exception as _idx_err:
-                _terminal_status("⚠️", f"RAG: indexing failed ({_idx_err})")
-        else:
-            _terminal_status("ℹ️", "RAG: no RAG_WORKSPACE_ROOT set — enricher active but index empty")
-    except ImportError as e:
-        _terminal_status("⚠️", f"RAG Enricher: UNAVAILABLE (import failed: {e})")
-    except Exception as e:
-        _terminal_status("❌", f"RAG Enricher: FAILED to initialize ({e})")
-else:
-    _terminal_status("ℹ️", "RAG Enricher: DISABLED (FEATURE_RAG_ENRICHMENT=False)")
+# ── RAG + Compressor: extracted to server2components/rag_facade.py ─────────────
+from .server2components import rag_facade as _rag_facade
+_rag_facade.init(terminal_status_fn=_terminal_status)
+_rag_available = _rag_facade.is_rag_available()
+_rag_module = _rag_facade.get_rag_module()
+_compressor_available = _rag_facade.is_compressor_available()
+_compressor_module = _rag_facade.get_compressor_module()
+FEATURE_COMPRESSOR = _rag_facade.FEATURE_COMPRESSOR
+FEATURE_RAG_ENRICHMENT = _rag_facade.FEATURE_RAG_ENRICHMENT
+FEATURE_COMPRESSION_THRESHOLD = _rag_facade.FEATURE_COMPRESSION_THRESHOLD
+FEATURE_COMPRESSION_GUARD = _rag_facade.FEATURE_COMPRESSION_GUARD
+FEATURE_RAG_RELEVANCE_THRESHOLD = _rag_facade.FEATURE_RAG_RELEVANCE_THRESHOLD
 
-# --- Prompt Compressor ---
-if FEATURE_COMPRESSOR:
-    try:
-        # Compressor uses the same rag_enricher module
-        if _rag_module is not None:
-            _compressor_module = _rag_module
-        else:
-            from . import rag_enricher as _comp_mod
-            _compressor_module = _comp_mod
-        _compressor_available = True
-        _terminal_status(
-            "🗜️",
-            f"Compressor: ACTIVATED | threshold={FEATURE_COMPRESSION_THRESHOLD} tok | "
-            f"guard={FEATURE_COMPRESSION_GUARD} msgs"
-        )
-        # Precarga de modelos auxiliares al startup — evita 20s de penalty en el primer request.
-        # Los modelos se leen de ~/.cache/huggingface/ (local, sin internet).
-        try:
-            _terminal_status("🗜️", "Compressor: precargando reranker + LLMLingua (CPU)...")
-            _compressor_module._load_reranker()
-            _compressor_module._load_llmlingua()
-            _terminal_status("✅", "Compressor: modelos auxiliares listos en CPU")
-        except Exception as _preload_err:
-            _terminal_status("⚠️", f"Compressor: partial preload ({_preload_err}) — will load lazily on first request")
-    except ImportError as e:
-        _terminal_status("⚠️", f"Compressor: UNAVAILABLE (import failed: {e})")
-    except Exception as e:
-        _terminal_status("❌", f"Compressor: FAILED to initialize ({e})")
-else:
-    _terminal_status("ℹ️", "Compressor: DISABLED (FEATURE_COMPRESSOR=False)")
 
 
 # --- Feature flags summary ---
