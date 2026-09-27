@@ -832,6 +832,7 @@ from .server3components.state import ServerState
 from .server3components.pipeline import (
     preprocess as _pipeline_preprocess,
     cache_lookup as _pipeline_cache_lookup,
+    generate as _pipeline_generate,
 )
 
 
@@ -3898,7 +3899,9 @@ class APIHandler(BaseHTTPRequestHandler):
                     rest_tokens = _adaptive_prefill(rest_tokens, prompt_cache, request_id)
 
                 if not is_vlm:
-                    hybrid_generation_checkpoint = _capture_hybrid_checkpoint_before_generation(
+                    # ── FASE D.3: GENERATE (checkpoint capture) ───────────────
+                    _pipeline_generate(ctx, _server_state)
+                    hybrid_generation_checkpoint = ctx.checkpoint or _capture_hybrid_checkpoint_before_generation(
                         request_id=request_id,
                         prompt_cache=prompt_cache,
                         prompt_tokens=prompt_tokens,
@@ -4327,7 +4330,9 @@ class APIHandler(BaseHTTPRequestHandler):
                     rest_tokens = _adaptive_prefill(rest_tokens, prompt_cache, request_id)
 
                 if not is_vlm:
-                    hybrid_generation_checkpoint = _capture_hybrid_checkpoint_before_generation(
+                    # ── FASE D.3: GENERATE (checkpoint capture) ───────────────
+                    _pipeline_generate(ctx, _server_state)
+                    hybrid_generation_checkpoint = ctx.checkpoint or _capture_hybrid_checkpoint_before_generation(
                         request_id=request_id,
                         prompt_cache=prompt_cache,
                         prompt_tokens=prompt_tokens,

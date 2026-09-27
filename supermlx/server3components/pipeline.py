@@ -382,9 +382,71 @@ def cache_lookup(ctx: RequestContext, state: ServerState, radix: RadixPromptCach
     ctx.cache_hit_ratio = 0.0
 
 
-def generate(ctx: RequestContext, state) -> None:
-    """Fase 3: Prefill adaptativo + decode."""
-    raise NotImplementedError
+from ..cache_engine import capture_hybrid_generation_checkpoint, _is_arrays_cache
+from .adaptive_prefill import _adaptive_prefill
+
+
+def generate(
+    ctx: RequestContext,
+    state: ServerState,
+    generator_fn: Optional[Callable[[list[int], RequestContext, ServerState], Any]] = None,
+) -> None:
+    """
+    Fase 3: Prefill adaptativo + captura de checkpoint pre-decode + generación de tokens.
+    Muta ctx in-place:
+    - ctx.cache_has_recurrent_layers: flag crítico para postprocess.
+    - ctx.checkpoint: snapshot limpio antes de que cualquier token de decode contamine el estado.
+    - ctx.generated_tokens: lista de token IDs producidos.
+    - ctx.finish_reason: motivo de terminación ('stop', 'length', etc.).
+    """
+    model_toks = ctx.model_tokens or ctx.prompt_tokens or []
+    # Calcular los tokens restantes a prefillear según rest_count
+    if ctx.rest_count > 0 and ctx.rest_count <= len(model_toks):
+        rest_tokens = model_toks[-ctx.rest_count :]
+    else:
+        rest_tokens = list(model_toks)
+
+    # 1. Detección estricta de capas recurrentes (ArraysCache / Marconi pattern)
+    has_recurrent = False
+    if ctx.prompt_cache and isinstance(ctx.prompt_cache, list):
+        has_recurrent = any(_is_arrays_cache(c) for c in ctx.prompt_cache)
+    ctx.cache_has_recurrent_layers = has_recurrent
+
+    # 2. Adaptive prefill: procesar rest_tokens[:-1] en chunks dinámicos
+    if not getattr(state, "is_vlm", False) and len(rest_tokens) > 1:
+        try:
+            rest_tokens = _adaptive_prefill(rest_tokens, ctx.prompt_cache, ctx.request_id)
+        except Exception as ap_err:
+            logger.debug("[GENERATE] Adaptive prefill fallback: %s", ap_err)
+
+    # 3. Checkpoint capture ANTES de generar (contrato inviolable contra contaminación KV)
+    if has_recurrent and not getattr(state, "is_vlm", False) and ctx.prompt_cache:
+        try:
+            # Invocar checkpoint() nativo en cada ArraysCache
+            for c in ctx.prompt_cache:
+                if hasattr(c, "checkpoint") and callable(c.checkpoint):
+                    c.checkpoint()
+
+            remaining = len(rest_tokens)
+            expected_offset = max(0, len(model_toks) - remaining)
+            canonical_key_len = max(0, len(ctx.prompt_tokens or []) - remaining)
+
+            ctx.checkpoint = capture_hybrid_generation_checkpoint(
+                ctx.prompt_cache,
+                cache_key_len=canonical_key_len,
+                model_offset=expected_offset,
+                model_prefix_hash=hash(tuple(model_toks[:expected_offset])),
+            )
+        except Exception as ckpt_err:
+            logger.debug("[GENERATE] Falló captura de hybrid checkpoint: %s", ckpt_err)
+
+    # 4. Ejecución del generador si está provisto
+    if generator_fn is not None:
+        generator_fn(rest_tokens, ctx, state)
+    else:
+        # Fallback para pruebas o cuando el decode es gestionado externamente
+        if not ctx.finish_reason:
+            ctx.finish_reason = "stop"
 
 
 def postprocess(ctx: RequestContext, state, radix: RadixPromptCache) -> None:
