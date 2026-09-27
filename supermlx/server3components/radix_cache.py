@@ -397,20 +397,44 @@ def _slice_kv_for_prefix(kv_cache: Any, tokens_to_trim: int, trim_fn: Optional[C
     Soporta:
     1. Objetos mock de test con método .trim(n) o .slice(n).
     2. Función de trim externa inyectada (trim_fn) sobre deepcopy.
-    3. mlx_lm trim_prompt_cache estándar si está disponible.
-    Si el cache no es trimmable (ej. capas recurrentes no reversibles), retorna None de forma segura.
+    3. mlx_lm trim_prompt_cache estándar si está disponible (exclusivamente para pure-KV).
+    
+    REGLA INVIOLABLE (Fail-Closed):
+    Si el cache contiene alguna capa recurrente (ArraysCache / Marconi pattern),
+    retorna None inmediatamente. El monkey-patch Marconi causa que can_trim_prompt_cache()
+    devuelva True, pero su trim() ejecuta rollback() en lugar de recorte posicional,
+    lo que corrompería silenciosamente el estado del nodo. Ante capas recurrentes,
+    la única operación válida es checkpoint/rollback, por lo que el prefijo debe forzar re-prefill.
     """
     if kv_cache is None or tokens_to_trim <= 0:
         return kv_cache
 
-    # Caso 1: Soporte directo de objetos mock o custom
+    # ── GUARD FAIL-CLOSED: Capas recurrentes (ArraysCache / hybrid models) ──
+    try:
+        from ..cache_types import is_recurrent_layer
+    except (ImportError, ValueError):
+        try:
+            from supermlx.cache_types import is_recurrent_layer
+        except Exception:
+            is_recurrent_layer = None
+
+    if isinstance(kv_cache, list):
+        for layer in kv_cache:
+            if (is_recurrent_layer is not None and is_recurrent_layer(layer)) or type(layer).__name__ == "ArraysCache":
+                logger.debug(
+                    "[RADIX_SPLIT] Fail-closed: capa recurrente detectada (%s), rechazando slice para prefix node",
+                    type(layer).__name__,
+                )
+                return None
+
+    # Caso 1: Soporte directo de objetos mock o custom de pruebas unitarias
     if hasattr(kv_cache, "trim") and callable(kv_cache.trim):
         try:
             copied = copy.deepcopy(kv_cache)
             copied.trim(tokens_to_trim)
             return copied
-        except Exception:
-            pass
+        except Exception as err:
+            logger.warning("[RADIX_SPLIT] Error recortando kv_cache custom: %s", err)
 
     # Caso 2: Función trim externa inyectada
     if trim_fn is not None:
@@ -418,10 +442,10 @@ def _slice_kv_for_prefix(kv_cache: Any, tokens_to_trim: int, trim_fn: Optional[C
             copied = copy.deepcopy(kv_cache)
             trim_fn(copied, tokens_to_trim)
             return copied
-        except Exception:
-            pass
+        except Exception as err:
+            logger.warning("[RADIX_SPLIT] Error en trim_fn inyectada: %s", err)
 
-    # Caso 3: mlx_lm nativo
+    # Caso 3: mlx_lm nativo (solo para caches pure-KV verificados)
     try:
         from mlx_lm.models.cache import can_trim_prompt_cache, trim_prompt_cache
         if isinstance(kv_cache, list):
@@ -429,7 +453,9 @@ def _slice_kv_for_prefix(kv_cache: Any, tokens_to_trim: int, trim_fn: Optional[C
             if can_trim_prompt_cache(copied):
                 trim_prompt_cache(copied, tokens_to_trim)
                 return copied
-    except (ImportError, Exception):
+    except ImportError:
         pass
+    except Exception as err:
+        logger.warning("[RADIX_SPLIT] Error en trim_prompt_cache nativo: %s", err)
 
     return None
