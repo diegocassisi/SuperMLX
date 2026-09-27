@@ -2968,8 +2968,11 @@ class APIHandler(BaseHTTPRequestHandler):
                     )
                     tool_calls = []
                     finish_reason = "stop"
-                cache_key.extend(generated_tokens)
                 # ── FASE D.4: POSTPROCESS (RadixAttention insertion + telemetry) ──
+                # NOTE: NO extender cache_key con generated_tokens aquí.
+                # postprocess() maneja internamente la bifurcación:
+                #   pure-KV: inserta base_key + generated_tokens
+                #   híbrido: inserta base_key[:checkpoint_len] (descarta generated)
                 ctx.cache_key = list(cache_key)
                 ctx.generated_tokens = list(generated_tokens)
                 ctx.finish_reason = finish_reason
@@ -3755,7 +3758,6 @@ class APIHandler(BaseHTTPRequestHandler):
                             break
                     _update_healing_store(raw_full_text, message_text, tool_calls, _heal_user_ctx)
 
-                cache_key.extend(generated_tokens)
                 # ── FASE D.4: POSTPROCESS (RadixAttention insertion + telemetry) ──
                 ctx.cache_key = list(cache_key)
                 ctx.generated_tokens = list(generated_tokens)
@@ -3792,7 +3794,6 @@ class APIHandler(BaseHTTPRequestHandler):
             # Wrapped in try/except: failure = current behavior (cache lost).
             try:
                 if prompt_cache is not None and len(cache_key) > 0:
-                    cache_key.extend(generated_tokens)
                     ctx.cache_key = list(cache_key)
                     ctx.generated_tokens = list(generated_tokens)
                     ctx.finish_reason = "disconnect"
