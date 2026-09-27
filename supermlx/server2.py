@@ -5095,6 +5095,47 @@ def run():
     server_address = (SETTINGS.mlx_host, SETTINGS.mlx_port)
     httpd = ThreadingHTTPServer(server_address, APIHandler)
 
+    # ── Module init: adaptive_prefill ─────────────────────────────────────
+    _ap_mod.init(
+        settings=SETTINGS,
+        terminal_status=_terminal_status,
+        pipeline_log=_pipeline_log,
+        guard=_guard,
+        cache_diag=_cache_diag,
+        model=model,
+        prefill_step_size=PREFILL_STEP_SIZE,
+        feature_cache_diag=FEATURE_CACHE_DIAG,
+        feature_full_logging=FEATURE_FULL_LOGGING,
+    )
+
+    # ── Module init: post_generation ──────────────────────────────────────
+    _post_gen.init(
+        settings=SETTINGS,
+        terminal_status=_terminal_status,
+        pipeline_log=_pipeline_log,
+        tokenize_prompt=_tokenize_prompt,
+        thinking_tracker=_thinking_tracker,
+        prompt_cache=PROMPT_CACHE,
+        session_index=SESSION_INDEX,
+        cache_diag=_cache_diag,
+        kv_cache_offset=_kv_cache_offset,
+        update_session_turn_store=_update_session_turn_store,
+        dpc=_DPC,
+        wm=_wm,
+        warmup_save_cache=_warmup_save_cache if '_warmup_save_cache' in dir() else None,
+        housekeeping_staging_manager=HOUSEKEEPING_STAGING_MANAGER if 'HOUSEKEEPING_STAGING_MANAGER' in dir() else None,
+        feature_housekeeping_cache_borrow=FEATURE_HOUSEKEEPING_CACHE_BORROW,
+        feature_log_generation=FEATURE_LOG_GENERATION,
+        feature_log_resp=FEATURE_LOG_RESP,
+        is_vlm=is_vlm,
+        prepare_cache_for_insertion=prepare_cache_for_insertion,
+        restore_hybrid_checkpoint=restore_hybrid_generation_checkpoint,
+        rollback_arrays_cache=rollback_arrays_cache,
+        can_trim_prompt_cache=can_trim_prompt_cache,
+        trim_prompt_cache=trim_prompt_cache,
+        HybridGenerationCheckpoint=HybridGenerationCheckpoint,
+    )
+
     # ── SIDECAR: Start lightweight endpoint in daemon thread ───────────
     sidecar_httpd = None
     if SETTINGS.sidecar_port > 0:
