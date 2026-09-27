@@ -17,6 +17,7 @@ SSoT: pipeline.py es la única definición de las 4 fases de ejecución para ser
 """
 from __future__ import annotations
 
+import copy
 import logging
 import threading
 import time
@@ -61,43 +62,6 @@ def _tokenize_text(tokenizer: Any, text: str) -> list[int]:
         return tokenizer.encode(text, add_special_tokens=add_special)
     except TypeError:
         return tokenizer.encode(text)
-
-
-def materialize_cache(cache: Any) -> None:
-    """Evalúa forzosamente y sincroniza todos los tensores del KV cache en el hilo actual.
-
-    Obligatorio en entornos multi-hilo (ThreadingHTTPServer) para evitar que tensores
-    lazy conserven dependencias de Stream(gpu, N) ligadas al hilo de origen.
-    """
-    if not cache:
-        return
-    try:
-        import mlx.core as mx  # type: ignore[import-untyped]
-    except ImportError:
-        return
-
-    arrays_to_eval = []
-    try:
-        for c in cache:
-            if hasattr(c, "state") and c.state is not None:
-                if isinstance(c.state, mx.array):
-                    arrays_to_eval.append(c.state)
-                elif isinstance(c.state, (list, tuple)):
-                    arrays_to_eval.extend([a for a in c.state if isinstance(a, mx.array)])
-            if hasattr(c, "cache") and c.cache is not None:
-                if isinstance(c.cache, (list, tuple)):
-                    arrays_to_eval.extend([a for a in c.cache if isinstance(a, mx.array)])
-            if hasattr(c, "keys") and isinstance(c.keys, mx.array):
-                arrays_to_eval.append(c.keys)
-            if hasattr(c, "values") and isinstance(c.values, mx.array):
-                arrays_to_eval.append(c.values)
-        if arrays_to_eval:
-            mx.eval(*arrays_to_eval)
-        if hasattr(mx, "synchronize"):
-            mx.synchronize()
-    except Exception as e:
-        logger.error("[MATERIALIZE_CACHE] Error evaluando tensores de cache: %s", str(e))
-        raise
 
 
 def preprocess(ctx: RequestContext, state: ServerState) -> None:
@@ -370,7 +334,7 @@ def cache_lookup(ctx: RequestContext, state: ServerState, radix: RadixPromptCach
 
     # Si hay match estructural pero kv_cache es None -> MISS funcional (P4)
     if kv is not None and matched:
-        ctx.prompt_cache = kv
+        ctx.prompt_cache = copy.deepcopy(kv)
         matched_len = len(matched)
         ctx.rest_count = max(0, len(ctx.model_tokens) - matched_len) if ctx.model_tokens else max(0, len(tokens) - matched_len)
         ctx.cache_hit_ratio = matched_len / max(len(tokens), 1)
@@ -458,7 +422,6 @@ def generate(
     if not getattr(state, "is_vlm", False) and len(rest_tokens) > 1:
         try:
             rest_tokens = _adaptive_prefill(rest_tokens, ctx.prompt_cache, ctx.request_id)
-            materialize_cache(ctx.prompt_cache)
         except Exception as ap_err:
             logger.debug("[GENERATE] Adaptive prefill fallback: %s", ap_err)
 
@@ -489,7 +452,6 @@ def generate(
     # 4. Ejecución del generador si está provisto
     if generator_fn is not None:
         generator_fn(rest_tokens, ctx, state)
-        materialize_cache(ctx.prompt_cache)
     else:
         # Fallback para pruebas o cuando el decode es gestionado externamente
         if not ctx.finish_reason:
@@ -556,7 +518,6 @@ def postprocess(
                 if restored:
                     ckpt_len = ctx.checkpoint.cache_key_len
                     checkpoint_key = base_key[:ckpt_len]
-                    materialize_cache(ctx.prompt_cache)
                     radix.insert(checkpoint_key, ctx.prompt_cache, slot=slot)
                     logger.info(
                         "[POSTPROCESS] [DECISION] Híbrido restaurado e insertado: %d tokens en slot '%s' (generated_tokens descartados)",
@@ -574,7 +535,6 @@ def postprocess(
         else:
             # ── CAMINO PURE-KV ──────────────────────────────────────────────
             full_key = base_key + (ctx.generated_tokens or [])
-            materialize_cache(ctx.prompt_cache)
             radix.insert(full_key, ctx.prompt_cache, slot=slot)
             logger.info(
                 "[POSTPROCESS] [DECISION] Pure-KV insertado: %d tokens (base=%d + gen=%d) en slot '%s'",

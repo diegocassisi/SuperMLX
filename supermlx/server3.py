@@ -839,7 +839,6 @@ from .server3components.pipeline import (
     cache_lookup as _pipeline_cache_lookup,
     generate as _pipeline_generate,
     postprocess as _pipeline_postprocess,
-    materialize_cache as _materialize_cache,
 )
 
 
@@ -1879,55 +1878,6 @@ _terminal_status(
 
 # _adaptive_prefill_chunk, _get_vm_counters, _adaptive_prefill: moved to adaptive_prefill.py
 
-def _split_and_commit_housekeeping_history(
-    prompt_cache: Any,
-    model_tokens: List[int],
-    conv_model_boundary: int,
-    conv_prompt_tokens: Optional[List[int]],
-    cache_session_tokens: Optional[List[int]],
-    session_ctx: Optional[SessionContext],
-    request_id: str,
-) -> Tuple[List[int], Optional[Dict[str, Any]], Optional[Tuple[int, ...]]]:
-    """Prefill conversation history up to conv_model_boundary, commit to PROMPT_CACHE,
-
-    and capture base snapshot before prefilling the ephemeral housekeeping tail.
-    """
-    curr_kv_off = _kv_cache_offset(prompt_cache) or 0
-    if curr_kv_off < conv_model_boundary:
-        conv_to_prefill = model_tokens[curr_kv_off:conv_model_boundary]
-        if conv_to_prefill:
-            _adaptive_prefill(
-                conv_to_prefill,
-                prompt_cache,
-                request_id,
-                leave_last_token=False,
-            )
-
-    with prompt_cache_lock:
-        if conv_prompt_tokens:
-            PROMPT_CACHE.insert_cache(
-                SETTINGS.model_path,
-                list(conv_prompt_tokens),
-                prompt_cache,
-            )
-            if session_ctx is not None and getattr(session_ctx, "session_id", None):
-                SESSION_INDEX.register_cache_key(session_ctx, list(conv_prompt_tokens))
-        snapshot = snapshot_arrays_cache(prompt_cache)
-        orig_tokens = (
-            tuple(conv_prompt_tokens)
-            if conv_prompt_tokens
-            else (tuple(cache_session_tokens) if cache_session_tokens else ())
-        )
-        _pipeline_log(
-            "CACHE",
-            request_id,
-            f"HOUSEKEEPING_BOUNDARY: conversation history committed to PROMPT_CACHE | "
-            f"boundary_tokens={len(orig_tokens)} | snapshot captured",
-        )
-
-    remaining_rest = model_tokens[conv_model_boundary:]
-    return remaining_rest, snapshot, orig_tokens
-
 
 
 def _stream_generate_kwargs(prompt_tokens, max_tokens, sampler, prompt_cache, logits_processors=None):
@@ -2830,7 +2780,6 @@ class APIHandler(BaseHTTPRequestHandler):
 
                 _pre_prefill_memory_relief(request_id, rest_count)
 
-
                 if not is_vlm:
                     # ── FASE D.3: GENERATE (adaptive prefill + checkpoint) ────
                     _pipeline_generate(ctx, _server_state)
@@ -3020,7 +2969,6 @@ class APIHandler(BaseHTTPRequestHandler):
                     tool_calls = []
                     finish_reason = "stop"
                 cache_key.extend(generated_tokens)
-                _materialize_cache(prompt_cache)
                 # ── FASE D.4: POSTPROCESS (RadixAttention insertion + telemetry) ──
                 ctx.cache_key = list(cache_key)
                 ctx.generated_tokens = list(generated_tokens)
@@ -3215,7 +3163,6 @@ class APIHandler(BaseHTTPRequestHandler):
                 _keepalive_thread.start()
 
                 _pre_prefill_memory_relief(request_id, rest_count)
-
 
                 if not is_vlm:
                     # ── FASE D.3: GENERATE (adaptive prefill + checkpoint) ────
@@ -3809,7 +3756,6 @@ class APIHandler(BaseHTTPRequestHandler):
                     _update_healing_store(raw_full_text, message_text, tool_calls, _heal_user_ctx)
 
                 cache_key.extend(generated_tokens)
-                _materialize_cache(prompt_cache)
                 # ── FASE D.4: POSTPROCESS (RadixAttention insertion + telemetry) ──
                 ctx.cache_key = list(cache_key)
                 ctx.generated_tokens = list(generated_tokens)
@@ -4010,12 +3956,6 @@ class APIHandler(BaseHTTPRequestHandler):
                     )
                 except Exception as _moe_post_err:
                     _terminal_status("⚠️", f"MoE post-generation hook error: {_moe_post_err}")
-                try:
-                    _pc_sync = locals().get("prompt_cache") or (getattr(ctx, "prompt_cache", None) if "ctx" in locals() else None)
-                    if _pc_sync:
-                        _materialize_cache(_pc_sync)
-                except Exception:
-                    pass
 
                 model_lock.release()
 

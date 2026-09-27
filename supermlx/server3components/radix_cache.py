@@ -149,7 +149,8 @@ class RadixPromptCache:
                 )
                 return [], None
 
-        return matched, best_kv
+        isolated_kv = copy.deepcopy(best_kv) if best_kv is not None else None
+        return matched, isolated_kv
 
     def insert(
         self,
@@ -169,6 +170,7 @@ class RadixPromptCache:
         if not tokens:
             return
 
+        kv_to_store = copy.deepcopy(kv_cache) if kv_cache is not None else None
         node = self.get_root(slot)
         remaining = list(tokens)
 
@@ -178,7 +180,7 @@ class RadixPromptCache:
                 # Caso: no hay hijo con este token inicial -> crear hoja con el sufijo restante
                 new_leaf = RadixNode(
                     tokens=remaining,
-                    kv_cache=kv_cache,
+                    kv_cache=kv_to_store,
                     slot_type=slot,  # type: ignore[arg-type]
                     pinned=pinned,
                     last_used=time.time(),
@@ -199,7 +201,7 @@ class RadixPromptCache:
                 if remaining:
                     new_leaf = RadixNode(
                         tokens=remaining,
-                        kv_cache=kv_cache,
+                        kv_cache=kv_to_store,
                         slot_type=slot,  # type: ignore[arg-type]
                         pinned=pinned,
                         last_used=time.time(),
@@ -209,7 +211,7 @@ class RadixPromptCache:
                     self._total_tokens += len(remaining)
                 else:
                     # El nuevo camino coincide exactamente con el prefix recién creado
-                    prefix_node.kv_cache = kv_cache
+                    prefix_node.kv_cache = kv_to_store
                     prefix_node.pinned = pinned or prefix_node.pinned
                     prefix_node.last_used = time.time()
                 remaining = []
@@ -220,7 +222,7 @@ class RadixPromptCache:
                 node = child
                 if not remaining:
                     # Coincidencia exacta con un nodo preexistente -> actualizar KV
-                    node.kv_cache = kv_cache
+                    node.kv_cache = kv_to_store
                     node.pinned = pinned or node.pinned
                     node.last_used = time.time()
                     break
