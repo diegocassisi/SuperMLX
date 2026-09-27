@@ -382,7 +382,11 @@ def cache_lookup(ctx: RequestContext, state: ServerState, radix: RadixPromptCach
     ctx.cache_hit_ratio = 0.0
 
 
-from ..cache_engine import capture_hybrid_generation_checkpoint, _is_arrays_cache
+from ..cache_engine import (
+    capture_hybrid_generation_checkpoint,
+    restore_hybrid_generation_checkpoint,
+    _is_arrays_cache,
+)
 from .adaptive_prefill import _adaptive_prefill
 
 
@@ -449,6 +453,95 @@ def generate(
             ctx.finish_reason = "stop"
 
 
-def postprocess(ctx: RequestContext, state, radix: RadixPromptCache) -> None:
-    """Fase 4: Inserción en radix tree + telemetría + respuesta."""
-    raise NotImplementedError
+def postprocess(
+    ctx: RequestContext,
+    state: ServerState,
+    radix: Optional[RadixPromptCache] = None,
+) -> None:
+    """
+    Fase 4: Post-procesamiento, restauración de checkpoint (si híbrido), inserción en RadixPromptCache y telemetría.
+
+    DOS caminos según ctx.cache_has_recurrent_layers:
+    1. Pure-KV (False):
+       - Clave a insertar: ctx.cache_key + (ctx.generated_tokens or [])
+       - Inserción en RadixPromptCache con todo el contexto generado.
+    2. Híbrido (True):
+       - Restaurar checkpoint primero vía restore_hybrid_generation_checkpoint(ctx.prompt_cache, ctx.checkpoint)
+       - Si la restauración es exitosa:
+           checkpoint_key = ctx.cache_key[: ctx.checkpoint.cache_key_len]
+           radix.insert(checkpoint_key, ctx.prompt_cache, slot=slot)
+           Los generated_tokens se descartan enteros del cache para evitar contaminación.
+       - Si falla: descarta la inserción (fail-closed).
+    """
+    if radix is None and state is not None:
+        radix = getattr(state, "radix_cache", None)
+
+    slot = "compact" if getattr(ctx, "is_compact", False) else "main"
+
+    # Preparar uso y métricas
+    prompt_len = len(ctx.model_tokens or ctx.prompt_tokens or [])
+    gen_len = len(ctx.generated_tokens or [])
+    ctx.usage = {
+        "prompt_tokens": prompt_len,
+        "completion_tokens": gen_len,
+        "total_tokens": prompt_len + gen_len,
+    }
+
+    # Verificar si se debe omitir la persistencia en cache
+    if getattr(ctx, "skip_cache_store", False) or ctx.prompt_cache is None or radix is None:
+        logger.debug(
+            "[POSTPROCESS] Omitiendo inserción en radix cache (skip=%s, cache_is_none=%s, radix_is_none=%s)",
+            getattr(ctx, "skip_cache_store", False),
+            ctx.prompt_cache is None,
+            radix is None,
+        )
+        return
+
+    base_key = (
+        list(ctx.cache_key)
+        if getattr(ctx, "cache_key", None)
+        else list(ctx.prompt_tokens or ctx.model_tokens or [])
+    )
+
+    lock = getattr(state, "prompt_cache_lock", None)
+
+    def _do_insert():
+        if ctx.cache_has_recurrent_layers:
+            # ── CAMINO HÍBRIDO ──────────────────────────────────────────────
+            if ctx.checkpoint is not None:
+                restored = restore_hybrid_generation_checkpoint(ctx.prompt_cache, ctx.checkpoint)
+                if restored:
+                    ckpt_len = ctx.checkpoint.cache_key_len
+                    checkpoint_key = base_key[:ckpt_len]
+                    radix.insert(checkpoint_key, ctx.prompt_cache, slot=slot)
+                    logger.info(
+                        "[POSTPROCESS] [DECISION] Híbrido restaurado e insertado: %d tokens en slot '%s' (generated_tokens descartados)",
+                        len(checkpoint_key),
+                        slot,
+                    )
+                else:
+                    logger.warning(
+                        "[POSTPROCESS] [ERROR] Falló restore_hybrid_generation_checkpoint — cache descartado (fail-closed)"
+                    )
+            else:
+                logger.warning(
+                    "[POSTPROCESS] [ERROR] Cache híbrido sin checkpoint disponible — cache descartado (fail-closed)"
+                )
+        else:
+            # ── CAMINO PURE-KV ──────────────────────────────────────────────
+            full_key = base_key + (ctx.generated_tokens or [])
+            radix.insert(full_key, ctx.prompt_cache, slot=slot)
+            logger.info(
+                "[POSTPROCESS] [DECISION] Pure-KV insertado: %d tokens (base=%d + gen=%d) en slot '%s'",
+                len(full_key),
+                len(base_key),
+                len(ctx.generated_tokens or []),
+                slot,
+            )
+
+    if lock is not None:
+        with lock:
+            _do_insert()
+    else:
+        _do_insert()
+

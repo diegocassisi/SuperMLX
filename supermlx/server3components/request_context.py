@@ -56,6 +56,8 @@ class RequestContext:
     vlm_kwargs: Any = None
 
     # ── cache_lookup ───────────────────────────────────────────
+    cache_key: Optional[list[int]] = None
+    skip_cache_store: bool = False
     rest_count: int = 0                 # tokens no cubiertos por cache hit
     cache_hit_ratio: Optional[float] = None
     prompt_cache: Any = None            # handle al objeto de mlx cache

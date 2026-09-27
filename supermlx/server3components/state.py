@@ -57,3 +57,6 @@ class ServerState:
 
     # ── Concurrency ───────────────────────────────────────────────────────
     console_lock: threading.Lock        # Protects terminal output
+
+    # ── Fase D: RadixAttention ────────────────────────────────────────────
+    radix_cache: Any = None             # RadixPromptCache instance (SSoT for prefix caching)

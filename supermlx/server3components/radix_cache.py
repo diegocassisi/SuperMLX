@@ -151,11 +151,21 @@ class RadixPromptCache:
 
         return matched, best_kv
 
-    def insert(self, tokens: list[int], kv_cache: Any, slot: str = "main", pinned: bool = False) -> None:
+    def insert(
+        self,
+        tokens: list[int],
+        kv_cache: Any,
+        slot: str = "main",
+        pinned: bool = False,
+        is_compact: bool = False,
+    ) -> None:
         """
         Inserta una secuencia de tokens y su KV cache en el árbol del slot especificado.
+        Si is_compact es True, fuerza slot='compact'.
         Si la inserción supera max_tokens, dispara evict_lru para mantener el presupuesto.
         """
+        if is_compact:
+            slot = "compact"
         if not tokens:
             return
 

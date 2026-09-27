@@ -833,6 +833,7 @@ from .server3components.pipeline import (
     preprocess as _pipeline_preprocess,
     cache_lookup as _pipeline_cache_lookup,
     generate as _pipeline_generate,
+    postprocess as _pipeline_postprocess,
 )
 
 
@@ -855,6 +856,7 @@ def _get_current_server_state() -> ServerState:
         tool_call_tracker=_tool_call_tracker,
         settings=SETTINGS,
         console_lock=console_lock,
+        radix_cache=RADIX_PROMPT_CACHE,
     )
 
 
@@ -4092,6 +4094,13 @@ class APIHandler(BaseHTTPRequestHandler):
                     tool_calls = []
                     finish_reason = "stop"
                 cache_key.extend(generated_tokens)
+                # ── FASE D.4: POSTPROCESS (RadixAttention insertion + telemetry) ──
+                ctx.cache_key = list(cache_key)
+                ctx.generated_tokens = list(generated_tokens)
+                ctx.finish_reason = finish_reason
+                ctx.skip_cache_store = _is_housekeeping
+                _pipeline_postprocess(ctx, _server_state, RADIX_PROMPT_CACHE)
+
                 with prompt_cache_lock:
                     _post_generation_cache_update(
                         request_id=request_id,
@@ -4926,6 +4935,13 @@ class APIHandler(BaseHTTPRequestHandler):
                     _update_healing_store(raw_full_text, message_text, tool_calls, _heal_user_ctx)
 
                 cache_key.extend(generated_tokens)
+                # ── FASE D.4: POSTPROCESS (RadixAttention insertion + telemetry) ──
+                ctx.cache_key = list(cache_key)
+                ctx.generated_tokens = list(generated_tokens)
+                ctx.finish_reason = finish_reason
+                ctx.skip_cache_store = _is_housekeeping
+                _pipeline_postprocess(ctx, _server_state, RADIX_PROMPT_CACHE)
+
                 with prompt_cache_lock:
                     _post_generation_cache_update(
                         request_id=request_id,
