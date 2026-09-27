@@ -145,3 +145,99 @@ def vlm_sync_before_generation(pixel_values: Any, mask: Any) -> None:
             mx.eval(*to_eval)
         except Exception:
             pass
+
+
+def _extract_images_from_messages(messages: List[Dict[str, Any]]) -> List[Any]:
+    """
+    Extract image sources from OpenAI-style content (type image_url / input_image).
+    Returns list in message order (data URL strings or PIL Images for prepare_inputs).
+    """
+    import base64
+    from io import BytesIO
+
+    images = []
+    for msg in messages:
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            url = None
+            if part.get("type") == "image_url":
+                u = part.get("image_url") or {}
+                url = u.get("url") if isinstance(u, dict) else None
+            elif part.get("type") == "input_image":
+                u = part.get("input_image") or part.get("image_url") or {}
+                url = (
+                    u.get("url")
+                    if isinstance(u, dict)
+                    else u
+                    if isinstance(u, str)
+                    else None
+                )
+            if not url or not isinstance(url, str):
+                continue
+            url = url.strip()
+            if url.startswith("data:image/") and "," in url:
+                try:
+                    _, b64 = url.split(",", 1)
+                    from PIL import Image
+
+                    img = Image.open(BytesIO(base64.b64decode(b64))).convert("RGB")
+                    images.append(img)
+                except Exception:
+                    images.append(url)
+            else:
+                images.append(url)
+    return images
+
+
+def _prepare_messages_for_vlm(
+    messages: List[Dict[str, Any]], tools: Optional[Any] = None
+) -> List[Dict[str, Any]]:
+    """
+    Normalize messages for VLM: fix tool_calls like _prepare_messages_for_template,
+    but preserve content as list (text + image_url) so get_chat_template can insert image tokens.
+    """
+    normalized = []
+    for msg in messages:
+        m = dict(msg)
+        content = m.get("content", "")
+        if isinstance(content, list):
+            new_content = []
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    text = part.get("text") or part.get("content") or ""
+                    # NOTE: do NOT normalize here — model must see original content.
+                    # Canonicalization for cache key happens via _canonicalize_messages()
+                    # before rendering, and only in the cache key pipeline.
+                    new_content.append({**part, "text": text})
+                else:
+                    new_content.append(part)
+            m["content"] = new_content
+        elif isinstance(content, str):
+            m["content"] = content
+        if m.get("role") == "assistant" and isinstance(m.get("tool_calls"), list):
+            fixed_tool_calls = []
+            for tc in m["tool_calls"]:
+                tc_copy = dict(tc)
+                fn = tc_copy.get("function")
+                if isinstance(fn, dict):
+                    fn_copy = dict(fn)
+                    args = fn_copy.get("arguments")
+                    if isinstance(args, str):
+                        try:
+                            fn_copy["arguments"] = json.loads(args)
+                        except Exception:
+                            fn_copy["arguments"] = {"raw": args}
+                    tc_copy["function"] = fn_copy
+                fixed_tool_calls.append(tc_copy)
+            m["tool_calls"] = fixed_tool_calls
+        normalized.append(m)
+    return normalized
+
+
+# Aliases for backward compatibility with server2.py imports
+vlm_extract_images = _extract_images_from_messages
+vlm_prepare_messages = _prepare_messages_for_vlm
