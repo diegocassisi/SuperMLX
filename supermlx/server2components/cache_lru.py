@@ -35,6 +35,25 @@ def init(*, settings: Any, terminal_status_fn: Callable) -> None:
     _settings = settings
 
 
+def _block_chain_hashes(
+    tokens: Tuple[int, ...],
+    block_size: int,
+) -> List[Tuple[bytes, int]]:
+    """Return [(chain_hash, prefix_len), ...] for each block prefix. chain_hash[i] = H(prev || block_i)."""
+    if block_size <= 0 or not tokens:
+        return []
+    out: List[Tuple[bytes, int]] = []
+    prev = b""
+    for i in range(0, len(tokens), block_size):
+        block = tokens[i : i + block_size]
+        block_bytes = b"".join(t.to_bytes(4, "big") for t in block)
+        h = hashlib.sha256(prev + block_bytes).digest()
+        prefix_len = min(i + block_size, len(tokens))
+        out.append((h, prefix_len))
+        prev = h
+    return out
+
+
 class LRUPromptCache:
     @dataclass
     class CacheEntry:
