@@ -37,26 +37,23 @@ SSoT: server.py es la única fuente de verdad (SSoT) para la ejecución de infer
       python SuperMLX.py
 
   Endpoints:
-   REMOVED!!! LiteLLM Proxy:  http://0.0.0.0:4000/v1/chat/completions  (point your framework here)
     MLX Direct:     http://0.0.0.0:8080/v1/chat/completions
     Sidecar:        http://0.0.0.0:8081/v1/chat/completions  (scripts, sensors)
 
 ─── ACTIVE FEATURES ──────────────────────────────────────────────────────────
 
   ✅ On by default:
-    • Dual-Slot KV Cache        Isolated MAIN + COMPACT LRU stores per agent type
+    • KV Cache (LRU max=2)       MAIN prompt cache with session-aware lookups
     • Tool Prefix Cache (TPC)   Pre-computed system+tools KV cache, disk persistence (tool_prefix_cache.py)
     • Post-Reaper Cache Reload  Automatic disk reload after idle eviction (v1.4.0)
     • Cache Canonicalization     Volatile fields masked → 97%+ cache hit rate
-    • Compact Runner Detector   Multi-signal routing: tools + keywords + anti-MAIN guard
     • Memory Guard              Pre-prefill Metal RAM check with auto-eviction
     • Tool Loop Breaker         Breaks infinite tool-call retry cycles (3 detection modes)
-    • Emergency Compression     LLMLingua-2 last-resort OOM defense
     • Session-Aware Routing     Per-session prefix tracking with block-hash index
     • Min-Suffix Pollution Wash Re-prefill ≥256 tokens on cache hit with response pollution
     • Per-Layer Trim            Selective KVCache trim for hybrid architecture disk saves
     • Frozen Cache Snapshot     Prompt-only snapshot for post-generation cache recovery
-    • LiteLLM Reverse Proxy     OpenAI-compatible routing layer
+    • Compact Guard             Overflow + memory pressure detection, triggers client compaction
 
   🔧 Optional (env vars):
     • RAG Enrichment            FEATURE_RAG_ENRICHMENT=true  (LanceDB + embeddings)
@@ -75,7 +72,6 @@ SSoT: server.py es la única fuente de verdad (SSoT) para la ejecución de infer
     MODEL_FAMILY                    (auto)      qwen3 | hermes | glm4 | gemma4 | deepseek | generic
     FORCE_TEXT_MODE                 (false)     Skip VLM detection for text-only models
     MLX_PORT                        (8080)      MLX engine port
-    PROXY_PORT                      (4000)      LiteLLM proxy port
     SIDECAR_PORT                    (8081)      Sidecar port (0 = disabled)
 
   KV Cache:
@@ -140,7 +136,7 @@ import shutil
 import signal
 import math
 from datetime import datetime
-# Emergency compressor removed — overflow guard inlined below
+# Overflow guard: reject requests that would exceed safe prefill limits (used by Compact Guard)
 _max_safe_prefill_tokens = int(os.environ.get("MAX_SAFE_PREFILL_TOKENS", "82192"))
 def _should_signal_overflow(rest_count: int) -> bool:
     return rest_count > _max_safe_prefill_tokens
@@ -3608,7 +3604,6 @@ if FEATURE_COMPRESSOR:
 else:
     _terminal_status("ℹ️", "Compressor: DISABLED (FEATURE_COMPRESSOR=False)")
 
-# Emergency compressor removed — overflow guard inlined in _should_signal_overflow().
 
 # --- Feature flags summary ---
 _active_features = []
@@ -6739,7 +6734,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 # During prefill (~58s) and decode, no SSE events are sent because
                 # we must collect all tokens to post-process (strip <think>, extract
                 # tool_calls).  Without keepalives the idle TCP connection dies and
-                # LiteLLM / OpenClaw sees "Connection error".
+                # the client sees \"Connection error\".
                 # SSE spec: lines starting with ':' are comments, ignored by clients.
                 _keepalive_stop = threading.Event()
                 _keepalive_wfile = self.wfile  # capture for thread
