@@ -12,6 +12,13 @@ REGLAS INVIOLABLES:
 - Kripper Dual-Slot: árboles aislados para 'main' y 'compact' bajo un mismo presupuesto max_tokens.
 - Nodos pinned inmunes a eviction LRU salvo deadlock total.
 - Sin imports circulares; dependencias inyectadas o resueltas con duck-typing limpio.
+DECISIÓN ARQUITECTURAL (Commit 3.5 — Coexistencia TPC vs Radix Tree):
+- Opción (b) adoptada: Subsistemas separados con orden de consulta determinístico estricto.
+  1. RadixPromptCache es el SSoT primario para secuencias conversacionales dinámicas multi-turno.
+  2. TPC (ToolPrefixCache) es el baseline inmutable de arranque en frío (cold-start) para requests con herramientas.
+  3. Orden de consulta: RadixPromptCache primero. Solo ante MISS funcional total se consulta TPC como fallback.
+  4. Garantía de no-contaminación: TPC retorna clones aislados; el estado extendido se indexa en el Radix Tree
+     en postprocess(), permitiendo que los turnos subsiguientes resuelvan 100% dentro del árbol radix.
 SSoT: RadixPromptCache es la única implementación de cache radix para server3.
 """
 from __future__ import annotations
