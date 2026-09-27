@@ -2472,15 +2472,20 @@ class APIHandler(BaseHTTPRequestHandler):
             f"hit_ratio={ctx.cache_hit_ratio or 0.0:.3f} | rest_count={ctx.rest_count} | "
             f"has_kv={ctx.prompt_cache is not None}")
 
-        prompt_cache = None
-        # model_tokens: tokens derived from the original (unmodified) prompt.
-        # The model always prefills from this sequence, never from the canonical cache key.
-        rest_tokens = model_tokens
+        prompt_cache = ctx.prompt_cache
+        rest_count = ctx.rest_count
+        matched_prefix_len = (
+            max(0, len(model_tokens) - rest_count)
+            if rest_count <= len(model_tokens)
+            else 0
+        )
+        cache_match_type = getattr(ctx, "cache_match_type", "hit" if matched_prefix_len > 0 else "miss")
+        cache_selection_source = getattr(ctx, "cache_selection_source", "radix")
+        if 0 < rest_count <= len(model_tokens):
+            rest_tokens = model_tokens[-rest_count:]
+        else:
+            rest_tokens = list(model_tokens)
         cache_session_tokens = prompt_tokens
-        cache_match_type = "miss"
-        matched_prefix_len = 0
-        cache_selection_source = "none"
-        rest_count = len(model_tokens)
         sampler, logits_processors, sampler_kwargs = _build_sampler(
             body, enable_thinking=enable_thinking, is_compact=_is_compact
         )
@@ -2550,18 +2555,6 @@ class APIHandler(BaseHTTPRequestHandler):
                         cache_model, max_kv_size=SETTINGS.max_kv_size
                     )
                     ctx.prompt_cache = prompt_cache
-                rest_count = ctx.rest_count
-                matched_prefix_len = (
-                    len(model_tokens) - rest_count
-                    if rest_count <= len(model_tokens)
-                    else 0
-                )
-                cache_match_type = getattr(ctx, "cache_match_type", "hit" if matched_prefix_len > 0 else "miss")
-                cache_selection_source = getattr(ctx, "cache_selection_source", "radix")
-                if rest_count > 0 and rest_count <= len(model_tokens):
-                    rest_tokens = model_tokens[-rest_count:]
-                else:
-                    rest_tokens = list(model_tokens)
 
                 _kv_off = _kv_cache_offset(prompt_cache)
                 _session_id_for_turn = (session_ctx.session_id or "").strip() if session_ctx else ""

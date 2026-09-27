@@ -334,7 +334,7 @@ def cache_lookup(ctx: RequestContext, state: ServerState, radix: RadixPromptCach
 
     # Si hay match estructural pero kv_cache es None -> MISS funcional (P4)
     if kv is not None and matched:
-        ctx.prompt_cache = copy.deepcopy(kv)
+        ctx.prompt_cache = kv
         matched_len = len(matched)
         ctx.rest_count = max(0, len(ctx.model_tokens) - matched_len) if ctx.model_tokens else max(0, len(tokens) - matched_len)
         ctx.cache_hit_ratio = matched_len / max(len(tokens), 1)
