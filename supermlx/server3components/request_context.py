@@ -59,6 +59,7 @@ class RequestContext:
     cache_key: Optional[list[int]] = None
     skip_cache_store: bool = False
     rest_count: int = 0                 # tokens no cubiertos por cache hit
+    rest_tokens: list[int] = field(default_factory=list)
     cache_hit_ratio: Optional[float] = None
     prompt_cache: Any = None            # handle al objeto de mlx cache
 

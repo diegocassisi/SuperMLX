@@ -2842,21 +2842,11 @@ class APIHandler(BaseHTTPRequestHandler):
                     )
                     rest_count = len(rest_tokens)
 
-                # Adaptive pre-prefill: process rest_tokens[:-1] with dynamic chunks,
-                # pass only the last token to stream_generate (skips its fixed-step loop).
-                if not is_vlm and len(rest_tokens) > 1:
-                    rest_tokens = _adaptive_prefill(rest_tokens, prompt_cache, request_id)
-
                 if not is_vlm:
-                    # ── FASE D.3: GENERATE (checkpoint capture) ───────────────
+                    # ── FASE D.3: GENERATE (adaptive prefill + checkpoint) ────
                     _pipeline_generate(ctx, _server_state)
-                    hybrid_generation_checkpoint = ctx.checkpoint or _capture_hybrid_checkpoint_before_generation(
-                        request_id=request_id,
-                        prompt_cache=prompt_cache,
-                        prompt_tokens=prompt_tokens,
-                        model_tokens=model_tokens,
-                        rest_tokens=rest_tokens,
-                    )
+                    rest_tokens = ctx.rest_tokens if ctx.rest_tokens else rest_tokens
+                    hybrid_generation_checkpoint = ctx.checkpoint
 
                 _prefill_done, _prefill_thread = _start_prefill_progress(request_id, rest_count)
 
@@ -3260,21 +3250,11 @@ class APIHandler(BaseHTTPRequestHandler):
                     )
                     rest_count = len(rest_tokens)
 
-                # Adaptive pre-prefill: process rest_tokens[:-1] with dynamic chunks,
-                # pass only the last token to stream_generate (skips its fixed-step loop).
-                if not is_vlm and len(rest_tokens) > 1:
-                    rest_tokens = _adaptive_prefill(rest_tokens, prompt_cache, request_id)
-
                 if not is_vlm:
-                    # ── FASE D.3: GENERATE (checkpoint capture) ───────────────
+                    # ── FASE D.3: GENERATE (adaptive prefill + checkpoint) ────
                     _pipeline_generate(ctx, _server_state)
-                    hybrid_generation_checkpoint = ctx.checkpoint or _capture_hybrid_checkpoint_before_generation(
-                        request_id=request_id,
-                        prompt_cache=prompt_cache,
-                        prompt_tokens=prompt_tokens,
-                        model_tokens=model_tokens,
-                        rest_tokens=rest_tokens,
-                    )
+                    rest_tokens = ctx.rest_tokens if ctx.rest_tokens else rest_tokens
+                    hybrid_generation_checkpoint = ctx.checkpoint
 
                 _prefill_done_s, _ = _start_prefill_progress(request_id, rest_count)
 

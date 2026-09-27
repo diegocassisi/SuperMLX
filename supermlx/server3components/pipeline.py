@@ -423,6 +423,9 @@ def generate(
         except Exception as ap_err:
             logger.debug("[GENERATE] Adaptive prefill fallback: %s", ap_err)
 
+    ctx.rest_tokens = rest_tokens
+    ctx.rest_count = len(rest_tokens)
+
     # 3. Checkpoint capture ANTES de generar (contrato inviolable contra contaminación KV)
     if has_recurrent and not getattr(state, "is_vlm", False) and ctx.prompt_cache:
         try:
