@@ -5109,6 +5109,11 @@ def run():
         get_metal_budget_gb=_get_metal_budget_gb,
         adaptive_prefill_safety_margin=_ADAPTIVE_PREFILL_SAFETY_MARGIN,
         gpu_yield_seconds=_GPU_YIELD_SECONDS,
+        scratch_coefficient=_SCRATCH_COEFFICIENT,
+        n_layers_sdpa=_N_LAYERS_SDPA,
+        n_heads=_N_HEADS,
+        scratch_bytes_per_element=_SCRATCH_BYTES_PER_ELEMENT,
+        adaptive_prefill_min_chunk=_ADAPTIVE_PREFILL_MIN_CHUNK,
     )
 
     # ── Module init: post_generation ──────────────────────────────────────

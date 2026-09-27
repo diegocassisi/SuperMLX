@@ -39,6 +39,11 @@ _feature_full_logging: bool = True
 _get_metal_budget_gb: Optional[Callable] = None
 _ADAPTIVE_PREFILL_SAFETY_MARGIN: float = 0.85
 _GPU_YIELD_SECONDS: float = 0.0
+_SCRATCH_COEFFICIENT: float = 0.065
+_N_LAYERS_SDPA: int = 10
+_N_HEADS: int = 16
+_SCRATCH_BYTES_PER_ELEMENT: int = 4
+_ADAPTIVE_PREFILL_MIN_CHUNK: int = 32
 
 
 def init(
@@ -55,12 +60,19 @@ def init(
     get_metal_budget_gb: Optional[Callable] = None,
     adaptive_prefill_safety_margin: float = 0.85,
     gpu_yield_seconds: float = 0.0,
+    scratch_coefficient: float = 0.065,
+    n_layers_sdpa: int = 10,
+    n_heads: int = 16,
+    scratch_bytes_per_element: int = 4,
+    adaptive_prefill_min_chunk: int = 32,
 ) -> None:
     """Initialize with shared state from server2."""
     global _settings, _terminal_status, _pipeline_log, _guard
     global _cache_diag, _model, _prefill_step_size
     global _feature_cache_diag, _feature_full_logging
     global _get_metal_budget_gb, _ADAPTIVE_PREFILL_SAFETY_MARGIN, _GPU_YIELD_SECONDS
+    global _SCRATCH_COEFFICIENT, _N_LAYERS_SDPA, _N_HEADS
+    global _SCRATCH_BYTES_PER_ELEMENT, _ADAPTIVE_PREFILL_MIN_CHUNK
 
     _settings = settings
     _terminal_status = terminal_status
@@ -74,6 +86,11 @@ def init(
     _get_metal_budget_gb = get_metal_budget_gb
     _ADAPTIVE_PREFILL_SAFETY_MARGIN = adaptive_prefill_safety_margin
     _GPU_YIELD_SECONDS = gpu_yield_seconds
+    _SCRATCH_COEFFICIENT = scratch_coefficient
+    _N_LAYERS_SDPA = n_layers_sdpa
+    _N_HEADS = n_heads
+    _SCRATCH_BYTES_PER_ELEMENT = scratch_bytes_per_element
+    _ADAPTIVE_PREFILL_MIN_CHUNK = adaptive_prefill_min_chunk
 
 
 def _start_prefill_progress(
