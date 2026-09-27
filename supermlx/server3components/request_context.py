@@ -35,6 +35,7 @@ class RequestContext:
     session_id: Optional[str] = None
     tool_calls: list[dict] = field(default_factory=list)
     healed: bool = False
+    loop_broken: int = 0
 
     # ── tokens y prompts renderizados (preprocess) ────────────
     model_tokens: list[int] = field(default_factory=list)

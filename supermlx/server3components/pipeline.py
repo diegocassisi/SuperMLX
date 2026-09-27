@@ -226,12 +226,13 @@ def preprocess(ctx: RequestContext, state: ServerState) -> None:
         # 4. Tool call loop breaker
         feat_loop_breaker = getattr(state.settings, "feature_tool_loop_breaker", True)
         loop_max_retries = getattr(state.settings, "tool_loop_max_retries", 3)
-        healed_messages, _ = _break_tool_call_loop(
+        healed_messages, _loop_broken = _break_tool_call_loop(
             healed_messages,
             request_id,
             enabled=feat_loop_breaker,
             max_retries=loop_max_retries,
         )
+        ctx.loop_broken = int(_loop_broken or 0)
 
         # 5. Dual pipeline: canonicalización para cache key vs mensaje crudo para modelo
         original_messages, canonical_messages = _canonicalize_messages(healed_messages)

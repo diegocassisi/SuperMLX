@@ -2564,6 +2564,7 @@ class APIHandler(BaseHTTPRequestHandler):
         queue_started_at = time.time()
         hybrid_generation_checkpoint: Optional[HybridGenerationCheckpoint] = None
         _task_detector: Any = None
+        _loop_broken: int = int(getattr(ctx, "loop_broken", 0) or 0)
 
         # --- STABLE-PREFIX TELEMETRY DEFAULTS ---
         stable_prefix_token_len_computed = 0
