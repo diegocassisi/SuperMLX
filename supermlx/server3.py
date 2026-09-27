@@ -2582,6 +2582,12 @@ class APIHandler(BaseHTTPRequestHandler):
             wait_seconds = generation_started_at - queue_started_at
             with prompt_cache_lock:
                 prompt_cache = ctx.prompt_cache
+                if prompt_cache is None and model is not None:
+                    cache_model = model.language_model if is_vlm else model
+                    prompt_cache = make_prompt_cache(
+                        cache_model, max_kv_size=SETTINGS.max_kv_size
+                    )
+                    ctx.prompt_cache = prompt_cache
                 rest_count = ctx.rest_count
                 matched_prefix_len = (
                     len(model_tokens) - rest_count

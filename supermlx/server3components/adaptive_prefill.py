@@ -239,6 +239,8 @@ def _adaptive_prefill(
     """
     if not rest_tokens:
         return []
+    if prompt_cache is None:
+        return rest_tokens
     if leave_last_token and len(rest_tokens) <= 1:
         return rest_tokens
 
