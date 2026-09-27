@@ -766,6 +766,13 @@ PROMPT_CACHE = LRUPromptCache(
     ttl_seconds=SETTINGS.prompt_cache_ttl_seconds,
 )
 
+# ── RadixPromptCache: SSoT para Fase D (RadixAttention) ────────────────────────
+from .server3components.radix_cache import RadixPromptCache
+RADIX_PROMPT_CACHE = RadixPromptCache(
+    max_tokens=SETTINGS.max_kv_size,
+    guard=_guard,
+)
+
 
 # Last tools list and system body from a MAIN (non-compact) request.
 # Used by _prewarm_post_compact to build canonical cache keys that match
@@ -822,7 +829,10 @@ from .server3components.stable_prefix import (
 # ── Pipeline Fase D: RequestContext, ServerState y preprocess ─────────────────
 from .server3components.request_context import RequestContext
 from .server3components.state import ServerState
-from .server3components.pipeline import preprocess as _pipeline_preprocess
+from .server3components.pipeline import (
+    preprocess as _pipeline_preprocess,
+    cache_lookup as _pipeline_cache_lookup,
+)
 
 
 def _get_current_server_state() -> ServerState:
@@ -2939,6 +2949,12 @@ class APIHandler(BaseHTTPRequestHandler):
             )
             cache_key_delta_chars = len(model_tokens) - len(prompt_tokens)
         cache_key = prompt_tokens[:]
+        # ── FASE D.2: CACHE_LOOKUP (RadixPromptCache + TPC) ───────────────
+        _pipeline_cache_lookup(ctx, _server_state, RADIX_PROMPT_CACHE)
+        _pipeline_log("CACHE_LOOKUP_RADIX", request_id,
+            f"hit_ratio={ctx.cache_hit_ratio or 0.0:.3f} | rest_count={ctx.rest_count} | "
+            f"has_kv={ctx.prompt_cache is not None}")
+
         prompt_cache = None
         # model_tokens: tokens derived from the original (unmodified) prompt.
         # The model always prefills from this sequence, never from the canonical cache key.

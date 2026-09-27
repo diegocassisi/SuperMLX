@@ -319,9 +319,67 @@ def preprocess(ctx: RequestContext, state: ServerState) -> None:
         ctx.session_id = session_ctx.session_id
 
 
-def cache_lookup(ctx: RequestContext, state, radix: RadixPromptCache) -> None:
-    """Fase 2: Reemplaza la resolución actual contra cache_lru."""
-    raise NotImplementedError
+def cache_lookup(ctx: RequestContext, state: ServerState, radix: RadixPromptCache) -> None:
+    """
+    Fase 2: Búsqueda en RadixPromptCache y resolución determinística con TPC fallback.
+    Muta ctx in-place: ctx.prompt_cache, ctx.rest_count, ctx.cache_hit_ratio.
+    """
+    tokens = ctx.prompt_tokens or []
+    slot = "compact" if ctx.is_compact else "main"
+
+    # 1. Búsqueda primaria en RadixPromptCache
+    matched, kv = radix.match_prefix(tokens, slot=slot)
+
+    # Si hay match estructural pero kv_cache es None -> MISS funcional (P4)
+    if kv is not None and matched:
+        ctx.prompt_cache = kv
+        matched_len = len(matched)
+        ctx.rest_count = max(0, len(ctx.model_tokens) - matched_len) if ctx.model_tokens else max(0, len(tokens) - matched_len)
+        ctx.cache_hit_ratio = matched_len / max(len(tokens), 1)
+        return
+
+    # 2. Fallback determinístico a TPC si no hubo hit en Radix y hay tools configuradas (Opción B)
+    tpc = getattr(state, "tpc", None)
+    if (
+        tpc is not None
+        and hasattr(tpc, "is_configured")
+        and tpc.is_configured()
+        and ctx.tool_calls
+        and not getattr(state, "is_vlm", False)
+    ):
+        try:
+            sys_body = ""
+            for m in ctx.raw_messages:
+                if (m.get("role") or "").lower() == "system":
+                    sys_body = m.get("content", "")
+                    break
+            if sys_body:
+                pc_clone, ptoks, _ = tpc.get_prefix_cache_clone(
+                    system_body=sys_body,
+                    tools=ctx.tool_calls,
+                    tokenizer=state.tokenizer,
+                    model=state.model,
+                    max_kv_size=getattr(state.settings, "max_kv_size", 131072),
+                    kv_bits=getattr(state.settings, "kv_bits", None),
+                    enable_thinking=ctx.enable_thinking,
+                    model_path=getattr(state.settings, "model_path", ""),
+                    prefill_step_size=getattr(state.settings, "prefill_step_size", 512),
+                )
+                if pc_clone is not None and ptoks:
+                    ptok_len = len(ptoks)
+                    target_tokens = ctx.model_tokens or tokens
+                    if len(target_tokens) >= ptok_len and target_tokens[:ptok_len] == ptoks:
+                        ctx.prompt_cache = pc_clone
+                        ctx.rest_count = max(0, len(target_tokens) - ptok_len)
+                        ctx.cache_hit_ratio = ptok_len / max(len(tokens), 1)
+                        return
+        except Exception as tpc_err:
+            logger.debug("[CACHE_LOOKUP] TPC fallback failed: %s", tpc_err)
+
+    # 3. Cache Miss total
+    ctx.prompt_cache = None
+    ctx.rest_count = len(ctx.model_tokens) if ctx.model_tokens else len(tokens)
+    ctx.cache_hit_ratio = 0.0
 
 
 def generate(ctx: RequestContext, state) -> None:
