@@ -819,6 +819,33 @@ from .server3components.stable_prefix import (
     init as _stable_prefix_init,
 )
 
+# ── Pipeline Fase D: RequestContext, ServerState y preprocess ─────────────────
+from .server3components.request_context import RequestContext
+from .server3components.state import ServerState
+from .server3components.pipeline import preprocess as _pipeline_preprocess
+
+
+def _get_current_server_state() -> ServerState:
+    """Construye un snapshot de ServerState para el pipeline de 4 fases."""
+    return ServerState(
+        model=model,
+        tokenizer=tokenizer,
+        model_lock=model_lock,
+        is_vlm=is_vlm,
+        processor=processor,
+        prompt_cache=PROMPT_CACHE,
+        session_index=SESSION_INDEX,
+        prompt_cache_lock=prompt_cache_lock,
+        guard=_guard,
+        tpc=_tpc,
+        dpc=_DPC,
+        healing_store=HEALING_STORE,
+        thinking_tracker=_thinking_tracker,
+        tool_call_tracker=_tool_call_tracker,
+        settings=SETTINGS,
+        console_lock=console_lock,
+    )
+
 
 class CacheSessionTranscriptLogger:
     def __init__(self, cache_session_id: str):
@@ -2435,6 +2462,16 @@ class APIHandler(BaseHTTPRequestHandler):
                 _pipeline_log("NL_TITLE", request_id,
                     "NL.framework unavailable — falling through to LLM")
 
+        # ── FASE D.1: PREPROCESS (coexistencia) ───────────────────────────
+        _server_state = _get_current_server_state()
+        ctx = RequestContext(
+            request_id=request_id,
+            body=body,
+            is_streaming=body.get("stream", False),
+            is_anthropic=self._is_anthropic,
+        )
+        _pipeline_preprocess(ctx, _server_state)
+
         tools = body.get("tools")
 
         _raw_messages_for_detect = body.get("messages", [])
@@ -2787,6 +2824,10 @@ class APIHandler(BaseHTTPRequestHandler):
             # Merge all system messages into one at position 0.
             original_messages = _hoist_system_messages(original_messages)
             canonical_messages = _hoist_system_messages(canonical_messages)
+            if ctx.canonical_messages is not None:
+                _pipeline_log("PREPROCESS_SMOKE", request_id,
+                    f"canonical_match={ctx.canonical_messages == canonical_messages} | "
+                    f"healed_match={ctx.healed == (healed_messages != raw_messages)}")
 
             messages = _prepare_messages_for_template(original_messages, SETTINGS.normalize_write_tool_content_for_prompt)
             cache_messages = _prepare_messages_for_template(canonical_messages, SETTINGS.normalize_write_tool_content_for_prompt)

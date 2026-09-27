@@ -1,19 +1,21 @@
 """
-RequestContext — contrato de estado para el pipeline de Fase D.
-
-No reemplaza ServerState (state.py): ServerState es estado *global* del
-server (model, tokenizer, locks). RequestContext es estado *por request*,
-vive y muere con _handle_chat_completion.
-
-Single-user, sin batching: un solo RequestContext activo a la vez, no hay
-queue ni scheduling entre requests concurrentes.
+[AI_DIRECTIVE]
+ROL: RequestContext — contrato de estado por request para el pipeline de 4 fases de Fase D.
+OBJETIVO: Encapsular todo el estado mutado y compartido a lo largo del ciclo de vida de un chat completion.
+ENTRADAS: Parámetros del request HTTP (body, headers, streaming flags).
+SALIDAS: Objeto de contexto que transita por preprocess -> cache_lookup -> generate -> postprocess.
+REGLAS INVIOLABLES:
+- Un solo RequestContext activo a la vez (single-user local).
+- No sustituye a ServerState (que gestiona recursos globales persistentes).
+- Tipado estricto en todos los atributos.
+SSoT: Este módulo es la única definición de RequestContext para server3.
 """
 from __future__ import annotations
 
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Dict, List, Optional
 
 
 @dataclass
@@ -34,8 +36,26 @@ class RequestContext:
     tool_calls: list[dict] = field(default_factory=list)
     healed: bool = False
 
-    # ── cache_lookup ───────────────────────────────────────────
+    # ── tokens y prompts renderizados (preprocess) ────────────
+    model_tokens: list[int] = field(default_factory=list)
     prompt_tokens: Optional[list[int]] = None
+    prompt: str = ""
+    cache_prompt: str = ""
+    enable_thinking: bool = False
+    is_compact: bool = False
+    is_housekeeping: bool = False
+    is_ephemeral: bool = False
+    session_ctx: Any = None
+    housekeeping_conv_model_boundary: Optional[int] = None
+    housekeeping_conv_prompt_tokens: Optional[list[int]] = None
+    pipeline_timings: dict = field(default_factory=dict)
+
+    # ── vlm opcionales (preprocess) ───────────────────────────
+    vlm_pixel_values: Any = None
+    vlm_mask: Any = None
+    vlm_kwargs: Any = None
+
+    # ── cache_lookup ───────────────────────────────────────────
     rest_count: int = 0                 # tokens no cubiertos por cache hit
     cache_hit_ratio: Optional[float] = None
     prompt_cache: Any = None            # handle al objeto de mlx cache
