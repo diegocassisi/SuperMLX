@@ -363,8 +363,34 @@ def cache_lookup(ctx: RequestContext, state: ServerState, radix: RadixPromptCach
                 matched = []
 
         if kv is not None and matched:
+            target_len = len(ctx.model_tokens) if ctx.model_tokens else len(tokens)
+            # Manejo de retry exacto (matched_model_len >= target_len):
+            # Para que generate_step arranque autoregresión, se requiere al menos 1 token.
+            # Si el cache ya cubre todo el prompt, recortamos el exceso para evitar duplicación.
+            if matched_model_len >= target_len and target_len > 0:
+                trim_amount = matched_model_len - (target_len - 1)
+                trimmed = False
+                if hasattr(kv, "trim") and callable(kv.trim):
+                    kv.trim(trim_amount)
+                    trimmed = True
+                elif isinstance(kv, list) and kv and hasattr(kv[0], "trim") and callable(kv[0].trim):
+                    for layer in kv:
+                        if hasattr(layer, "trim"):
+                            layer.trim(trim_amount)
+                    trimmed = True
+                else:
+                    try:
+                        from mlx_lm.models.cache import can_trim_prompt_cache, trim_prompt_cache
+                        if can_trim_prompt_cache(kv):
+                            trim_prompt_cache(kv, trim_amount)
+                            trimmed = True
+                    except Exception:
+                        pass
+                if trimmed:
+                    matched_model_len = target_len - 1
+
             ctx.prompt_cache = kv
-            ctx.rest_count = max(1, len(ctx.model_tokens) - matched_model_len) if ctx.model_tokens else max(1, len(tokens) - len(matched))
+            ctx.rest_count = max(1, target_len - matched_model_len) if target_len > 0 else 0
             ctx.cache_hit_ratio = len(matched) / max(len(tokens), 1)
             return
 
