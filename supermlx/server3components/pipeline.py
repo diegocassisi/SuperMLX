@@ -364,7 +364,7 @@ def cache_lookup(ctx: RequestContext, state: ServerState, radix: RadixPromptCach
 
         if kv is not None and matched:
             ctx.prompt_cache = kv
-            ctx.rest_count = max(0, len(ctx.model_tokens) - matched_model_len) if ctx.model_tokens else max(0, len(tokens) - len(matched))
+            ctx.rest_count = max(1, len(ctx.model_tokens) - matched_model_len) if ctx.model_tokens else max(1, len(tokens) - len(matched))
             ctx.cache_hit_ratio = len(matched) / max(len(tokens), 1)
             return
 
@@ -400,11 +400,11 @@ def cache_lookup(ctx: RequestContext, state: ServerState, radix: RadixPromptCach
                     target_tokens = ctx.model_tokens or tokens
                     if len(target_tokens) >= ptok_len and target_tokens[:ptok_len] == ptoks:
                         ctx.prompt_cache = pc_clone
-                        ctx.rest_count = max(0, len(target_tokens) - ptok_len)
+                        ctx.rest_count = max(1, len(target_tokens) - ptok_len)
                         ctx.cache_hit_ratio = ptok_len / max(len(tokens), 1)
                         return
         except Exception as tpc_err:
-            logger.debug("[CACHE_LOOKUP] TPC fallback failed: %s", tpc_err)
+            logger.warning("[CACHE_LOOKUP] TPC fallback failed: %s", tpc_err)
 
     # 3. Cache Miss total
     ctx.prompt_cache = None
