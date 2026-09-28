@@ -466,18 +466,43 @@ def generate(
     else:
         rest_tokens = list(model_toks)
 
-    # 1. Detección estricta de capas recurrentes (ArraysCache / Marconi pattern)
+    # 1. Instanciación temprana de prompt_cache si es None (para detectar capas recurrentes en cold starts)
+    if ctx.prompt_cache is None and state is not None and getattr(state, "model", None) is not None:
+        try:
+            from mlx_lm.models.cache import make_prompt_cache
+            cache_model = getattr(state.model, "language_model", state.model) if getattr(state, "is_vlm", False) else state.model
+            ctx.prompt_cache = make_prompt_cache(cache_model)
+        except Exception as cache_init_err:
+            logger.debug("[GENERATE] make_prompt_cache fallback: %s", cache_init_err)
+
+    # 2. Detección estricta de capas recurrentes (ArraysCache / Marconi pattern)
     has_recurrent = False
     if ctx.prompt_cache and isinstance(ctx.prompt_cache, list):
         has_recurrent = any(_is_arrays_cache(c) for c in ctx.prompt_cache)
     ctx.cache_has_recurrent_layers = has_recurrent
 
-    # 2. Adaptive prefill: procesar rest_tokens[:-1] en chunks dinámicos
+    # 3. Adaptive prefill: procesar rest_tokens[:-1] en chunks dinámicos
     if not getattr(state, "is_vlm", False) and len(rest_tokens) > 1:
         try:
             rest_tokens = _adaptive_prefill(rest_tokens, ctx.prompt_cache, ctx.request_id)
         except Exception as ap_err:
             logger.debug("[GENERATE] Adaptive prefill fallback: %s", ap_err)
+            # Prefill de respaldo si _adaptive_prefill no está inicializado:
+            # Procesar rest_tokens[:-1] en el modelo para capturar checkpoint con 1 token pendiente.
+            if len(rest_tokens) > 1 and state is not None and getattr(state, "model", None) is not None and ctx.prompt_cache is not None:
+                try:
+                    import mlx.core as mx
+                    to_prefill = rest_tokens[:-1]
+                    prompt_arr = mx.array(to_prefill)[None]
+                    state.model(prompt_arr, cache=ctx.prompt_cache)
+                    for c in ctx.prompt_cache:
+                        if hasattr(c, "state"):
+                            mx.eval(c.state)
+                        else:
+                            mx.eval(c)
+                    rest_tokens = rest_tokens[-1:]
+                except Exception as direct_prefill_err:
+                    logger.debug("[GENERATE] Direct prefill fallback error: %s", direct_prefill_err)
 
     ctx.rest_tokens = rest_tokens
     ctx.rest_count = len(rest_tokens)
