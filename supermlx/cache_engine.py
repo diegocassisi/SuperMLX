@@ -169,16 +169,16 @@ def rollback_arrays_cache(cache: list, snapshot: Dict[str, Any]) -> bool:
                 and c.is_trimmable()
             ):
                 return False
-        # Custom __deepcopy__ implementations must provide isolated mutable
-        # state; this is also required by the existing prompt-cache API.
-        staged = copy.deepcopy(cache)
+        # Stage restoration: superficial copy of cache list, deepcopy only recurrent states
+        staged = list(cache)
         for i, state in layers.items():
             staged[i] = copy.deepcopy(state)
         for i, old in offsets.items():
-            delta = int(staged[i].offset) - old
+            c = staged[i]
+            delta = int(c.offset) - old
             if delta:
-                staged[i].trim(delta)
-            if int(staged[i].offset) != old:
+                c.trim(delta)
+            if int(c.offset) != old:
                 return False
         arrays = [a for i in layers for a in staged[i].cache if a is not None]
         if arrays:
