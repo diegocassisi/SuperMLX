@@ -49,6 +49,9 @@ from ..housekeeping_staging import find_housekeeping_split_index
 
 logger = logging.getLogger(__name__)
 
+# Fase E: Guard de delta máximo entre offset de modelo y match canónico
+MAX_CACHE_OFFSET_DELTA: int = 128
+
 
 def _tokenize_text(tokenizer: Any, text: str) -> list[int]:
     """Tokeniza un string utilizando el tokenizer del modelo de forma consistente."""
@@ -342,7 +345,16 @@ def cache_lookup(ctx: RequestContext, state: ServerState, radix: RadixPromptCach
 
         matched_model_len = len(matched)
         if stored_hash is not None and stored_off is not None:
-            if stored_off <= len(ctx.model_tokens):
+            max_delta = getattr(state.settings, "max_cache_offset_delta", MAX_CACHE_OFFSET_DELTA)
+            if abs(stored_off - len(matched)) > max_delta:
+                logger.warning(
+                    "[CACHE_LOOKUP] Discrepancia excesiva entre stored_off y len(matched) "
+                    "(|%d - %d| = %d > %d). Descartando como miss funcional con warning.",
+                    stored_off, len(matched), abs(stored_off - len(matched)), max_delta
+                )
+                kv = None
+                matched = []
+            elif stored_off <= len(ctx.model_tokens):
                 current_model_hash = hash(tuple(ctx.model_tokens[:stored_off]))
                 if current_model_hash != stored_hash:
                     logger.warning(
