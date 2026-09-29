@@ -369,30 +369,72 @@ def cache_lookup(ctx: RequestContext, state: ServerState, radix: RadixPromptCach
             # Si el cache ya cubre todo el prompt, recortamos el exceso para evitar duplicación.
             if matched_model_len >= target_len and target_len > 0:
                 trim_amount = matched_model_len - (target_len - 1)
-                trimmed = False
-                if hasattr(kv, "trim") and callable(kv.trim):
-                    kv.trim(trim_amount)
-                    trimmed = True
-                elif isinstance(kv, list) and kv and hasattr(kv[0], "trim") and callable(kv[0].trim):
-                    for layer in kv:
-                        if hasattr(layer, "trim"):
-                            layer.trim(trim_amount)
-                    trimmed = True
-                else:
-                    try:
-                        from mlx_lm.models.cache import can_trim_prompt_cache, trim_prompt_cache
-                        if can_trim_prompt_cache(kv):
-                            trim_prompt_cache(kv, trim_amount)
-                            trimmed = True
-                    except Exception:
-                        pass
-                if trimmed:
-                    matched_model_len = target_len - 1
+                # Detección de capas recurrentes (híbrido) vs pure-KV
+                has_recurrent = False
+                if isinstance(kv, list):
+                    has_recurrent = any(
+                        not hasattr(layer, "offset") or layer.__class__.__name__ == "ArraysCache"
+                        for layer in kv
+                    )
 
-            ctx.prompt_cache = kv
-            ctx.rest_count = max(1, target_len - matched_model_len) if target_len > 0 else 0
-            ctx.cache_hit_ratio = len(matched) / max(len(tokens), 1)
-            return
+                if has_recurrent:
+                    # En caché híbrido: las recurrentes se restauran a su snapshot pre-decode.
+                    # Verificamos si las capas de atención ya están en target_len - 1
+                    attn_offsets = [getattr(l, "offset", None) for l in kv if hasattr(l, "offset")]
+                    if attn_offsets and all(off == target_len - 1 for off in attn_offsets if off is not None):
+                        # Ya está exactamente sincronizado en target_len - 1 (del checkpoint pre-decode)
+                        matched_model_len = target_len - 1
+                    else:
+                        # Si difiere, intentamos trim y verificamos
+                        try:
+                            from mlx_lm.models.cache import can_trim_prompt_cache, trim_prompt_cache
+                            if can_trim_prompt_cache(kv):
+                                trim_prompt_cache(kv, trim_amount)
+                                attn_offsets_after = [getattr(l, "offset", None) for l in kv if hasattr(l, "offset")]
+                                if attn_offsets_after and all(off == target_len - 1 for off in attn_offsets_after if off is not None):
+                                    matched_model_len = target_len - 1
+                                else:
+                                    logger.warning(
+                                        "[CACHE_LOOKUP] Desincronización en trim híbrido (offsets=%s vs target=%d). Fallback a cold start.",
+                                        attn_offsets_after, target_len - 1,
+                                    )
+                                    kv = None
+                                    matched = []
+                            else:
+                                logger.warning("[CACHE_LOOKUP] Cache híbrido no trimmable en retry exacto. Fallback a cold start.")
+                                kv = None
+                                matched = []
+                        except Exception as e:
+                            logger.warning("[CACHE_LOOKUP] Error durante trim de cache híbrido: %s. Fallback a cold start.", e)
+                            kv = None
+                            matched = []
+                else:
+                    # Pure-KV tradicional
+                    trimmed = False
+                    if hasattr(kv, "trim") and callable(kv.trim):
+                        kv.trim(trim_amount)
+                        trimmed = True
+                    elif isinstance(kv, list) and kv and hasattr(kv[0], "trim") and callable(kv[0].trim):
+                        for layer in kv:
+                            if hasattr(layer, "trim"):
+                                layer.trim(trim_amount)
+                        trimmed = True
+                    else:
+                        try:
+                            from mlx_lm.models.cache import can_trim_prompt_cache, trim_prompt_cache
+                            if can_trim_prompt_cache(kv):
+                                trim_prompt_cache(kv, trim_amount)
+                                trimmed = True
+                        except Exception as e:
+                            logger.warning("[CACHE_LOOKUP] Error recortando pure-kv cache: %s", e)
+                    if trimmed:
+                        matched_model_len = target_len - 1
+
+            if kv is not None:
+                ctx.prompt_cache = kv
+                ctx.rest_count = max(1, target_len - matched_model_len) if target_len > 0 else 0
+                ctx.cache_hit_ratio = len(matched) / max(len(tokens), 1)
+                return
 
     # 2. Fallback determinístico a TPC si no hubo hit en Radix y hay tools configuradas (Opción B)
     tpc = getattr(state, "tpc", None)
