@@ -293,8 +293,8 @@ def _save_hermes_context() -> None:
             _dir = _tpc_mod._cache_dir
         _path = _dir / _HERMES_CONTEXT_FILE
         _path.write_text(json.dumps(_last_hermes_context, ensure_ascii=False))
-    except Exception:
-        pass  # Best-effort, non-critical
+    except Exception as _e:
+        logger.warning("[CONTEXT] Falló guardado de hermes_context: %s", _e)
 
 def _load_hermes_context() -> None:
     """Load persisted _last_hermes_context from disk."""
@@ -306,8 +306,8 @@ def _load_hermes_context() -> None:
             _path = _tpc_mod._cache_dir / _HERMES_CONTEXT_FILE
             if _path.exists():
                 _last_hermes_context = json.loads(_path.read_text())
-    except Exception:
-        pass
+    except Exception as _e:
+        logger.warning("[CONTEXT] Falló carga de hermes_context: %s", _e)
 
 # Prefill step size: tokens processed per chunk during prompt prefill.
 # Smaller = less Metal scratch memory (flash attention scratch ≈ 0.065 × chunk × kv_len × n_heads × 4).
@@ -522,7 +522,8 @@ def _resolve_model_path_and_config():
             try:
                 with open(config_path, encoding="utf-8") as f:
                     return path, json.load(f)
-            except Exception:
+            except Exception as _cfg_err:
+                logger.warning("[CONFIG] Falló parseo de config.json en %s: %s", config_path, _cfg_err)
                 return path, None
         return path, None
     if mlx_vlm_available:
@@ -568,8 +569,8 @@ def _resolve_model_path_and_config():
                 with open(config_path, encoding="utf-8") as f:
                     return path, json.load(f)
             return path, None
-        except Exception:
-            pass
+        except Exception as _e:
+            logger.warning("[CONFIG] Error leyendo config de modelo en %s: %s", path, _e)
     return None, None
 
 
@@ -603,8 +604,8 @@ _LASTLOG_PATH = SETTINGS.log_root.parent / "lastlog.md"
 try:
     with open(_LASTLOG_PATH, "w", encoding="utf-8") as _f:
         _f.write(f"# SuperMLX Session Log — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n```\n")
-except Exception:
-    pass
+except Exception as _e:
+    logger.warning("[LOG] No se pudo inicializar lastlog.md: %s", _e)
 
 
 # ── Request Logger: extracted to server3components/request_logger.py ───────────
@@ -935,7 +936,8 @@ def _metal_mem_str() -> str:
         peak_gb = mx.get_peak_memory() / 1e9
         cache_gb = mx.get_cache_memory() / 1e9
         return f"metal={active_gb:.2f}GB peak={peak_gb:.2f}GB cache={cache_gb:.2f}GB"
-    except Exception:
+    except Exception as _m_err:
+        logger.warning("[METAL] Error leyendo memoria Metal: %s", _m_err)
         return ""
 
 
@@ -1045,7 +1047,8 @@ def _update_healing_store(raw_text: str, message_text: str, tool_calls: Optional
             _args_str = _fn.get("arguments", "")
             try:
                 _akeys = list(json.loads(_args_str).keys())
-            except Exception:
+            except Exception as _json_err:
+                logger.warning("[HEAL_STORE] Error parseando JSON de arguments: %s", _json_err)
                 _akeys = []
             _tc_detail += (
                 f" | tc[{_ti}]={{id={_t.get('id','')[:16]}, fn={_fn.get('name','')}, "
@@ -1064,136 +1067,6 @@ def _update_healing_store(raw_text: str, message_text: str, tool_calls: Optional
         HEALING_STORE.move_to_end(h, last=True)
         while len(HEALING_STORE) > MAX_HEALING_STORE:
             HEALING_STORE.popitem(last=False)
-
-
-def _prewarm_post_compact(
-    summary_text: str,
-    messages: List[Dict[str, Any]],
-    request_id: str,
-) -> None:
-    """Pre-warm MAIN cache after compact using TPC + dual pipeline.
-
-    The compact runner just generated a summary. The old MAIN cache is dead.
-    This function builds a pre-warmed cache using the SAME dual pipeline as
-    the main request path:
-    - CANONICAL key (prompt_tokens space) for cache lookup matching
-    - MODEL tokens for KV state computation (via TPC clone + delta prefill)
-
-    Steps:
-    1. Build messages [system, summary_user_msg] with stored tools
-    2. Run dual pipeline: canonical → scrub → tokenize = canonical_key
-    3. Run model pipeline: original → tokenize = model_tokens
-    4. Clone TPC, prefill delta = model_tokens[tpc_len:]
-    5. Evict dead MAIN + COMPACT, insert (canonical_key, new_cache)
-
-    Must be called while model_lock is held (MLX is not thread-safe).
-    """
-    import copy
-
-    if not _tpc.is_initialized():
-        _terminal_status("⚠️",
-            f"POST-COMPACT: TPC not available, skipping | req={request_id[:8]}")
-        return
-
-    if _LAST_MAIN_TOOLS is None or _LAST_MAIN_SYSTEM_BODY is None:
-        _terminal_status("⚠️",
-            f"POST-COMPACT: no MAIN tools/system captured yet, skipping | req={request_id[:8]}")
-        return
-
-    t0 = time.time()
-
-    # 1. Build the expected post-compact messages
-    from .server_compact import COMPACT_USER_WRAPPER
-
-    summary_user_msg = {
-        "role": "user",
-        "content": COMPACT_USER_WRAPPER.format(summary=summary_text),
-    }
-    prewarm_messages = [
-        {"role": "system", "content": _LAST_MAIN_SYSTEM_BODY},
-        summary_user_msg,
-    ]
-
-    # 2. Dual pipeline — same as _handle_chat_completion (L4265-L4312)
-    enable_thinking = SETTINGS.default_thinking
-    original_msgs, canonical_msgs = _canonicalize_messages(prewarm_messages)
-    original_msgs = _hoist_system_messages(original_msgs)
-    canonical_msgs = _hoist_system_messages(canonical_msgs)
-    original_msgs = _prepare_messages_for_template(original_msgs, SETTINGS.normalize_write_tool_content_for_prompt)
-    canonical_msgs = _prepare_messages_for_template(canonical_msgs, SETTINGS.normalize_write_tool_content_for_prompt)
-
-    if hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template:
-        model_prompt = tokenizer.apply_chat_template(
-            original_msgs, tokenize=False, add_generation_prompt=True,
-            tools=_LAST_MAIN_TOOLS, enable_thinking=enable_thinking,
-            preserve_thinking=FEATURE_PRESERVE_THINKING,
-        )
-        cache_prompt_raw = tokenizer.apply_chat_template(
-            canonical_msgs, tokenize=False, add_generation_prompt=True,
-            tools=_LAST_MAIN_TOOLS, enable_thinking=enable_thinking,
-            preserve_thinking=FEATURE_PRESERVE_THINKING,
-        )
-    else:
-        _terminal_status("⚠️",
-            f"POST-COMPACT: no chat template, skipping | req={request_id[:8]}")
-        return
-
-    cache_prompt = _scrub_cache_key(cache_prompt_raw, SETTINGS.cache_canonicalize_tool_context)
-    canonical_key = _tokenize_prompt(cache_prompt)
-    model_tokens = _tokenize_prompt(model_prompt)
-
-    # 3. Verify TPC prefix alignment with model_tokens
-    tpc_tokens = list(_tpc._prefix_tokens)
-    tpc_len = len(tpc_tokens)
-
-    if len(model_tokens) <= tpc_len:
-        _terminal_status("⚠️",
-            f"POST-COMPACT: model_tokens({len(model_tokens)}) <= TPC({tpc_len}), skipping | req={request_id[:8]}")
-        return
-
-    if model_tokens[:tpc_len] != tpc_tokens:
-        _terminal_status("⚠️",
-            f"POST-COMPACT: TPC prefix mismatch, skipping | req={request_id[:8]}")
-        return
-
-    # 4. Clone TPC and prefill only the delta (summary tokens)
-    new_cache = copy.deepcopy(_tpc._prefix_cache)
-    delta_model_tokens = model_tokens[tpc_len:]
-
-    try:
-        ok = _tpc.prefill_cache_only(
-            delta_model_tokens,
-            model,
-            new_cache,
-            prefill_step_size=PREFILL_STEP_SIZE,
-            kv_bits=SETTINGS.kv_bits,
-            kv_group_size=64,
-            quantized_kv_start=0,
-        )
-        if not ok:
-            _terminal_status("⚠️",
-                f"POST-COMPACT: prefill postcondition failed, skipping | req={request_id[:8]}")
-            return
-    except Exception as e:
-        _terminal_status("⚠️",
-            f"POST-COMPACT: delta prefill failed ({e}), skipping | req={request_id[:8]}")
-        return
-
-    # 5. Evict dead MAIN + COMPACT caches, insert with canonical key
-    with prompt_cache_lock:
-        PROMPT_CACHE.evict_unpinned()
-        PROMPT_CACHE.insert_cache(SETTINGS.model_path, canonical_key, new_cache)
-
-    _guard.force_clear_cache("post_compact_warmup")
-
-    elapsed_ms = (time.time() - t0) * 1000
-    _terminal_status("🔥",
-        f"POST-COMPACT PRE-WARMUP: TPC({tpc_len}) + delta({len(delta_model_tokens)}) → MAIN | "
-        f"canonical_key={len(canonical_key)} | model_kv={len(model_tokens)} | "
-        f"{elapsed_ms:.0f}ms | {_metal_mem_str()} | req={request_id[:8]}")
-
-
-
 
 
 # ── Post-generation cache logic: extracted to server3components/post_generation.py ──
@@ -1246,8 +1119,8 @@ def _kv_cache_offset(cache: Any) -> Optional[int]:
                 for c in layer.cache:
                     if c is not None and len(c.shape) >= 3:
                         return int(c.shape[2])
-    except (IndexError, TypeError, AttributeError):
-        pass
+    except (IndexError, TypeError, AttributeError) as _e:
+        logger.warning("[CACHE] Error leyendo offset en capas de cache: %s", _e)
     return None
 
 
@@ -1516,8 +1389,8 @@ if _config and _is_vlm_config(_config) and not SETTINGS.force_text_mode:
             return None
 
         _vpa.video_processor_class_from_name = _patched_video_processor_class_from_name
-    except Exception:
-        pass
+    except Exception as _vlm_patch_err:
+        logger.warning("[VLM] Falló parche de video_processor_class_from_name: %s", _vlm_patch_err)
     model, processor = load_vlm(
         SETTINGS.model_path, tokenizer_config={"trust_remote_code": True}
     )
@@ -1643,8 +1516,8 @@ else:
             with open(_jinja_path, "r") as f:
                 tokenizer.chat_template = f.read()
             _terminal_status("🔧", "Loaded chat_template.jinja into tokenizer (was missing from tokenizer_config)")
-        except Exception:
-            pass  # No jinja file available, model uses a different template mechanism
+        except Exception as _jinja_err:
+            logger.warning("[TOKENIZER] No se pudo cargar chat_template.jinja: %s", _jinja_err)
 
 # ── MoE Expert Cache ──────────────────────────────────────────────────────
 # ── MoE Expert Subsystem ──────────────────────────────────────────────────
@@ -2111,8 +1984,8 @@ class APIHandler(BaseHTTPRequestHandler):
             try:
                 cl = int(self.headers.get("Content-Length", 0))
                 self.rfile.read(cl)
-            except Exception:
-                pass
+            except Exception as _count_err:
+                logger.warning("[HTTP] Error leyendo body en count_tokens: %s", _count_err)
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
@@ -2285,7 +2158,8 @@ class APIHandler(BaseHTTPRequestHandler):
         try:
             content_length = int(self.headers["Content-Length"])
             body = json.loads(self.rfile.read(content_length).decode("utf-8"))
-        except Exception:
+        except Exception as _parse_err:
+            logger.warning("[HTTP] Error parseando request body: %s", _parse_err)
             self.send_error(400, "Bad Request")
             return
         # Ephemeral route flag → skip session cache save
@@ -2573,21 +2447,7 @@ class APIHandler(BaseHTTPRequestHandler):
                         f"rest={len(rest_tokens)} | matched={matched_prefix_len}/{len(prompt_tokens)}",
                     )
 
-            rest_count = len(rest_tokens) if rest_tokens is not None else len(model_tokens)
-
-            # ── Emergency compression removed — was pipeline stage A5 ─────
-
-            # ── DIAGNOSTIC: prompt_tokens vs model_tokens divergence ──────
-            # FIXME: temporary — remove after diagnosing 146K vs 34K bug on dense models
-            if prompt_tokens and model_tokens and abs(len(prompt_tokens) - len(model_tokens)) > len(model_tokens) * 0.5:
-                _terminal_status("🔍",
-                    f"TOKEN DIVERGENCE: prompt_tokens={len(prompt_tokens)} model_tokens={len(model_tokens)} "
-                    f"ratio={len(prompt_tokens)/max(1,len(model_tokens)):.2f}x | "
-                    f"pt_type={type(prompt_tokens).__name__} mt_type={type(model_tokens).__name__} | "
-                    f"pt[0]={prompt_tokens[0] if prompt_tokens else '?'} (type={type(prompt_tokens[0]).__name__ if prompt_tokens else '?'}) | "
-                    f"mt[0]={model_tokens[0] if model_tokens else '?'} (type={type(model_tokens[0]).__name__ if model_tokens else '?'}) | "
-                    f"cache_prompt_type={type(cache_prompt).__name__ if 'cache_prompt' in dir() else 'N/A'} "
-                    f"cache_prompt_len={len(cache_prompt) if 'cache_prompt' in dir() and cache_prompt else 'N/A'}")
+            rest_count = ctx.rest_count if ctx.rest_count is not None else len(rest_tokens)
 
             # ── COMPACT GUARD: OVERFLOW + MEMORY PRESSURE ─────────────────
             # Applies to ALL requests unconditionally (including Anthropic).
@@ -2610,8 +2470,8 @@ class APIHandler(BaseHTTPRequestHandler):
                         if _active_gb > _threshold_gb and _real_token_count > 80000:
                             _memory_pressure = True
                             _pressure_reason = f"metal={_active_gb:.1f}GB > {_threshold_gb}GB threshold (prompt={_real_token_count} tokens)"
-                except Exception:
-                    pass
+                except Exception as _mem_err:
+                    logger.warning("[COMPACT_GUARD] Error consultando memoria Metal: %s", _mem_err)
 
             if _memory_pressure:
                 _terminal_status("⚠️",
@@ -2642,8 +2502,6 @@ class APIHandler(BaseHTTPRequestHandler):
                 _pipeline_log("CACHE", request_id,
                     f"global_lookup: match_type={cache_match_type} | matched_prefix={matched_prefix_len}/{len(prompt_tokens)}")
                 _pipeline_log("CACHE", request_id,
-                    f"stable_prefix: computed={stable_prefix_token_len_computed} tok")
-                _pipeline_log("CACHE", request_id,
                     f"RESULTADO: cache_hit={cache_match_type} | rest_tokens={rest_count} | source={cache_selection_source}")
             
 
@@ -2653,7 +2511,8 @@ class APIHandler(BaseHTTPRequestHandler):
                     request_logger = CacheSessionTranscriptLogger(
                         cache_session_id=cache_session_id
                     )
-                except Exception:
+                except Exception as _rlog_err:
+                    logger.warning("[LOG] Error instanciando CacheSessionTranscriptLogger: %s", _rlog_err)
                     request_logger = None
 
             if request_logger:
@@ -2750,8 +2609,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 try:
                     from .expert_cache import start_expert_routing
                     start_expert_routing(request_id)
-                except (ImportError, Exception):
-                    pass
+                except (ImportError, Exception) as _er_err:
+                    logger.warning("[EXPERT_ROUTING] No se pudo iniciar expert routing: %s", _er_err)
             if FEATURE_FULL_LOGGING:
                 _pipeline_log("PRE_GEN", request_id,
                     f"entering generation | rest={rest_count} | stream={is_streaming} | "
@@ -2972,14 +2831,6 @@ class APIHandler(BaseHTTPRequestHandler):
                 ctx.skip_cache_store = _is_housekeeping
                 _pipeline_postprocess(ctx, _server_state, RADIX_PROMPT_CACHE)
 
-                # POST-COMPACT PRE-WARMUP: after compact finishes, pre-warm MAIN
-                # with the summary so the next request doesn't cold-start 50K tokens.
-                # Guard: skip if MAIN already has a warm cache larger than TPC —
-                # title/slug generators are classified as compact runners but don't
-                _main_max_len = max(
-                    (len(e.tokens) for e in PROMPT_CACHE._entries.values()), default=0
-                ) if PROMPT_CACHE._entries else 0
-                _tpc_len = len(_tpc._prefix_tokens) if _tpc.is_initialized() else 0
                 if _frozen_summary:
                     message_text = f"{_frozen_summary}\n\n---\n\n{message_text}"
 
@@ -3175,8 +3026,8 @@ class APIHandler(BaseHTTPRequestHandler):
                     try:
                         from .expert_cache import start_expert_routing
                         start_expert_routing(request_id)
-                    except (ImportError, Exception):
-                        pass
+                    except (ImportError, Exception) as _er_err:
+                        logger.warning("[EXPERT_ROUTING] No se pudo iniciar expert routing: %s", _er_err)
 
                 progress_last_at = time.time()
                 from .sampling import DynamicTaskDetector
@@ -3478,7 +3329,8 @@ class APIHandler(BaseHTTPRequestHandler):
                         _afn = _atc.get("function", {})
                         try:
                             _aargs = json.loads(_afn.get("arguments", "{}"))
-                        except Exception:
+                        except Exception as _tc_json_err:
+                            logger.warning("[TOOL_AUDIT] Error parseando JSON de arguments: %s", _tc_json_err)
                             _aargs = {}
                         _aarg_lens = {k: len(str(v)) for k, v in _aargs.items()}
                         _aargs_json = _afn.get("arguments", "")
@@ -3757,14 +3609,6 @@ class APIHandler(BaseHTTPRequestHandler):
                 ctx.finish_reason = finish_reason
                 ctx.skip_cache_store = _is_housekeeping
                 _pipeline_postprocess(ctx, _server_state, RADIX_PROMPT_CACHE)
-
-                # POST-COMPACT PRE-WARMUP: after compact finishes, pre-warm MAIN
-                # with the summary so the next request doesn't cold-start 50K tokens.
-                # Guard: skip if MAIN already has a warm cache larger than TPC.
-                _main_max_len = max(
-                    (len(e.tokens) for e in PROMPT_CACHE._entries.values()), default=0
-                ) if PROMPT_CACHE._entries else 0
-                _tpc_len = len(_tpc._prefix_tokens) if _tpc.is_initialized() else 0
         except BrokenPipeError:
             _terminal_status(
                 "⚠️",
@@ -3820,12 +3664,12 @@ class APIHandler(BaseHTTPRequestHandler):
                     })
                     self.wfile.write(f"event: error\ndata: {_oom_error}\n\n".encode("utf-8"))
                     self.wfile.flush()
-                except Exception:
-                    pass
+                except Exception as _werr:
+                    logger.warning("[ERROR] Falló envío SSE de oom_error: %s", _werr)
                 try:
                     _guard.force_clear_cache("oom_error")
-                except Exception:
-                    pass
+                except Exception as _gerr:
+                    logger.warning("[ERROR] Falló force_clear_cache tras OOM: %s", _gerr)
             else:
                 _terminal_status("❌", f"Request {request_id} failed: {e}", indent=1)
                 import traceback
@@ -3893,8 +3737,8 @@ class APIHandler(BaseHTTPRequestHandler):
                                 f" | moe_hit={_mcs['hit_rate']:.0%}"
                                 f" fallback={_mcs['fallback_rate']:.0%}"
                             )
-                    except (ImportError, Exception):
-                        pass
+                    except (ImportError, Exception) as _moe_err:
+                        logger.warning("[STATS] Error obteniendo moe stats: %s", _moe_err)
                     # Metal memory snapshot — monitor fragmentation and pressure
                     _mem_suffix = ""
                     try:
@@ -3902,8 +3746,8 @@ class APIHandler(BaseHTTPRequestHandler):
                         _m_cache = mx.get_cache_memory() / 1e9
                         _m_peak = mx.get_peak_memory() / 1e9
                         _mem_suffix = f" | mem={_m_active:.1f}GB active/{_m_cache:.1f}GB cache/{_m_peak:.1f}GB peak"
-                    except Exception:
-                        pass
+                    except Exception as _mem_err:
+                        logger.warning("[STATS] Error leyendo snapshot de memoria Metal: %s", _mem_err)
                     _terminal_status("✅", _req_log + _moe_suffix + _mem_suffix, indent=1)
                 else:
                     _final_tag = getattr(_task_detector, "tag", "DEFAULT") if _task_detector else "DEFAULT"
@@ -3921,8 +3765,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 from .router_tracer import flush_request_trace
                 _prompt_preview = str(locals().get("_last_user", locals().get("last_user_msg", locals().get("prompt", ""))))
                 flush_request_trace(request_id, prompt_preview=_prompt_preview)
-            except Exception:
-                pass
+            except Exception as _trc_err:
+                logger.warning("[TRACER] Error ejecutando flush_request_trace: %s", _trc_err)
             # On normal exit or Python exception, release the lock. On process abort (e.g. Metal
             # "uncommitted encoder" crash), finally may not run, so the "leaked semaphore" warning
             # at shutdown is expected; fixing the Metal crash resolves it.
