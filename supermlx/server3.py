@@ -1915,6 +1915,29 @@ from .server3components.sidecar_handler import SidecarHandler, init as _sidecar_
 # _sidecar_init() is called in run() after all deps are available
 
 
+class SuperMLXHTTPServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer with structured socket-level exception handling.
+
+    Intercepts client disconnections (ConnectionResetError, BrokenPipeError,
+    ConnectionAbortedError) to log structured [NETWORK] warnings rather than dumping
+    raw tracebacks to sys.stderr.
+    """
+
+    def handle_error(self, request, client_address):
+        exc_type, exc_val, _ = sys.exc_info()
+        if exc_type is not None and issubclass(
+            exc_type, (ConnectionResetError, BrokenPipeError, ConnectionAbortedError)
+        ):
+            logger.warning(
+                "[NETWORK] Client %s disconnected abruptly (%s: %s)",
+                client_address,
+                exc_type.__name__,
+                exc_val,
+            )
+            return
+        super().handle_error(request, client_address)
+
+
 class APIHandler(BaseHTTPRequestHandler):
     # Per-request state set during routing.  Checked at response time to
     # decide between OpenAI and Anthropic wire formats.
@@ -1924,6 +1947,18 @@ class APIHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         # Keep terminal output focused on custom request lifecycle lines.
         return
+
+    def handle(self):
+        """Handle multiple requests if necessary, cleanly intercepting client aborts."""
+        try:
+            super().handle()
+        except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError) as e:
+            logger.warning(
+                "[NETWORK] Connection closed abruptly by client %s (%s: %s)",
+                self.client_address,
+                type(e).__name__,
+                e,
+            )
 
     def _route_path(self) -> str:
         """Strip query string from self.path for route matching.
@@ -3800,7 +3835,7 @@ class APIHandler(BaseHTTPRequestHandler):
 
 def run():
     server_address = (SETTINGS.mlx_host, SETTINGS.mlx_port)
-    httpd = ThreadingHTTPServer(server_address, APIHandler)
+    httpd = SuperMLXHTTPServer(server_address, APIHandler)
 
     # ── Module init: adaptive_prefill ─────────────────────────────────────
     _ap_mod.init(
@@ -3878,7 +3913,7 @@ def run():
                 ThinkingEvent=ThinkingEvent,
             )
             sidecar_address = (SETTINGS.mlx_host, SETTINGS.sidecar_port)
-            sidecar_httpd = ThreadingHTTPServer(sidecar_address, SidecarHandler)
+            sidecar_httpd = SuperMLXHTTPServer(sidecar_address, SidecarHandler)
             sidecar_thread = threading.Thread(
                 target=sidecar_httpd.serve_forever,
                 name="sidecar",
