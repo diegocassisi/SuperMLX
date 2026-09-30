@@ -37,7 +37,6 @@ class RadixNode:
     children: dict[int, "RadixNode"] = field(default_factory=dict)  # Keyed por primer token del hijo
     kv_cache: Any = None                                            # MLX prompt cache asociado al segmento
     last_used: float = field(default_factory=time.time)
-    ref_count: int = 0                                              # >0 mientras un request activo lo usa
     slot_type: Literal["main", "compact"] = "main"                  # Kripper Dual-Slot
     pinned: bool = False                                            # Inmune a eviction LRU si True
     parent: Optional["RadixNode"] = None                            # Referencia al nodo padre para eviction/split
@@ -404,7 +403,7 @@ class RadixPromptCache:
                 pinned_candidates.sort(key=lambda n: n.last_used)
                 target = pinned_candidates[0]
             else:
-                # Ninguna hoja disponible (ej: todos en ref_count > 0 activo)
+                # Ninguna hoja desalojable disponible
                 break
 
             if target is None or target.parent is None:
@@ -436,7 +435,9 @@ class RadixPromptCache:
         lineal cada turno deja un nodo intermedio con el KV completo de su prefijo, y esos
         nodos nunca llegan a ser hoja. En un nodo interno sólo se suelta el KV (la
         estructura queda para los hijos); una hoja se elimina del árbol.
-        Nunca toca el nodo recién insertado ni nodos con ref_count > 0.
+        Nunca toca el nodo recién insertado. No hay ref_count: match_prefix entrega un
+        deepcopy y el desalojo sólo corre dentro de insert() bajo model_lock, por lo que
+        ninguna generación en curso referencia un nodo del árbol.
         Pinned sólo se desaloja si no queda otra opción (igual que evict_lru).
         """
         freed = 0
@@ -453,7 +454,6 @@ class RadixPromptCache:
                     node.parent is None
                     or node.kv_cache is None
                     or node is self._newest
-                    or node.ref_count > 0
                 ):
                     continue
                 (pinned_candidates if node.pinned else candidates).append(node)
@@ -518,11 +518,11 @@ class RadixPromptCache:
         candidates: list[RadixNode],
         pinned_candidates: list[RadixNode],
     ) -> None:
-        """Recorre recursivamente buscando nodos hoja con ref_count == 0."""
+        """Recorre recursivamente buscando nodos hoja desalojables."""
         for child in list(node.children.values()):
             if not child.children:
                 # Es nodo hoja (el recién insertado nunca es candidato)
-                if child.ref_count == 0 and child is not self._newest:
+                if child is not self._newest:
                     if child.pinned:
                         pinned_candidates.append(child)
                     else:
@@ -534,7 +534,7 @@ class RadixPromptCache:
         """Elimina nodos internos intermedios que se quedaron sin hijos y sin kv_cache."""
         current = node
         while current is not None and current.parent is not None:
-            if not current.children and current.kv_cache is None and current.ref_count == 0:
+            if not current.children and current.kv_cache is None:
                 parent = current.parent
                 if current.tokens and current.tokens[0] in parent.children:
                     del parent.children[current.tokens[0]]
