@@ -36,7 +36,7 @@ It speaks both the **OpenAI** and the **Anthropic** HTTP APIs, so most clients w
 
 **Integration**
 - OpenAI and Anthropic endpoints, streaming and non-streaming, plus separate **ephemeral** endpoints and a **sidecar** port for traffic that must not use the session cache (see [Endpoints](#endpoints)).
-- Optional RAG enrichment and prompt compression (LanceDB, LLMLingua-2), and vision-language models via `mlx-vlm`.
+- Optional RAG enrichment and prompt compression (LanceDB, LLMLingua-2).
 
 An experimental Apple Neural Engine prefill path exists but is disabled by default.
 
@@ -124,7 +124,6 @@ ANTHROPIC_BASE_URL=http://127.0.0.1:8080 claude
 ### Optional extras
 
 ```bash
-pip install -e '.[vlm]'       # vision-language models (mlx-vlm)
 pip install -e '.[rag]'       # RAG enrichment + prompt compression
 pip install -e '.[titles]'    # Apple NaturalLanguage session titles (macOS)
 ```
@@ -192,6 +191,7 @@ Some suites (`*_real_model*`, `scale_radix_17k.py`) need a model and a running s
 ## Limitations
 
 - One request at a time: a model lock serializes generation.
+- Text-only: vision-language models are not operational yet. The code path exists but is unfinished; set `FORCE_TEXT_MODE=true` to load a VLM checkpoint as text-only.
 - macOS / Apple Silicon only.
 - Quality of the tool-call parsers outside the Qwen family is not guaranteed.
 

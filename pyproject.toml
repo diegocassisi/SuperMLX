@@ -31,7 +31,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-vlm = ["mlx-vlm>=0.3.11"]
 rag = ["lancedb>=0.26.1", "sentence-transformers>=5.2.0", "llmlingua>=0.2.2", "torch>=2.11.0"]
 titles = ["pyobjc-framework-NaturalLanguage>=12.2; sys_platform == 'darwin'"]
 dev = ["pytest>=8.0"]
