@@ -34,9 +34,10 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Dict, Generator, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, Union
 
 import mlx.core as mx
+from mlx_lm.sample_utils import apply_min_p, apply_top_k, apply_top_p
 from supermlx.config import SETTINGS
 
 logger = logging.getLogger(__name__)
@@ -49,33 +50,124 @@ def _distribution_from_logits(
     min_p: float = 0.0,
     top_k: int = 0,
 ) -> mx.array:
-    """Final distribution for a single vocabulary vector; greedy is one-hot."""
+    """Distribución final idéntica a mlx_lm.sample_utils.make_sampler."""
     if logits.ndim != 1 or logits.size == 0:
         raise ValueError("Expected a nonempty 1D logits vector")
-    if not 0.0 < top_p <= 1.0 or not 0.0 <= min_p <= 1.0 or top_k < 0:
-        raise ValueError("Invalid top_p, min_p or top_k")
     logits = logits.astype(mx.float32)
     if temperature <= 0.0:
         return (mx.arange(logits.shape[0]) == mx.argmax(logits)).astype(mx.float32)
-    scaled = logits / temperature
-    if top_k > 0:
-        k = min(top_k, scaled.shape[0])
-        threshold = mx.min(mx.topk(scaled, k=k))
-        scaled = mx.where(scaled < threshold, -float("inf"), scaled)
+    logprobs = logits - mx.logsumexp(logits)
+    if 0.0 < top_p < 1.0:
+        logprobs = apply_top_p(logprobs, top_p)
     if min_p > 0.0:
-        # Equivalent to softmax(x) >= min_p * max(softmax(x)).
-        threshold = mx.max(scaled) + mx.log(mx.array(min_p, dtype=mx.float32))
-        scaled = mx.where(scaled < threshold, -float("inf"), scaled)
-    probs = mx.softmax(scaled)
-    if top_p < 1.0:
-        order = mx.argsort(-probs)
-        ordered = probs[order]
-        cumulative = mx.cumsum(ordered)
-        remove = mx.concatenate([mx.array([False]), cumulative[:-1] > top_p])
-        ordered = mx.where(remove, 0.0, ordered)
-        probs = ordered[mx.argsort(order)]
-        probs = probs / mx.sum(probs)
-    return probs
+        logprobs = apply_min_p(logprobs, min_p)
+    if top_k > 0:
+        logprobs = apply_top_k(logprobs, top_k)
+    return mx.softmax(logprobs / temperature)
+
+
+def _apply_logits_processors(
+    processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]],
+    tokens: mx.array,
+    logits: mx.array,
+) -> mx.array:
+    """Aplica la lista de logits_processors (repetition penalty, etc.) sobre logits 1D o 2D."""
+    if not processors or tokens is None or tokens.size == 0:
+        return logits
+    is_1d = (logits.ndim == 1)
+    x = logits[None] if is_1d else logits
+    for proc in processors:
+        x = proc(tokens, x)
+    return x[0] if is_1d else x
+
+
+def _is_cache_mtp_safe(prompt_cache: Optional[List[Any]], max_tokens: int) -> Tuple[bool, str]:
+    """Evalúa dinámicamente por request si las capas en prompt_cache admiten rollback seguro."""
+    if not prompt_cache:
+        return True, ""
+    try:
+        from mlx_lm.models.cache import QuantizedKVCache, RotatingKVCache, BatchRotatingKVCache
+    except ImportError:
+        QuantizedKVCache = ()
+        RotatingKVCache = ()
+        BatchRotatingKVCache = ()
+
+    for idx, layer in enumerate(prompt_cache):
+        if isinstance(layer, QuantizedKVCache):
+            return False, f"layer {idx} is QuantizedKVCache (quantized KV not trimmable for rejection rollback)"
+
+        if isinstance(layer, (RotatingKVCache, BatchRotatingKVCache)):
+            is_trimmable_fn = getattr(layer, "is_trimmable", None)
+            if is_trimmable_fn is None or not is_trimmable_fn():
+                offset = getattr(layer, "offset", 0)
+                max_size = getattr(layer, "max_size", 0)
+                return False, f"layer {idx} RotatingKVCache is not currently trimmable (offset {offset} >= max_size {max_size})"
+            offset = getattr(layer, "offset", 0)
+            max_size = getattr(layer, "max_size", 0)
+            if max_size > 0 and (offset + max_tokens > max_size):
+                return False, f"layer {idx} RotatingKVCache offset ({offset}) + max_tokens ({max_tokens}) > max_size ({max_size}); rollback would fail mid-generation"
+    return True, ""
+
+
+def _extract_sampling_params(
+    sampler: Optional[Any],
+    kwargs: Dict[str, Any],
+) -> Tuple[Dict[str, Any], bool]:
+    """
+    Extrae parámetros de sampling del sampler o kwargs.
+    Retorna (params_dict, is_opaque_sampler).
+    """
+    if sampler is None:
+        return {
+            "temp": float(kwargs.get("temperature", kwargs.get("temp", 0.0))),
+            "top_p": float(kwargs.get("top_p", 1.0)),
+            "min_p": float(kwargs.get("min_p", 0.0)),
+            "top_k": int(kwargs.get("top_k", 0)),
+        }, False
+
+    # 1. Contrato explícito _mtp_sampling_params
+    if hasattr(sampler, "_mtp_sampling_params"):
+        p = sampler._mtp_sampling_params
+        p_dict = p() if callable(p) else dict(p)
+        return {
+            "temp": float(p_dict.get("temp", p_dict.get("temperature", 0.0))),
+            "top_p": float(p_dict.get("top_p", 1.0)),
+            "min_p": float(p_dict.get("min_p", 0.0)),
+            "top_k": int(p_dict.get("top_k", 0)),
+        }, False
+
+    # 2. DualPhaseSampler u objetos con atributos de temperatura
+    if (
+        hasattr(sampler, "resp_temp")
+        or hasattr(sampler, "think_temp")
+        or hasattr(sampler, "temp")
+    ):
+        return {
+            "temp": float(getattr(sampler, "temp", getattr(sampler, "resp_temp", 0.0))),
+            "top_p": float(getattr(sampler, "top_p", 1.0)),
+            "min_p": float(getattr(sampler, "min_p", 0.0)),
+            "top_k": int(getattr(sampler, "top_k", 0)),
+        }, False
+
+    # 3. Kwargs explícitos acompañando a sampler opaco
+    if "temperature" in kwargs or "temp" in kwargs:
+        return {
+            "temp": float(kwargs.get("temperature", kwargs.get("temp"))),
+            "top_p": float(kwargs.get("top_p", 1.0)),
+            "min_p": float(kwargs.get("min_p", 0.0)),
+            "top_k": int(kwargs.get("top_k", 0)),
+        }, False
+
+    # 4. Sampler opaco sin contrato
+    if callable(sampler):
+        return {}, True
+
+    return {
+        "temp": 0.0,
+        "top_p": 1.0,
+        "min_p": 0.0,
+        "top_k": 0,
+    }, False
 
 
 def _sample_token(
@@ -122,10 +214,10 @@ def _rollback_draft_caches(
     mtp_cache: Optional[List[Any]] = None,
 ) -> None:
     """
-    Restaura los cachés del trunk y del MTP al estado previo al draft rechazado.
+    Restaura los cachés del trunk al estado previo al draft rechazado.
     - Capas SSM (ArraysCache): restaura (conv_snap, ssm_snap) de rollback_state.
     - Capas de atención (KVCache): recorta 1 token con trim(1).
-    - Cabezal MTP (KVCache): recorta 1 token con trim(1) para mantener sincronía posicional.
+    El cabezal MTP NO se recorta porque nunca procesó el draft rechazado.
     """
     for c in model_cache:
         if hasattr(c, "rollback_state") and c.rollback_state is not None:
@@ -137,11 +229,6 @@ def _rollback_draft_caches(
                 c.advance(-1)
         elif hasattr(c, "trim") and getattr(c, "offset", 0) > 0:
             c.trim(1)
-
-    if mtp_cache is not None:
-        for c in mtp_cache:
-            if hasattr(c, "trim") and getattr(c, "offset", 0) > 0:
-                c.trim(1)
 
 
 
@@ -168,7 +255,8 @@ class MTPSpeculativeEngine:
         adaptive_temperature: bool = False,
         tokenizer: Optional[Any] = None,
         on_token_callback: Optional[Any] = None,
-        prefill_step_size: int = 512,
+        prefill_step_size: int = 256,
+        logits_processors: Optional[List[Callable]] = None,
     ) -> None:
         self.model = model
         self.temperature = temperature
@@ -180,12 +268,15 @@ class MTPSpeculativeEngine:
         self.tokenizer = tokenizer
         self._on_token_callback = on_token_callback
         self.prefill_step_size = prefill_step_size
+        self.logits_processors = logits_processors
         logger.info(
-            "[CONFIG] MTPSpeculativeEngine inicializado: temp=%.2f, top_p=%.2f, min_p=%.2f, top_k=%d, adaptive_temp=%s",
+            "[CONFIG] MTPSpeculativeEngine inicializado: temp=%.2f, top_p=%.2f, min_p=%.2f, top_k=%d, prefill_step=%d, logits_processors=%s, adaptive_temp=%s",
             self.temperature,
             self.top_p,
             self.min_p,
             self.top_k,
+            self.prefill_step_size,
+            bool(self.logits_processors),
             self.adaptive_temperature,
         )
 
@@ -194,10 +285,24 @@ class MTPSpeculativeEngine:
         Resuelve (temp, top_p, min_p, top_k) dinámicamente según la fase del sampler
         (DualPhaseSampler / FEATURE_ADAPTIVE_TEMPERATURE) o el modo estático.
         """
-        if not self.adaptive_temperature or self.sampler is None:
+        if self.sampler is None:
             return self.temperature, self.top_p, self.min_p, self.top_k
 
-        # 1. Temperatura activa según la fase (thinking vs response)
+        # 1. Contrato explícito si existe
+        if hasattr(self.sampler, "_mtp_sampling_params"):
+            p = self.sampler._mtp_sampling_params
+            p_dict = p() if callable(p) else dict(p)
+            return (
+                float(p_dict.get("temp", p_dict.get("temperature", self.temperature))),
+                float(p_dict.get("top_p", self.top_p)),
+                float(p_dict.get("min_p", self.min_p)),
+                int(p_dict.get("top_k", self.top_k)),
+            )
+
+        if not self.adaptive_temperature:
+            return self.temperature, self.top_p, self.min_p, self.top_k
+
+        # 2. Temperatura activa según la fase (thinking vs response)
         temp = self.temperature
         if hasattr(self.sampler, "tracker") and getattr(self.sampler.tracker, "is_thinking", False):
             temp = getattr(self.sampler, "think_temp", self.temperature)
@@ -206,7 +311,7 @@ class MTPSpeculativeEngine:
         elif hasattr(self.sampler, "temp"):
             temp = getattr(self.sampler, "temp", self.temperature)
 
-        # 2. Filtros de sampling del sampler activo
+        # 3. Filtros de sampling del sampler activo
         top_p = getattr(self.sampler, "top_p", self.top_p)
         min_p = getattr(self.sampler, "min_p", self.min_p)
         top_k = getattr(self.sampler, "top_k", self.top_k)
@@ -230,21 +335,26 @@ class MTPSpeculativeEngine:
         drafts_accepted: int,
         drafts_attempted: int,
         curr_alpha: float,
+        max_tokens: int = 512,
+        eos_token_id: Optional[int] = None,
     ) -> Tuple[List[Dict[str, Any]], int, int, Any, List[Any], int, Any]:
         """Inject tokens into KV cache and prepare next draft.
 
         This is the MECHANISM for injection. The POLICY (when/what to inject)
         lives in FlightController.
-
-        Performs:
-        1. Forward pass to insert tokens into trunk KV cache
-        2. Build token dicts to yield (caller does actual yield)
-        3. Reset MTP cache
-        4. Generate new draft from the last injected token
-
-        Returns:
-            (tokens_to_yield, new_confirmed, hidden, new_mtp_cache, tokens_generated, draft_tok, q2_probs)
         """
+        # Respetar presupuesto de max_tokens
+        rem_budget = max(0, max_tokens - tokens_generated)
+        inject_token_ids = list(inject_token_ids)[:rem_budget]
+
+        # Respetar EOS
+        if eos_token_id is not None and eos_token_id in inject_token_ids:
+            eos_idx = inject_token_ids.index(eos_token_id)
+            inject_token_ids = inject_token_ids[:eos_idx + 1]
+
+        if not inject_token_ids:
+            return [], confirmed_token, None, mtp_cache, tokens_generated, None, None
+
         # Forward confirmed_token + all nudge tokens except last through trunk
         tokens_to_forward = [confirmed_token] + list(inject_token_ids[:-1])
         fwd_arr = mx.array([tokens_to_forward], dtype=mx.int32)
@@ -271,11 +381,16 @@ class MTPSpeculativeEngine:
                 "drafts_attempted": drafts_attempted,
                 "alpha": curr_alpha,
             })
+            if eos_token_id is not None and int(n_tok) == eos_token_id:
+                break
 
         # Last injected token becomes the new confirmed token
         new_confirmed = int(inject_token_ids[-1])
         hidden_at_confirmed = fwd_hidden[:, -1:, :]
         new_mtp_cache = self.model.make_mtp_cache()
+
+        if (eos_token_id is not None and new_confirmed == eos_token_id) or tokens_generated >= max_tokens:
+            return tokens_to_yield, new_confirmed, hidden_at_confirmed, new_mtp_cache, tokens_generated, None, None
 
         # Generate new speculative draft from the last injected token
         mtp_logits = self.model.mtp_forward(
@@ -327,6 +442,7 @@ class MTPSpeculativeEngine:
         if prompt_tokens.ndim == 1:
             prompt_tokens = prompt_tokens[None]
 
+        tokens_context = [int(t) for t in prompt_tokens[0].tolist()] if prompt_tokens.size > 0 else []
         previous_hidden = None
         for offset in range(0, prompt_tokens.shape[1], self.prefill_step_size):
             chunk = prompt_tokens[:, offset:offset + self.prefill_step_size]
@@ -353,13 +469,19 @@ class MTPSpeculativeEngine:
         pre_norm = previous_hidden
 
         curr_temp, curr_top_p, curr_min_p, curr_top_k = self._get_sampling_params()
+        first_token_logits = logits[0, -1]
+        if self.logits_processors and tokens_context:
+            first_token_logits = _apply_logits_processors(
+                self.logits_processors, mx.array(tokens_context), first_token_logits
+            )
         token_t1, _ = _sample_token(
-            logits[0, -1],
+            first_token_logits,
             temperature=curr_temp,
             top_p=curr_top_p,
             min_p=curr_min_p,
             top_k=curr_top_k,
         )
+        tokens_context.append(int(token_t1))
 
         tokens_generated = 1
         drafts_attempted = 0
@@ -417,20 +539,25 @@ class MTPSpeculativeEngine:
             if self._on_token_callback is not None:
                 action = self._on_token_callback(tokens_generated, confirmed_token)
                 if action is not None:
-                    if action.hard_break:
+                    if getattr(action, "hard_break", False):
                         break
-                    if action.inject_tokens:
+                    inject_list = getattr(action, "inject_tokens", None)
+                    if inject_list:
                         # Inject tokens into KV cache and resume speculative decoding
                         inject_result = self._inject_tokens(
-                            action.inject_tokens, cache, mtp_cache,
+                            inject_list, cache, mtp_cache,
                             confirmed_token, tokens_generated,
                             drafts_accepted, drafts_attempted, curr_alpha,
+                            max_tokens=max_tokens,
+                            eos_token_id=eos_token_id,
                         )
                         tokens_to_yield, confirmed_token, hidden_at_confirmed, mtp_cache, tokens_generated, draft_tok, q2_probs = inject_result
                         # Yield injected tokens to consumer
                         for tok_dict in tokens_to_yield:
                             yield tok_dict
-                        if tokens_generated >= max_tokens:
+                        if tokens_generated >= max_tokens or (eos_token_id is not None and confirmed_token == eos_token_id):
+                            break
+                        if draft_tok is None:
                             break
                         continue
 
@@ -445,6 +572,11 @@ class MTPSpeculativeEngine:
 
             verify_logits = target_logits[0, 0]
             bonus_logits = target_logits[0, 1]
+
+            if self.logits_processors and tokens_context:
+                verify_logits = _apply_logits_processors(
+                    self.logits_processors, mx.array(tokens_context), verify_logits
+                )
 
             curr_temp, curr_top_p, curr_min_p, curr_top_k = self._get_sampling_params()
             p_probs = _distribution_from_logits(
@@ -468,6 +600,7 @@ class MTPSpeculativeEngine:
                 drafts_accepted += 1
                 curr_alpha = (drafts_accepted / max(drafts_attempted, 1)) * 100.0
 
+                tokens_context.append(int(draft_tok))
                 # Emitir draft token confirmado
                 tokens_generated += 1
                 _fc_record(int(draft_tok))
@@ -488,6 +621,10 @@ class MTPSpeculativeEngine:
 
                 # Resolve again after the consumer processes the accepted token.
                 curr_temp, curr_top_p, curr_min_p, curr_top_k = self._get_sampling_params()
+                if self.logits_processors and tokens_context:
+                    bonus_logits = _apply_logits_processors(
+                        self.logits_processors, mx.array(tokens_context), bonus_logits
+                    )
                 # Muestrear y emitir bonus token proyectado por el trunk en posición 1
                 bonus_tok, _ = _sample_token(
                     bonus_logits,
@@ -496,6 +633,7 @@ class MTPSpeculativeEngine:
                     min_p=curr_min_p,
                     top_k=curr_top_k,
                 )
+                tokens_context.append(int(bonus_tok))
                 tokens_generated += 1
                 _fc_record(int(bonus_tok))
                 yield {
@@ -541,10 +679,11 @@ class MTPSpeculativeEngine:
                 draft_tok = next_draft_tok
 
             else:
-                # RECHAZO: Rollback simétrico en trunk y en cabezal MTP
-                _rollback_draft_caches(cache, mtp_cache=mtp_cache)
+                # RECHAZO: Rollback en trunk únicamente (el cabezal MTP nunca evaluó el draft rechazado)
+                _rollback_draft_caches(cache, mtp_cache=None)
                 curr_alpha = (drafts_accepted / max(drafts_attempted, 1)) * 100.0
 
+                tokens_context.append(int(committed_token))
                 # Emitir el token corregido
                 tokens_generated += 1
                 _fc_record(int(committed_token))
@@ -605,6 +744,8 @@ def stream_generate_mtp(
     prompt_cache: Optional[List[Any]] = None,
     mtp_cache: Optional[List[Any]] = None,
     adaptive_temperature: Optional[bool] = None,
+    logits_processors: Optional[List[Callable]] = None,
+    prefill_step_size: Optional[int] = None,
     **kwargs: Any,
 ) -> Generator[Any, None, None]:
     """
@@ -622,37 +763,105 @@ def stream_generate_mtp(
         except Exception:
             adaptive_temperature = True
 
-    if not isinstance(tokenizer, TokenizerWrapper):
+    if tokenizer is not None and not isinstance(tokenizer, TokenizerWrapper):
         tokenizer = TokenizerWrapper(tokenizer)
 
     if not isinstance(prompt, mx.array):
         if isinstance(prompt, str):
-            add_special_tokens = tokenizer.bos_token is None or not prompt.startswith(
+            add_special_tokens = tokenizer is None or tokenizer.bos_token is None or not prompt.startswith(
                 tokenizer.bos_token
             )
-            prompt = tokenizer.encode(prompt, add_special_tokens=add_special_tokens)
+            prompt = tokenizer.encode(prompt, add_special_tokens=add_special_tokens) if tokenizer else []
         prompt = mx.array(prompt)
 
-    # Extraer parámetros de sampling base del sampler si están presentes
-    temp = getattr(sampler, "temp", getattr(sampler, "resp_temp", 0.0)) if sampler is not None else 0.0
-    min_p = getattr(sampler, "min_p", 0.0) if sampler is not None else 0.0
-    top_p = getattr(sampler, "top_p", 1.0) if sampler is not None else 1.0
-    top_k = getattr(sampler, "top_k", 0) if sampler is not None else 0
+    # Protección contra prompt / rest_tokens vacío
+    if prompt.size == 0:
+        logger.warning("[DECISION] Prompt vacío recibido en stream_generate_mtp. Retornando sin generar.")
+        return
+
+    # Guard de Caché Dinámico por Request: derivar a autoregresivo si el cache no es trimmable
+    cache_safe, cache_reason = _is_cache_mtp_safe(prompt_cache, max_tokens)
+    if not cache_safe:
+        logger.warning(
+            "[FALLBACK] Cache KV incompatible con rollback de MTP (%s); derivando a autoregresivo estándar",
+            cache_reason,
+        )
+        import mlx_lm
+        fallback_gen = getattr(mlx_lm, "stream_generate", None)
+        if fallback_gen is None:
+            from mlx_lm.generate import stream_generate as fallback_gen
+        for resp in fallback_gen(
+            model=model,
+            tokenizer=tokenizer,
+            prompt=prompt,
+            max_tokens=max_tokens,
+            sampler=sampler,
+            prompt_cache=prompt_cache,
+            logits_processors=logits_processors,
+            **kwargs,
+        ):
+            if not hasattr(resp, "alpha"):
+                resp.alpha = 0.0
+            if not hasattr(resp, "drafts_accepted"):
+                resp.drafts_accepted = 0
+            if not hasattr(resp, "drafts_attempted"):
+                resp.drafts_attempted = 0
+            if not hasattr(resp, "from_draft"):
+                resp.from_draft = False
+            yield resp
+        return
+
+    # Extraer parámetros de sampling base del sampler; derivar si es opaco sin contrato
+    sampling_params, is_opaque = _extract_sampling_params(sampler, kwargs)
+    if is_opaque:
+        logger.warning(
+            "[FALLBACK] Sampler opaco sin contrato de parámetros (_mtp_sampling_params / temp); "
+            "derivando a autoregresivo estándar de mlx_lm"
+        )
+        import mlx_lm
+        fallback_gen = getattr(mlx_lm, "stream_generate", None)
+        if fallback_gen is None:
+            from mlx_lm.generate import stream_generate as fallback_gen
+        for resp in fallback_gen(
+            model=model,
+            tokenizer=tokenizer,
+            prompt=prompt,
+            max_tokens=max_tokens,
+            sampler=sampler,
+            prompt_cache=prompt_cache,
+            logits_processors=logits_processors,
+            **kwargs,
+        ):
+            if not hasattr(resp, "alpha"):
+                resp.alpha = 0.0
+            if not hasattr(resp, "drafts_accepted"):
+                resp.drafts_accepted = 0
+            if not hasattr(resp, "drafts_attempted"):
+                resp.drafts_attempted = 0
+            if not hasattr(resp, "from_draft"):
+                resp.from_draft = False
+            yield resp
+        return
 
     # Flight controller: policy for in-flight interventions (nudge, loop, spark)
     from supermlx.flight_controller import FlightController
-    controller = FlightController(tokenizer=tokenizer, sampler=sampler)
+    controller = FlightController(tokenizer=tokenizer, sampler=sampler) if tokenizer else None
+
+    step_size = prefill_step_size if prefill_step_size is not None else kwargs.get("prefill_step_size", 256)
+    effective_logits_processors = logits_processors if logits_processors is not None else kwargs.get("logits_processors", None)
 
     engine = MTPSpeculativeEngine(
         model=model,
-        temperature=temp,
-        top_p=top_p,
-        min_p=min_p,
-        top_k=top_k,
+        temperature=sampling_params["temp"],
+        top_p=sampling_params["top_p"],
+        min_p=sampling_params["min_p"],
+        top_k=sampling_params["top_k"],
         sampler=sampler,
         adaptive_temperature=adaptive_temperature,
         tokenizer=tokenizer,
-        on_token_callback=controller.evaluate,
+        on_token_callback=controller.evaluate if controller else None,
+        prefill_step_size=step_size,
+        logits_processors=effective_logits_processors,
     )
 
     detokenizer = tokenizer.detokenizer
