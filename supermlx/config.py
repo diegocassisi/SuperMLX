@@ -128,8 +128,6 @@ class Settings:
     thinking_temperature: float
     thinking_schedule_enabled: bool
     thinking_temp_schedule: str
-    temp_resp_explain: float
-    temp_resp_explore: float
     response_temperature: float
     tool_calling_temperature: float
     compaction_temperature: float
@@ -269,8 +267,6 @@ def build_settings(script_dir: Path = Path(__file__).parent) -> Settings:
         thinking_temp_schedule=_env_str(
             "THINKING_TEMP_SCHEDULE", "0:0.80,256:0.60,1024:0.35,3000:0.10"
         ),
-        temp_resp_explain=_env_float("TEMP_RESP_EXPLAIN", 0.50),
-        temp_resp_explore=_env_float("TEMP_RESP_EXPLORE", 0.85),
         response_temperature=_env_float("RESPONSE_TEMPERATURE", 0.30),
         tool_calling_temperature=_env_float("TOOL_CALLING_TEMPERATURE", 0.10),
         compaction_temperature=_env_float("COMPACTION_TEMPERATURE", 0.20),
