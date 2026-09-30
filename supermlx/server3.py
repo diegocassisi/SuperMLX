@@ -3826,12 +3826,6 @@ class APIHandler(BaseHTTPRequestHandler):
                         ),
                         indent=1,
                     )
-            try:
-                from .router_tracer import flush_request_trace
-                _prompt_preview = str(locals().get("_last_user", locals().get("last_user_msg", locals().get("prompt", ""))))
-                flush_request_trace(request_id, prompt_preview=_prompt_preview)
-            except Exception as _trc_err:
-                logger.warning("[TRACER] Error ejecutando flush_request_trace: %s", _trc_err)
             # On normal exit or Python exception, release the lock. On process abort (e.g. Metal
             # "uncommitted encoder" crash), finally may not run, so the "leaked semaphore" warning
             # at shutdown is expected; fixing the Metal crash resolves it.
