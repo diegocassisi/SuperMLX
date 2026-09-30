@@ -82,6 +82,31 @@ Also available: `GET /v1/models` and `POST /v1/messages/count_tokens`. Streaming
 
 On startup the server prints this table for the configured host and ports.
 
+### Example: Hermes agent
+
+Hermes runs auxiliary services (title generation, context compression, web extraction…) as separate model calls. Point the agent's main model at `http://127.0.0.1:8080/v1` (session cache + thinking) and every auxiliary service at the ephemeral endpoint, so those side calls never disturb the main conversation's KV cache:
+
+```yaml
+auxiliary:
+  title_generation:
+    provider: custom
+    model: local
+    base_url: http://127.0.0.1:8080/v1/ephemeral   # no session cache, thinking off
+    api_key: "none"
+  compression:
+    provider: custom
+    model: local
+    base_url: http://127.0.0.1:8080/v1/ephemeral
+    api_key: "none"
+  web_extract:
+    provider: custom
+    model: local
+    base_url: http://127.0.0.1:8080/v1/ephemeral
+    api_key: "none"
+```
+
+Each auxiliary service has its own `base_url`, so you can also send some of them elsewhere, for example a cloud model for `web_extract` and the local ephemeral endpoint for the rest. The same idea works in any client that lets you set a base URL per task.
+
 Quick check:
 
 ```bash
