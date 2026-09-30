@@ -1,53 +1,37 @@
-# === ENTORNO ===
-venv/
+# Python
 __pycache__/
 *.pyc
-.DS_Store
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.venv/
+venv/
 
-# === CONFIGURACIÓN LOCAL (secretos, paths locales) ===
+# Local configuration and secrets
 .env
 .env.*
 !.env.example
-*.swp
-*.bak*
-backup/
 
-# === RUNTIME (generado por el servidor) ===
+# Runtime output
 logs/
 rag_data/
 
-# === MODELOS Y PESOS (demasiado grandes para git) ===
+# Models and weights
 models/
 *.safetensors
 *.gguf
 *.bin
 
-# === ARCHIVOS HISTÓRICOS ===
-Archive/
-Private-docs/
-
-# === IDE ===
-.vscode/
-.idea/
-
-# === BUILD / PIP ===
-*.egg-info/
-dist/
-build/
-lab/
-
-# === PRIVADO (no publicar) ===
-abliterated/
-envs/
-venv/
-.venv-vllm-metal/
-requirements_full_backup.txt
-sidecar_stream_test.txt
-
-# === LOCAL-ONLY (logs, resultados, trazas, estado de corridas) ===
+# Local-only files (logs, benchmark results, run state)
 _local/
 lastlog*.md
-L[0-9]-lastlog*.md
 *_trace.jsonl
 *_state.json
 benchmarks/results/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
