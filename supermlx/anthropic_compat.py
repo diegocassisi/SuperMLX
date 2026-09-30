@@ -156,6 +156,7 @@ def openai_to_anthropic_response(
     finish_reason: str,
     requested_model: str,
     prompt_input_tokens: int = 0,
+    output_tokens: int = 0,
 ) -> dict:
     """Build an Anthropic Messages response from already-processed generation
     output (text + tool_calls) that came out of the existing SuperMLX pipeline.
@@ -200,7 +201,7 @@ def openai_to_anthropic_response(
         "stop_sequence": None,
         "usage": {
             "input_tokens": prompt_input_tokens,
-            "output_tokens": 0,
+            "output_tokens": output_tokens,
             "cache_creation_input_tokens": 0,
             "cache_read_input_tokens": 0,
         },

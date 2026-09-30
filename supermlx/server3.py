@@ -2428,9 +2428,14 @@ class APIHandler(BaseHTTPRequestHandler):
                 logits_processors = [_budget_proc]
             else:
                 logits_processors.append(_budget_proc)
-        # Always use server DEFAULT_MAX_TOKENS — Claude Code sends max_tokens=8192
-        # which truncates long code generation. We override it entirely.
+        # Anthropic clients (Claude Code sends max_tokens=8192, which truncates
+        # long code generation) always get server DEFAULT_MAX_TOKENS. OpenAI
+        # clients may bound output with a smaller max_tokens: min(client, default).
         max_tokens = SETTINGS.default_max_tokens
+        _client_max = body.get("max_tokens")
+        if (not self._is_anthropic and isinstance(_client_max, int)
+                and not isinstance(_client_max, bool) and _client_max > 0):
+            max_tokens = min(_client_max, max_tokens)
         # Compact runner (context compaction) needs short output.
         # Cap total budget to avoid wasting 35s on thinking for a summary.
         # Note: title generation is intercepted earlier by the NL fast path.
@@ -2897,6 +2902,7 @@ class APIHandler(BaseHTTPRequestHandler):
                         message_text, tool_calls, finish_reason,
                         self._anthropic_model,
                         prompt_input_tokens=len(model_tokens),
+                        output_tokens=len(generated_tokens),
                     )
                     self.wfile.write(json.dumps(full_response).encode("utf-8"))
                 else:
@@ -2913,11 +2919,7 @@ class APIHandler(BaseHTTPRequestHandler):
                                 "finish_reason": finish_reason,
                             }
                         ],
-                        "usage": {
-                            "prompt_tokens": 0,
-                            "completion_tokens": 0,
-                            "total_tokens": 0,
-                        },
+                        "usage": dict(ctx.usage),
                     }
                     if tool_calls:
                         full_response["choices"][0]["message"]["tool_calls"] = tool_calls
@@ -3606,6 +3608,11 @@ class APIHandler(BaseHTTPRequestHandler):
                         "choices": [
                             {"index": 0, "delta": {}, "finish_reason": finish_reason}
                         ],
+                        "usage": {
+                            "prompt_tokens": len(model_tokens),
+                            "completion_tokens": len(generated_tokens),
+                            "total_tokens": len(model_tokens) + len(generated_tokens),
+                        },
                     }
                     _wire_payload = f"data: {json.dumps(final_chunk)}\n\n"
                     _pipeline_log("WIRE", request_id, f"SEND final_chunk | finish_reason={finish_reason} | wire_len={len(_wire_payload)}")
