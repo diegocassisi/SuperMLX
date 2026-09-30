@@ -1566,6 +1566,29 @@ try:
 except Exception as _guard_err:
     _terminal_status("⚠️", f"Metal Guard init failed (non-fatal): {_guard_err}")
 
+# ── RadixPromptCache: presupuesto de memoria (budget Metal - pesos - reserva) ──
+# Se mide lo que el árbol posee (nbytes de sus KV), no la memoria activa global.
+try:
+    from mlx.utils import tree_flatten as _tree_flatten
+    _radix_weights_bytes = sum(v.nbytes for _, v in _tree_flatten(model.parameters()))
+    _radix_metal_budget_bytes = int(_guard.get_metal_budget_gb() * 1e9)
+    _radix_scratch_bytes = int(float(os.environ.get("RADIX_SCRATCH_RESERVE_GB", "1.5")) * 1e9)
+    RADIX_PROMPT_CACHE.configure_memory_budget(
+        metal_budget_bytes=_radix_metal_budget_bytes,
+        weights_bytes=_radix_weights_bytes,
+        scratch_reserve_bytes=_radix_scratch_bytes,
+        log_fn=lambda _msg: _terminal_status("🌲", _msg, indent=1),
+    )
+    _terminal_status(
+        "🌲",
+        f"Radix memory budget: metal={_radix_metal_budget_bytes / 1e9:.2f}GB | "
+        f"weights={_radix_weights_bytes / 1e9:.2f}GB | scratch_reserve={_radix_scratch_bytes / 1e9:.2f}GB | "
+        f"kv_budget={max(0, _radix_metal_budget_bytes - _radix_weights_bytes) / 1e9:.2f}GB "
+        f"(minus working copy = newest node)",
+    )
+except Exception as _radix_budget_err:
+    _terminal_status("⚠️", f"Radix memory budget init failed (token-only eviction): {_radix_budget_err}")
+
 # ── Late init: wire _guard + HSM into cache_lru (defined after model load) ──
 _cache_lru_init(
     settings=SETTINGS, terminal_status_fn=_terminal_status,

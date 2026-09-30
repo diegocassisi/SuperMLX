@@ -41,6 +41,37 @@ class RadixNode:
     slot_type: Literal["main", "compact"] = "main"                  # Kripper Dual-Slot
     pinned: bool = False                                            # Inmune a eviction LRU si True
     parent: Optional["RadixNode"] = None                            # Referencia al nodo padre para eviction/split
+    kv_nbytes: int = 0                                              # Bytes de arrays que posee kv_cache (medido al asignar)
+
+
+def _kv_nbytes(kv_cache: Any) -> int:
+    """
+    Suma los bytes de todos los arrays alcanzables desde kv_cache (keys/values, estado
+    recurrente, snapshots de checkpoint). Cuenta buffers reservados, no sólo el offset
+    ocupado: es la memoria que el nodo retiene. Deduplica por id() dentro del objeto.
+    """
+    if kv_cache is None:
+        return 0
+    total = 0
+    seen: set[int] = set()
+    stack: list[Any] = [kv_cache]
+    while stack:
+        obj = stack.pop()
+        if obj is None or isinstance(obj, (int, float, str, bool, bytes)):
+            continue
+        if id(obj) in seen:
+            continue
+        seen.add(id(obj))
+        nbytes = getattr(obj, "nbytes", None) if hasattr(obj, "shape") else None
+        if isinstance(nbytes, int):
+            total += nbytes
+        elif isinstance(obj, dict):
+            stack.extend(obj.values())
+        elif isinstance(obj, (list, tuple)):
+            stack.extend(obj)
+        elif hasattr(obj, "__dict__"):
+            stack.extend(vars(obj).values())
+    return total
 
 
 class RadixPromptCache:
@@ -64,6 +95,51 @@ class RadixPromptCache:
             "main": RadixNode(tokens=[], slot_type="main"),
             "compact": RadixNode(tokens=[], slot_type="compact"),
         }
+        # Presupuesto de memoria (desactivado hasta configure_memory_budget)
+        self._kv_budget_bytes: Optional[int] = None   # budget Metal - pesos del modelo
+        self._scratch_reserve_bytes: int = 0          # scratch de prefill/decode fuera del árbol
+        self._newest: Optional[RadixNode] = None      # nodo del último insert: nunca se desaloja
+        self._log_fn: Optional[Callable[[str], None]] = None
+
+    def configure_memory_budget(
+        self,
+        metal_budget_bytes: int,
+        weights_bytes: int,
+        scratch_reserve_bytes: int = 0,
+        log_fn: Optional[Callable[[str], None]] = None,
+    ) -> None:
+        """
+        Activa el desalojo por memoria. Lo que el árbol puede retener es:
+            metal_budget - weights - (copia de trabajo + scratch)
+        donde la copia de trabajo es el tamaño del último KV insertado (el próximo turno
+        lo deep-copia vía match_prefix y lo extiende).
+        """
+        self._kv_budget_bytes = max(0, int(metal_budget_bytes) - int(weights_bytes))
+        self._scratch_reserve_bytes = max(0, int(scratch_reserve_bytes))
+        self._log_fn = log_fn
+
+    @property
+    def owned_bytes(self) -> int:
+        """Bytes de KV que retienen los nodos del árbol (todos los slots)."""
+        total = 0
+        stack = list(self._roots.values())
+        while stack:
+            node = stack.pop()
+            total += node.kv_nbytes
+            stack.extend(node.children.values())
+        return total
+
+    def memory_limit_bytes(self) -> Optional[int]:
+        """Límite actual para owned_bytes, o None si el presupuesto no está configurado."""
+        if self._kv_budget_bytes is None:
+            return None
+        working_copy = self._newest.kv_nbytes if self._newest is not None else 0
+        return max(0, self._kv_budget_bytes - self._scratch_reserve_bytes - working_copy)
+
+    @staticmethod
+    def _set_kv(node: RadixNode, kv_cache: Any) -> None:
+        node.kv_cache = kv_cache
+        node.kv_nbytes = _kv_nbytes(kv_cache)
 
     @property
     def root(self) -> RadixNode:
@@ -170,7 +246,15 @@ class RadixPromptCache:
         if not tokens:
             return
 
+        # Hacer lugar ANTES del deepcopy: la copia nueva no debe coexistir con nodos
+        # que igual se van a desalojar (evita un pico transitorio de un KV extra).
+        if self._kv_budget_bytes is not None and kv_cache is not None:
+            incoming = _kv_nbytes(kv_cache)
+            limit_after = max(0, self._kv_budget_bytes - self._scratch_reserve_bytes - incoming)
+            self.evict_to_bytes(max(0, limit_after - incoming), reason="pre_insert")
+
         kv_to_store = copy.deepcopy(kv_cache) if kv_cache is not None else None
+        stored_node: Optional[RadixNode] = None
         node = self.get_root(slot)
         remaining = list(tokens)
 
@@ -180,12 +264,13 @@ class RadixPromptCache:
                 # Caso: no hay hijo con este token inicial -> crear hoja con el sufijo restante
                 new_leaf = RadixNode(
                     tokens=remaining,
-                    kv_cache=kv_to_store,
                     slot_type=slot,  # type: ignore[arg-type]
                     pinned=pinned,
                     last_used=time.time(),
                     parent=node,
                 )
+                self._set_kv(new_leaf, kv_to_store)
+                stored_node = new_leaf
                 node.children[first_token] = new_leaf
                 self._total_tokens += len(remaining)
                 remaining = []
@@ -201,17 +286,19 @@ class RadixPromptCache:
                 if remaining:
                     new_leaf = RadixNode(
                         tokens=remaining,
-                        kv_cache=kv_to_store,
                         slot_type=slot,  # type: ignore[arg-type]
                         pinned=pinned,
                         last_used=time.time(),
                         parent=prefix_node,
                     )
+                    self._set_kv(new_leaf, kv_to_store)
+                    stored_node = new_leaf
                     prefix_node.children[remaining[0]] = new_leaf
                     self._total_tokens += len(remaining)
                 else:
                     # El nuevo camino coincide exactamente con el prefix recién creado
-                    prefix_node.kv_cache = kv_to_store
+                    self._set_kv(prefix_node, kv_to_store)
+                    stored_node = prefix_node
                     prefix_node.pinned = pinned or prefix_node.pinned
                     prefix_node.last_used = time.time()
                 remaining = []
@@ -222,14 +309,35 @@ class RadixPromptCache:
                 node = child
                 if not remaining:
                     # Coincidencia exacta con un nodo preexistente -> actualizar KV
-                    node.kv_cache = kv_to_store
+                    self._set_kv(node, kv_to_store)
+                    stored_node = node
                     node.pinned = pinned or node.pinned
                     node.last_used = time.time()
                     break
 
-        # Mantener presupuesto de memoria
+        if stored_node is not None and stored_node.kv_cache is not None:
+            self._newest = stored_node
+
+        # Mantener presupuesto de tokens
         if self._total_tokens > self.max_tokens:
             self.evict_lru(self._total_tokens - self.max_tokens)
+
+        # Mantener presupuesto de memoria
+        limit = self.memory_limit_bytes()
+        if limit is not None:
+            self.evict_to_bytes(limit, reason="post_insert")
+            if self._log_fn is not None:
+                try:
+                    self._log_fn(
+                        f"[RADIX_MEM] insert={len(tokens)} tok "
+                        f"node={(self._newest.kv_nbytes if self._newest else 0) / 1e9:.3f}GB | "
+                        f"owned={self.owned_bytes / 1e9:.3f}GB limit={limit / 1e9:.3f}GB | "
+                        f"kv_budget={self._kv_budget_bytes / 1e9:.2f}GB "
+                        f"scratch={self._scratch_reserve_bytes / 1e9:.2f}GB | "
+                        f"kv_nodes={self._count_kv_nodes()}"
+                    )
+                except Exception:
+                    pass
 
     def _split_node(self, child: RadixNode, split_idx: int) -> RadixNode:
         """
@@ -266,7 +374,7 @@ class RadixPromptCache:
         # child mantiene su kv_cache original que representa la secuencia completa.
         # prefix_node obtiene un slice/trim del kv_cache si es factible.
         if child.kv_cache is not None:
-            prefix_node.kv_cache = _slice_kv_for_prefix(child.kv_cache, len(suffix_tokens), trim_fn=self.trim_fn)
+            self._set_kv(prefix_node, _slice_kv_for_prefix(child.kv_cache, len(suffix_tokens), trim_fn=self.trim_fn))
 
         return prefix_node
 
@@ -307,7 +415,7 @@ class RadixPromptCache:
             del target.parent.children[target.tokens[0]]
             self._total_tokens -= num_tokens
             freed += num_tokens
-            target.kv_cache = None
+            self._set_kv(target, None)
 
             # Si el padre quedó sin hijos y sin KV propio, podarlo si no es raíz
             self._prune_empty_ancestors(target.parent)
@@ -320,6 +428,90 @@ class RadixPromptCache:
 
         return freed
 
+    def evict_to_bytes(self, limit_bytes: int, reason: str = "") -> int:
+        """
+        Libera KV (LRU) hasta que owned_bytes <= limit_bytes. Retorna bytes liberados.
+
+        A diferencia de evict_lru, considera también nodos internos: en una conversación
+        lineal cada turno deja un nodo intermedio con el KV completo de su prefijo, y esos
+        nodos nunca llegan a ser hoja. En un nodo interno sólo se suelta el KV (la
+        estructura queda para los hijos); una hoja se elimina del árbol.
+        Nunca toca el nodo recién insertado ni nodos con ref_count > 0.
+        Pinned sólo se desaloja si no queda otra opción (igual que evict_lru).
+        """
+        freed = 0
+        evicted_nodes = 0
+        owned = self.owned_bytes
+        while owned > limit_bytes:
+            candidates: list[RadixNode] = []
+            pinned_candidates: list[RadixNode] = []
+            stack = list(self._roots.values())
+            while stack:
+                node = stack.pop()
+                stack.extend(node.children.values())
+                if (
+                    node.parent is None
+                    or node.kv_cache is None
+                    or node is self._newest
+                    or node.ref_count > 0
+                ):
+                    continue
+                (pinned_candidates if node.pinned else candidates).append(node)
+
+            pool = candidates or pinned_candidates
+            if not pool:
+                logger.warning(
+                    "[RADIX_MEM] Sin candidatos desalojables: owned=%.3fGB > limit=%.3fGB (reason=%s)",
+                    owned / 1e9, limit_bytes / 1e9, reason,
+                )
+                break
+            if not candidates:
+                logger.warning("[RADIX_MEM] Sólo quedan nodos pinned. Aplicando fallback de desalojo.")
+
+            # LRU; a igualdad de timestamp, el más superficial primero (menos contexto reutilizable)
+            target = min(pool, key=lambda n: (n.last_used, _node_depth(n)))
+            node_bytes = target.kv_nbytes
+            if target.children:
+                self._set_kv(target, None)
+            else:
+                del target.parent.children[target.tokens[0]]
+                self._total_tokens -= len(target.tokens)
+                self._set_kv(target, None)
+                self._prune_empty_ancestors(target.parent)
+            freed += node_bytes
+            evicted_nodes += 1
+            owned -= node_bytes
+
+        if freed > 0:
+            logger.info(
+                "[RADIX_MEM] evict_to_bytes(%s): %d nodos, %.3fGB liberados, owned=%.3fGB limit=%.3fGB",
+                reason, evicted_nodes, freed / 1e9, owned / 1e9, limit_bytes / 1e9,
+            )
+            if self._log_fn is not None:
+                try:
+                    self._log_fn(
+                        f"[RADIX_MEM] evicted {evicted_nodes} node(s) ({reason}) | freed={freed / 1e9:.3f}GB | "
+                        f"owned={owned / 1e9:.3f}GB limit={limit_bytes / 1e9:.3f}GB"
+                    )
+                except Exception:
+                    pass
+            if self.guard is not None:
+                try:
+                    self.guard.force_clear_cache("radix_evict_bytes")
+                except Exception:
+                    pass
+        return freed
+
+    def _count_kv_nodes(self) -> int:
+        count = 0
+        stack = list(self._roots.values())
+        while stack:
+            node = stack.pop()
+            if node.kv_cache is not None:
+                count += 1
+            stack.extend(node.children.values())
+        return count
+
     def _collect_leaf_candidates(
         self,
         node: RadixNode,
@@ -329,8 +521,8 @@ class RadixPromptCache:
         """Recorre recursivamente buscando nodos hoja con ref_count == 0."""
         for child in list(node.children.values()):
             if not child.children:
-                # Es nodo hoja
-                if child.ref_count == 0:
+                # Es nodo hoja (el recién insertado nunca es candidato)
+                if child.ref_count == 0 and child is not self._newest:
                     if child.pinned:
                         pinned_candidates.append(child)
                     else:
@@ -367,7 +559,7 @@ class RadixPromptCache:
                     del leaf.parent.children[leaf.tokens[0]]
                     self._total_tokens -= n_tok
                     freed += n_tok
-                    leaf.kv_cache = None
+                    self._set_kv(leaf, None)
                     self._prune_empty_ancestors(leaf.parent)
         if freed > 0 and self.guard is not None:
             try:
@@ -380,6 +572,16 @@ class RadixPromptCache:
         """Verifica si la secuencia exacta de tokens está registrada en el árbol."""
         matched, _ = self.match_prefix(tokens, slot=slot)
         return len(matched) == len(tokens)
+
+
+def _node_depth(node: RadixNode) -> int:
+    """Tokens desde la raíz hasta el final de node."""
+    depth = 0
+    current: Optional[RadixNode] = node
+    while current is not None:
+        depth += len(current.tokens)
+        current = current.parent
+    return depth
 
 
 def _common_prefix_len(a: list[int], b: list[int]) -> int:
