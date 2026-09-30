@@ -35,8 +35,7 @@ It speaks both the **OpenAI** and the **Anthropic** HTTP APIs, so most clients w
 - **MoE expert cache** *(optional)* — predictive loading and pinning of experts for MoE models.
 
 **Integration**
-- OpenAI `/v1/chat/completions`, Anthropic `/v1/messages` (+ `/v1/messages/count_tokens`), `/v1/models`, streaming and non-streaming.
-- `/v1/ephemeral/...` variants that bypass the session cache, and a **sidecar** port for scripts and sensors.
+- OpenAI and Anthropic endpoints, streaming and non-streaming, plus separate **ephemeral** endpoints and a **sidecar** port for traffic that must not use the session cache (see [Endpoints](#endpoints)).
 - Optional RAG enrichment and prompt compression (LanceDB, LLMLingua-2), and vision-language models via `mlx-vlm`.
 
 An experimental Apple Neural Engine prefill path exists but is disabled by default.
@@ -61,12 +60,27 @@ cp .env.example .env          # set MODEL_PATH, everything else is optional
 python SuperMLX.py            # or: supermlx
 ```
 
-On startup the server prints the endpoints it serves:
+### Endpoints
 
-| Endpoint | Default port | Purpose |
-|---|:---:|---|
-| OpenAI / Anthropic API | `8080` | Point your agent framework here |
-| Sidecar | `8081` | Lightweight endpoint for scripts, no session tracking (`SIDECAR_PORT=0` disables it) |
+All API endpoints are served on the main port (`8080` by default). The sidecar has its own port.
+
+| Endpoint | Tool-prefix cache | Session KV cache | Thinking |
+|---|:---:|:---:|:---:|
+| **OpenAI** `POST /v1/chat/completions` | ✅ | ✅ | ✅ |
+| **OpenAI** `POST /v1/ephemeral/chat/completions` | ✅ | ❌ | ❌ |
+| **Anthropic** `POST /v1/messages` | ✅ | ✅ | ✅ |
+| **Anthropic** `POST /v1/ephemeral/messages` | ✅ | ❌ | ❌ |
+| **Sidecar** `http://host:8081` (OpenAI-style) | ❌ | ❌ | per request |
+
+Also available: `GET /v1/models` and `POST /v1/messages/count_tokens`. Streaming and non-streaming are supported on all of them.
+
+**Main endpoints** are for the agent itself: they use the session KV cache, so each turn only prefills what changed, and they support thinking.
+
+**Ephemeral endpoints** (`/v1/ephemeral/...`) are for everything around the agent that should *not* touch its cache: title generation, summaries, memory and other housekeeping calls. They never read or write the session cache and run with thinking off, so they cannot evict or pollute the main conversation. Because they are separate URLs, you can point those auxiliary services at them independently of the main agent, in any client that lets you set a base URL per service.
+
+**Sidecar** is a lightweight extra port for scripts, sensors and other tools: no session tracking, an ephemeral per-request cache, optional RAG enrichment and its own limits (`SIDECAR_PORT`, `SIDECAR_MAX_TOKENS`, `SIDECAR_ENABLE_RAG`). Set `SIDECAR_PORT=0` to disable it. It shares the loaded model, so it takes turns with the main endpoints.
+
+On startup the server prints this table for the configured host and ports.
 
 Quick check:
 
