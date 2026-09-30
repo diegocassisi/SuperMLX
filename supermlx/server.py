@@ -59,7 +59,6 @@ SSoT: server.py es la única fuente de verdad (SSoT) para la ejecución de infer
     • RAG Enrichment            FEATURE_RAG_ENRICHMENT=true  (LanceDB + embeddings)
     • Prompt Compressor         FEATURE_COMPRESSOR=true      (LLMLingua-2 + reranker)
     • Vision Model Support      Auto-detected from config    (mlx-vlm)
-    • Cascade Routing           FEATURE_CASCADE=true         (frontier API fallback)
     • Native KV Quantization    KV_BITS=4                    (4-bit / 8-bit per session)
 
   ❌ Not implemented:
@@ -436,14 +435,6 @@ from .housekeeping_staging import (
 HOUSEKEEPING_STAGING_MANAGER = HousekeepingStagingManager()
 
 
-# ── CASCADE ROUTING: DESCONECTADO ─────────────────────────────────────────────
-# Extracted to components/cascade_routing.py and DISABLED.
-# Was: forward to frontier API (Gemini) when RAG confidence is low.
-# Re-enable by importing cascade_routing and calling init().
-FEATURE_CASCADE = False  # DESCONECTADO
-CASCADE_API_URL = ""
-CASCADE_API_KEY = ""
-CASCADE_MODEL = ""
 CASCADE_RAG_THRESHOLD = 2.0
 CASCADE_TIMEOUT_S = 60
 
@@ -730,14 +721,6 @@ _delta_tracker = _rlog.delta_tracker
 _pipeline_log = _rlog.pipeline_log
 _fmt_tc_for_log = _rlog.fmt_tc_for_log
 _write_request_log = _rlog.write_request_log
-
-
-
-# _cascade_forward_request: REMOVED — was in cascade_routing.py (DESCONECTADO)
-def _cascade_forward_request(*args, **kwargs):
-    """Cascade routing is DISCONNECTED. This stub prevents NameError."""
-    raise RuntimeError("Cascade routing is DISCONNECTED")
-
 
 
 

@@ -18,7 +18,6 @@ from typing import Dict, List, Set, Tuple
 
 # Módulos intencionalmente desconectados (documentados en arquitectura)
 KNOWN_DISCONNECTED_MODULES: Set[str] = {
-    "cascade_routing",  # Desconectado a propósito en v2-refactor / Fase D
 }
 
 
