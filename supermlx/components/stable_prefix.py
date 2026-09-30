@@ -32,7 +32,7 @@ def init(
     feature_preserve_thinking: bool,
     max_idle_seconds: int,
 ) -> None:
-    """Initialize with shared state from server2."""
+    """Initialize with shared state from server."""
     global _tokenizer, _is_vlm, _feature_preserve_thinking, _max_idle_seconds
     _tokenizer = tokenizer
     _is_vlm = is_vlm

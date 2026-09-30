@@ -1,8 +1,8 @@
 """
 [AI_DIRECTIVE]
-ROL: Auditor de wiring de funciones init() para módulos de server3components.
-OBJETIVO: Detectar definiciones def init() en server3components/*.py y verificar que estén cableadas en server3.py.
-ENTRADAS: Rutas a server3.py y server3components/.
+ROL: Auditor de wiring de funciones init() para módulos de components.
+OBJETIVO: Detectar definiciones def init() en components/*.py y verificar que estén cableadas en server.py.
+ENTRADAS: Rutas a server.py y components/.
 SALIDAS: Código de salida 0 si todo está cableado o debidamente justificado, 1 si falta cablear algún init().
 REGLAS INVIOLABLES:
 - Prohibido omitir módulos con init() no registrados como intencionalmente desconectados.
@@ -49,19 +49,19 @@ def find_init_calls_in_server(server_file: Path) -> Tuple[Set[str], Set[str]]:
     content = server_file.read_text(encoding="utf-8")
     tree = ast.parse(content, filename=str(server_file))
 
-    # Mapear alias a nombres de módulo importados de server3components
-    # Ej: from .server3components import adaptive_prefill as _ap_mod -> {'_ap_mod': 'adaptive_prefill'}
-    # Ej: from .server3components.cache_lru import init as _cache_lru_init -> {'_cache_lru_init': 'cache_lru'}
+    # Mapear alias a nombres de módulo importados de components
+    # Ej: from .components import adaptive_prefill as _ap_mod -> {'_ap_mod': 'adaptive_prefill'}
+    # Ej: from .components.cache_lru import init as _cache_lru_init -> {'_cache_lru_init': 'cache_lru'}
     alias_to_module: Dict[str, str] = {}
     func_alias_to_module: Dict[str, str] = {}
 
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom):
             module_path = node.module or ""
-            if "server3components" in module_path:
-                # Caso: from .server3components.module_name import init as foo_init
+            if "components" in module_path:
+                # Caso: from .components.module_name import init as foo_init
                 parts = module_path.split(".")
-                submod = parts[-1] if parts[-1] != "server3components" else None
+                submod = parts[-1] if parts[-1] != "components" else None
                 for alias in node.names:
                     imported_name = alias.name
                     as_name = alias.asname or imported_name
@@ -92,19 +92,19 @@ def find_init_calls_in_server(server_file: Path) -> Tuple[Set[str], Set[str]]:
 
 
 def audit_wiring(repo_root: Path) -> bool:
-    """Ejecuta la auditoría completa de wiring de init() entre server3.py y server3components."""
-    server3_file = repo_root / "supermlx" / "server3.py"
-    components_dir = repo_root / "supermlx" / "server3components"
+    """Ejecuta la auditoría completa de wiring de init() entre server.py y components."""
+    server_file = repo_root / "supermlx" / "server.py"
+    components_dir = repo_root / "supermlx" / "components"
 
-    if not server3_file.exists():
-        print(f"[ERROR] No existe {server3_file}")
+    if not server_file.exists():
+        print(f"[ERROR] No existe {server_file}")
         return False
     if not components_dir.exists():
         print(f"[ERROR] No existe {components_dir}")
         return False
 
     modules_with_init = find_modules_with_init(components_dir)
-    called_modules, _ = find_init_calls_in_server(server3_file)
+    called_modules, _ = find_init_calls_in_server(server_file)
 
     missing: List[str] = []
     wired: List[str] = []
@@ -119,7 +119,7 @@ def audit_wiring(repo_root: Path) -> bool:
             missing.append(mod)
 
     print("=" * 60)
-    print(" AUDITORÍA DE WIRING INIT() — server3components → server3.py")
+    print(" AUDITORÍA DE WIRING INIT() — components → server.py")
     print("=" * 60)
     for mod in wired:
         print(f"  [OK] {mod}.init() conectado")
@@ -129,7 +129,7 @@ def audit_wiring(repo_root: Path) -> bool:
     if missing:
         print("-" * 60)
         for mod in missing:
-            print(f"  [FAIL] {mod}.init() DEFINIDO pero NO LLAMADO en server3.py!")
+            print(f"  [FAIL] {mod}.init() DEFINIDO pero NO LLAMADO en server.py!")
         print("=" * 60)
         return False
 

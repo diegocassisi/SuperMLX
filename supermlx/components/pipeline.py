@@ -1,6 +1,6 @@
 """
 [AI_DIRECTIVE]
-ROL: Pipeline de 4 fases para _handle_chat_completion en server3 (Fase D).
+ROL: Pipeline de 4 fases para _handle_chat_completion en server (Fase D).
 OBJETIVO: Descomponer el procesamiento de chat completions en 4 fases secuenciales
           puras/mutadoras sobre RequestContext y ServerState:
           1. preprocess: parseo, canonicalización dual, healing, compresión y RAG.
@@ -13,7 +13,7 @@ REGLAS INVIOLABLES:
 - Single-user local: sin scheduler de colas ni continuous batching.
 - No imports circulares: dependencias de modelo/tokenizer pasan vía state.
 - Coexistencia paso a paso según el plan de refactorización.
-SSoT: pipeline.py es la única definición de las 4 fases de ejecución para server3.
+SSoT: pipeline.py es la única definición de las 4 fases de ejecución para server.
 """
 from __future__ import annotations
 

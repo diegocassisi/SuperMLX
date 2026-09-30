@@ -35,7 +35,7 @@ _prompt_cache_ref: Any = None  # Reference to PROMPT_CACHE for self-check
 def init(*, settings: Any, terminal_status_fn: Callable,
          guard: Any = None, housekeeping_staging_manager: Any = None,
          prompt_cache_ref: Any = None) -> None:
-    """Initialize with shared state from server2."""
+    """Initialize with shared state from server."""
     global _terminal_status_fn, _settings, _guard, _hsm, _prompt_cache_ref
     _terminal_status_fn = terminal_status_fn
     _settings = settings

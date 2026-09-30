@@ -77,7 +77,7 @@ def init(
     scratch_bytes_per_element: int = 4,
     adaptive_prefill_min_chunk: int = 32,
 ) -> None:
-    """Initialize with shared state from server2."""
+    """Initialize with shared state from server."""
     global _settings, _terminal_status, _pipeline_log, _guard
     global _cache_diag, _model, _prefill_step_size
     global _feature_cache_diag, _feature_full_logging

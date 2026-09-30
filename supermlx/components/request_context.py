@@ -8,7 +8,7 @@ REGLAS INVIOLABLES:
 - Un solo RequestContext activo a la vez (single-user local).
 - No sustituye a ServerState (que gestiona recursos globales persistentes).
 - Tipado estricto en todos los atributos.
-SSoT: Este módulo es la única definición de RequestContext para server3.
+SSoT: Este módulo es la única definición de RequestContext para server.
 """
 from __future__ import annotations
 

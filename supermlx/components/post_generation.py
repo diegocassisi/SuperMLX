@@ -79,7 +79,7 @@ def init(
     trim_prompt_cache: Callable,
     HybridGenerationCheckpoint: Any,
 ) -> None:
-    """Initialize with shared state from server2."""
+    """Initialize with shared state from server."""
     global _settings, _terminal_status, _pipeline_log, _tokenize_prompt
     global _thinking_tracker, _prompt_cache, _session_index, _cache_diag
     global _kv_cache_offset_fn, _update_session_turn_store_fn

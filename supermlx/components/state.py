@@ -1,9 +1,9 @@
 """
 [AI_DIRECTIVE]
-ROL: Contrato de dependencias para módulos extraídos de server2.py
+ROL: Contrato de dependencias para módulos extraídos de server.py
 OBJETIVO: Centralizar las ~15 variables globales compartidas en un dataclass tipado,
           eliminando acoplamiento implícito entre componentes
-ENTRADAS: Globals de server2.py (model, tokenizer, caches, guards, etc.)
+ENTRADAS: Globals de server.py (model, tokenizer, caches, guards, etc.)
 SALIDAS: ServerState dataclass que los módulos reciben en lugar de acceder a globals
 REGLAS INVIOLABLES:
 - from __future__ import annotations OBLIGATORIO (evita NameError en forward refs)
@@ -22,7 +22,7 @@ import threading
 
 @dataclass
 class ServerState:
-    """Shared state contract for extracted server2 modules.
+    """Shared state contract for extracted server modules.
 
     IMPORTANT: This dataclass uses forward-referenced types (strings in annotations)
     thanks to `from __future__ import annotations`. This means:

@@ -138,7 +138,7 @@ import math
 import logging
 import traceback
 
-logger = logging.getLogger("supermlx.server3")
+logger = logging.getLogger("supermlx.server")
 from datetime import datetime
 # Overflow guard: reject requests that would exceed safe prefill limits (used by Compact Guard)
 _max_safe_prefill_tokens = int(os.environ.get("MAX_SAFE_PREFILL_TOKENS", "82192"))
@@ -383,8 +383,8 @@ def _tool_audit_write(request_id: str, stage: str, data: dict) -> None:
 # FEATURE_COMPRESSION_THRESHOLD: now in rag_facade
 # FEATURE_COMPRESSION_GUARD: now in rag_facade
 
-# ── Compression Cache: extracted to server3components/compress_cache.py ────────
-from .server3components import compress_cache as _cc
+# ── Compression Cache: extracted to components/compress_cache.py ────────
+from .components import compress_cache as _cc
 _compress_cache_get = _cc.cache_get
 _compress_cache_put = _cc.cache_put
 _compress_with_cache = _cc.compress_with_cache
@@ -437,7 +437,7 @@ HOUSEKEEPING_STAGING_MANAGER = HousekeepingStagingManager()
 
 
 # ── CASCADE ROUTING: DESCONECTADO ─────────────────────────────────────────────
-# Extracted to server3components/cascade_routing.py and DISABLED.
+# Extracted to components/cascade_routing.py and DISABLED.
 # Was: forward to frontier API (Gemini) when RAG confidence is low.
 # Re-enable by importing cascade_routing and calling init().
 FEATURE_CASCADE = False  # DESCONECTADO
@@ -608,8 +608,8 @@ except Exception as _e:
     logger.warning("[LOG] No se pudo inicializar lastlog.md: %s", _e)
 
 
-# ── Request Logger: extracted to server3components/request_logger.py ───────────
-from .server3components import request_logger as _rlog
+# ── Request Logger: extracted to components/request_logger.py ───────────
+from .components import request_logger as _rlog
 _rlog.init(
     console_lock=console_lock,
     feature_full_logging=FEATURE_FULL_LOGGING,
@@ -720,7 +720,7 @@ MAX_HEALING_STORE = 2000  # Generous size to survive deep multi-agent sessions
 _PIPELINE_LOG_DIR = SETTINGS.log_root / "requests"
 
 
-# ANSI constants — re-exported from request_logger for direct use in server2.py
+# ANSI constants — re-exported from request_logger for direct use in server.py
 _ANSI_YELLOW = _rlog.ANSI_YELLOW
 _ANSI_RED = _rlog.ANSI_RED
 _ANSI_DIM = _rlog.ANSI_DIM
@@ -759,11 +759,11 @@ _terminal_status = _rlog.terminal_status
 
 
 # _block_chain_hashes moved to cache_lru.py
-from .server3components.cache_lru import _block_chain_hashes
+from .components.cache_lru import _block_chain_hashes
 
 
-# ── LRUPromptCache: extracted to server3components/cache_lru.py ────────────────
-from .server3components.cache_lru import LRUPromptCache, init as _cache_lru_init
+# ── LRUPromptCache: extracted to components/cache_lru.py ────────────────
+from .components.cache_lru import LRUPromptCache, init as _cache_lru_init
 _cache_lru_init(settings=SETTINGS, terminal_status_fn=_terminal_status)
 
 
@@ -773,7 +773,7 @@ PROMPT_CACHE = LRUPromptCache(
 )
 
 # ── RadixPromptCache: SSoT para Fase D (RadixAttention) ────────────────────────
-from .server3components.radix_cache import RadixPromptCache
+from .components.radix_cache import RadixPromptCache
 RADIX_PROMPT_CACHE = RadixPromptCache(
     max_tokens=SETTINGS.max_kv_size,
     guard=_guard,
@@ -811,8 +811,8 @@ _staging_reaper_thread.start()
 
 
 
-# ── SessionIndex: extracted to server3components/session_index.py ──────────────
-from .server3components.session_index import SessionIndex
+# ── SessionIndex: extracted to components/session_index.py ──────────────
+from .components.session_index import SessionIndex
 
 SESSION_INDEX = SessionIndex(
     max_entries_per_session=SETTINGS.prompt_cache_max_entries_per_session,
@@ -820,8 +820,8 @@ SESSION_INDEX = SessionIndex(
 )
 
 
-# ── Stable Prefix: extracted to server3components/stable_prefix.py ─────────────
-from .server3components.stable_prefix import (
+# ── Stable Prefix: extracted to components/stable_prefix.py ─────────────
+from .components.stable_prefix import (
     _SessionTurnRecord,
     SESSION_TURN_STORE,
     _normalize_message_content_for_diff,
@@ -833,9 +833,9 @@ from .server3components.stable_prefix import (
 )
 
 # ── Pipeline Fase D: RequestContext, ServerState y preprocess ─────────────────
-from .server3components.request_context import RequestContext
-from .server3components.state import ServerState
-from .server3components.pipeline import (
+from .components.request_context import RequestContext
+from .components.state import ServerState
+from .components.pipeline import (
     preprocess as _pipeline_preprocess,
     cache_lookup as _pipeline_cache_lookup,
     generate as _pipeline_generate,
@@ -913,13 +913,13 @@ def _cache_log_session_id(
 
 
 # _extract_images_from_messages + _prepare_messages_for_vlm moved to vlm_pipeline.py
-from .server3components.vlm_pipeline import vlm_extract_images as _extract_images_from_messages
-from .server3components.vlm_pipeline import vlm_prepare_messages as _prepare_messages_for_vlm
+from .components.vlm_pipeline import vlm_extract_images as _extract_images_from_messages
+from .components.vlm_pipeline import vlm_prepare_messages as _prepare_messages_for_vlm
 
 
 
-# ── VLM Pipeline: extracted to server3components/vlm_pipeline.py ───────────────
-from .server3components import vlm_pipeline as _vlm
+# ── VLM Pipeline: extracted to components/vlm_pipeline.py ───────────────
+from .components import vlm_pipeline as _vlm
 _vlm.init(feature_preserve_thinking=FEATURE_PRESERVE_THINKING)
 _vlm_prompt_and_inputs = _vlm.vlm_prompt_and_inputs
 _vlm_sync_before_generation = _vlm.vlm_sync_before_generation
@@ -983,9 +983,9 @@ def _pre_prefill_memory_relief(request_id: str, rest_count: int) -> None:
             _terminal_status("⚠️", f"MoE pre-prefill hook error: {_be} | req={request_id[:8]}")
 
 
-# ── Adaptive prefill: extracted to server3components/adaptive_prefill.py ───────
-from .server3components import adaptive_prefill as _ap_mod
-from .server3components.adaptive_prefill import (
+# ── Adaptive prefill: extracted to components/adaptive_prefill.py ───────
+from .components import adaptive_prefill as _ap_mod
+from .components.adaptive_prefill import (
     _start_prefill_progress,
     _adaptive_prefill,
     _adaptive_prefill_chunk,
@@ -1069,9 +1069,9 @@ def _update_healing_store(raw_text: str, message_text: str, tool_calls: Optional
             HEALING_STORE.popitem(last=False)
 
 
-# ── Post-generation cache logic: extracted to server3components/post_generation.py ──
-from .server3components import post_generation as _post_gen
-from .server3components.post_generation import (
+# ── Post-generation cache logic: extracted to components/post_generation.py ──
+from .components import post_generation as _post_gen
+from .components.post_generation import (
     _post_generation_cache_update,
     _build_timing_dict,
     _log_generation_telemetry,
@@ -1621,8 +1621,8 @@ _terminal_status("🗜️", f"KV Cache Quantization (native mlx-lm): {_kv_desc}"
 # Failures are logged but never crash startup — graceful degradation.
 # ══════════════════════════════════════════════════════════════════════════════
 # --- RAG Enricher ---
-# ── RAG + Compressor: extracted to server3components/rag_facade.py ─────────────
-from .server3components import rag_facade as _rag_facade
+# ── RAG + Compressor: extracted to components/rag_facade.py ─────────────
+from .components import rag_facade as _rag_facade
 _rag_facade.init(terminal_status_fn=_terminal_status)
 _rag_available = _rag_facade.is_rag_available()
 _rag_module = _rag_facade.get_rag_module()
@@ -1933,8 +1933,8 @@ def _stream_generate_unified(
 # Memory during generation: ~144KB × context_tokens (ephemeral, freed on completion)
 # ══════════════════════════════════════════════════════════════════════════════
 
-# ── SidecarHandler: extracted to server3components/sidecar_handler.py ──────────
-from .server3components.sidecar_handler import SidecarHandler, init as _sidecar_init
+# ── SidecarHandler: extracted to components/sidecar_handler.py ──────────
+from .components.sidecar_handler import SidecarHandler, init as _sidecar_init
 # _sidecar_init() is called in run() after all deps are available
 
 

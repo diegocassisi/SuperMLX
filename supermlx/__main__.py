@@ -1,4 +1,4 @@
 """Allow running as: python -m supermlx"""
-from supermlx.server3 import run
+from supermlx.server import run
 
 run()

@@ -1,6 +1,6 @@
 """
 [AI_DIRECTIVE]
-ROL: Unified pipeline logging for server2 — terminal output, auto-delta tracking, disk logs
+ROL: Unified pipeline logging for server — terminal output, auto-delta tracking, disk logs
 OBJETIVO: Centralizar todas las funciones de logging de request pipeline en un módulo reutilizable
 ENTRADAS: stage tags, request IDs, messages, structured data
 SALIDAS: Console output (with ANSI colors), lastlog.md, per-request JSON logs
@@ -8,7 +8,7 @@ REGLAS INVIOLABLES:
 - Never crash the pipeline for a log failure (best-effort everywhere)
 - Thread-safe: always acquire console_lock before writing
 - FEATURE_FULL_LOGGING master switch controls all pipeline_log output
-SSoT: Este módulo es la única fuente de logging de pipeline para server2.py
+SSoT: Este módulo es la única fuente de logging de pipeline para server.py
 """
 import json
 import re
@@ -47,7 +47,7 @@ def init(
     lastlog_path: Path,
     pipeline_log_dir: Path,
 ) -> None:
-    """Initialize the request logger with shared state from server2.
+    """Initialize the request logger with shared state from server.
 
     Must be called once during server startup, before any logging calls.
     """

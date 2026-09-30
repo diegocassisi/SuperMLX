@@ -19,7 +19,7 @@ DECISIÓN ARQUITECTURAL (Commit 3.5 — Coexistencia TPC vs Radix Tree):
   3. Orden de consulta: RadixPromptCache primero. Solo ante MISS funcional total se consulta TPC como fallback.
   4. Garantía de no-contaminación: TPC retorna clones aislados; el estado extendido se indexa en el Radix Tree
      en postprocess(), permitiendo que los turnos subsiguientes resuelvan 100% dentro del árbol radix.
-SSoT: RadixPromptCache es la única implementación de cache radix para server3.
+SSoT: RadixPromptCache es la única implementación de cache radix para server.
 """
 from __future__ import annotations
 

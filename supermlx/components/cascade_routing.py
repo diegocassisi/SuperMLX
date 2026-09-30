@@ -55,7 +55,7 @@ CASCADE_TIMEOUT_S = _env_int("CASCADE_TIMEOUT_S", 60)
 
 
 def init(*, pipeline_log: Callable) -> None:
-    """Initialize with shared state from server2."""
+    """Initialize with shared state from server."""
     global _pipeline_log
     _pipeline_log = pipeline_log
 

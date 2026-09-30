@@ -64,7 +64,7 @@ def init(
     feature_preserve_thinking: bool,
     ThinkingEvent: Any,
 ) -> None:
-    """Initialize with shared state from server2."""
+    """Initialize with shared state from server."""
     global _settings, _terminal_status, _pipeline_log, _guard
     global _model_lock, _model, _tokenizer, _thinking_tracker
     global _make_prompt_cache, _stream_generate, _stream_generate_mtp

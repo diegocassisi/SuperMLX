@@ -28,7 +28,7 @@ _feature_preserve_thinking: bool = True
 
 
 def init(*, feature_preserve_thinking: bool) -> None:
-    """Initialize VLM pipeline with shared config from server2."""
+    """Initialize VLM pipeline with shared config from server."""
     global _feature_preserve_thinking
     _feature_preserve_thinking = feature_preserve_thinking
 
@@ -238,6 +238,6 @@ def _prepare_messages_for_vlm(
     return normalized
 
 
-# Aliases for backward compatibility with server2.py imports
+# Aliases for backward compatibility with server.py imports
 vlm_extract_images = _extract_images_from_messages
 vlm_prepare_messages = _prepare_messages_for_vlm

@@ -1,15 +1,15 @@
 """
 [AI_DIRECTIVE]
-ROL: Facade para RAG enrichment y prompt compression (server2)
+ROL: Facade para RAG enrichment y prompt compression (server)
 OBJETIVO: Centralizar la inicialización, config, y estado de rag_enricher
-          para que server2.py solo importe este módulo
+          para que server.py solo importe este módulo
 ENTRADAS: env vars (FEATURE_RAG_ENRICHMENT, RAG_WORKSPACE_ROOT, etc.)
 SALIDAS: is_rag_available(), is_compressor_available(), enrich_messages(), compress_messages()
 REGLAS INVIOLABLES:
 - No duplicar lógica de rag_enricher — solo wrappear
 - Exponer estado via funciones, no globals
 - init() es idempotente
-SSoT: rag_enricher.py es la implementación, este módulo es el wiring para server2
+SSoT: rag_enricher.py es la implementación, este módulo es el wiring para server
 """
 from __future__ import annotations
 
