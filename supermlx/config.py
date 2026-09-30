@@ -115,7 +115,6 @@ class Settings:
     force_text_mode: bool
     mlx_host: str
     mlx_port: int
-    proxy_port: int
     prompt_cache_max_entries_global: int
     prompt_cache_max_entries_per_session: int
     prompt_cache_ttl_seconds: int
@@ -129,10 +128,6 @@ class Settings:
     thinking_temperature: float
     thinking_schedule_enabled: bool
     thinking_temp_schedule: str
-    thinking_temperature_min: float
-    thinking_cooling_exponent: float
-    thinking_cooling_fraction: float
-    temp_resp_precise: float
     temp_resp_explain: float
     temp_resp_explore: float
     response_temperature: float
@@ -157,15 +152,11 @@ class Settings:
     vlm_cache_debug: bool
     normalize_write_tool_content_for_prompt: bool
     cache_canonicalize_tool_context: bool
-    cache_session_partitioning: bool
     prompt_cache_block_size: int
-    cache_use_block_index: bool
     cache_norm_safety_check: bool
     log_root: Path
-    proxy_startup_wait_seconds: float
     proxy_model_id: str
     cache_persist_path: str
-    embedded_cache_persist_path: str  # Kripper slot for EMBEDDED agents (compaction/memory)
     memory_guard_threshold_gb: float  # Metal RAM threshold (GB) for pre-prefill eviction (0=disabled)
     sidecar_port: int                 # Sidecar port for non-OpenClaw queries (0=disabled)
     sidecar_max_tokens: int           # Max tokens for sidecar responses (keep low to minimize lock time)
@@ -175,8 +166,6 @@ class Settings:
     enable_moe_cache: bool            # Enable predictive MoE expert caching (lazy load + dynamic swap)
     moe_target_capacity: int          # Target capacity after warmup (0=no expansion)
     moe_expert_profile: str           # Path to expert profile JSON for MoE pinning (""=none)
-    moe_shallow_pin_layers: int       # Pin top experts in first N MoE layers (0=disabled)
-    moe_shallow_pin_top: int          # How many experts to pin per shallow layer
     ngram_loop_detection: bool        # Enable verbatim n-gram repetition loop detector
     ngram_max_repeats: int            # Max allowed repeats before breaking generation
     ngram_size: int                   # Tokens per n-gram pattern
@@ -185,13 +174,6 @@ class Settings:
     ngram_nudge_enabled: bool         # Enable in-situ steering thought instead of abrupt break
     ngram_nudge_text: str             # In-situ thought text injected into thinking KV-cache
     ngram_grace_tokens: int           # Grace token budget after nudge before applying hard break
-    adaptive_temperature_enabled: bool # Enable prefill domain-adaptive temperature
-    adaptive_temperature_layer: int    # Layer to tap for domain classification (default: 20)
-    adaptive_temperature_prosa: float  # Response temperature for prose domain
-    adaptive_temperature_codigo_mate: float # Response temperature for code/math domain
-    adaptive_temperature_default: float # Fallback response temperature
-    adaptive_markers_prosa: str        # Comma-separated expert IDs for prose
-    adaptive_markers_codigo_mate: str  # Comma-separated expert IDs for code/math
     enable_mtp: bool                   # Multi-Token Prediction (MTP) speculative decoding
     mtp_weights_path: str              # Local directory containing MTP weights and config
     mtp_adaptive_temperature: bool     # Sync MTP speculative sampling temperature with model (DualPhase / Domain-Adaptive)
@@ -212,8 +194,6 @@ class Settings:
     housekeeping_staging_ttl_seconds: float # Staging TTL in seconds before rollback to base
     housekeeping_staging_max_entries: int  # Max concurrent sessions in housekeeping staging
     enable_ane: bool                       # Enable Apple Neural Engine (ANE) offload for prefill
-    ane_prefill_threshold: int            # Minimum prompt length in tokens to trigger ANE offload
-    ane_compiled_dir: str                  # Directory to store precompiled ANE kernels
     ane_prefill_buckets: List[int]         # Precompiled sequence length buckets for ANE
 
 
@@ -264,7 +244,6 @@ def build_settings(script_dir: Path = Path(__file__).parent) -> Settings:
         force_text_mode=_env_bool("FORCE_TEXT_MODE", False),
         mlx_host=_env_str("MLX_HOST", "0.0.0.0"),
         mlx_port=_env_int("MLX_PORT", 8080),
-        proxy_port=_env_int("PROXY_PORT", 4000),
         prompt_cache_max_entries_global=_env_int_any(
             ["PROMPT_CACHE_MAX_ENTRIES_GLOBAL", "PROMPT_CACHE_MAX_SIZE"],
             2,  # 24GB M4 Pro: modelo(5GB) + 2 MAIN entries(9GB) + 1 COMPACT(4.5GB) + scratch(5GB) = ~23.5GB
@@ -290,10 +269,6 @@ def build_settings(script_dir: Path = Path(__file__).parent) -> Settings:
         thinking_temp_schedule=_env_str(
             "THINKING_TEMP_SCHEDULE", "0:0.80,256:0.60,1024:0.35,3000:0.10"
         ),
-        thinking_temperature_min=_env_float("THINKING_TEMPERATURE_MIN", 0.10),
-        thinking_cooling_exponent=_env_float("THINKING_COOLING_EXPONENT", 3.0),
-        thinking_cooling_fraction=_env_float("THINKING_COOLING_FRACTION", 0.25),
-        temp_resp_precise=_env_float("TEMP_RESP_PRECISE", 0.10),
         temp_resp_explain=_env_float("TEMP_RESP_EXPLAIN", 0.50),
         temp_resp_explore=_env_float("TEMP_RESP_EXPLORE", 0.85),
         response_temperature=_env_float("RESPONSE_TEMPERATURE", 0.30),
@@ -325,21 +300,11 @@ def build_settings(script_dir: Path = Path(__file__).parent) -> Settings:
             ["CACHE_CANONICALIZE_TOOL_CONTEXT"],
             True,
         ),
-        cache_session_partitioning=_env_bool_any(
-            ["CACHE_SESSION_PARTITIONING"],
-            True,
-        ),
         prompt_cache_block_size=_env_int("PROMPT_CACHE_BLOCK_SIZE", 16),
-        cache_use_block_index=_env_bool_any(
-            ["CACHE_USE_BLOCK_INDEX"],
-            True,
-        ),
         cache_norm_safety_check=_env_bool("CACHE_NORM_SAFETY_CHECK", False),
         log_root=Path(_env_str("LOG_ROOT", str(script_dir / "logs"))),
-        proxy_startup_wait_seconds=_env_float("PROXY_STARTUP_WAIT_SECONDS", 2.0),
         proxy_model_id=proxy_model_id,
         cache_persist_path=_env_str("CACHE_PERSIST_PATH", ""),
-        embedded_cache_persist_path=_env_str("EMBEDDED_CACHE_PERSIST_PATH", ""),
         # Memory guard: evict cache entries if Metal RAM exceeds this threshold (GB).
         # Default: total RAM minus 8GB OS reserve (not 80% of total — the server
         # doesn't own all RAM; macOS + apps consume ~5-7GB permanently).
@@ -360,8 +325,6 @@ def build_settings(script_dir: Path = Path(__file__).parent) -> Settings:
         enable_moe_cache=_env_bool("ENABLE_MOE_CACHE", False),
         moe_target_capacity=_env_int("MOE_TARGET_CAPACITY", 0),
         moe_expert_profile=_env_str("MOE_EXPERT_PROFILE", ""),
-        moe_shallow_pin_layers=_env_int("MOE_SHALLOW_PIN_LAYERS", 5),
-        moe_shallow_pin_top=_env_int("MOE_SHALLOW_PIN_TOP", 6),
         ngram_loop_detection=_env_bool("NGRAM_LOOP_DETECTION", False),
         ngram_max_repeats=_env_int("NGRAM_MAX_REPEATS", 12),
         ngram_size=_env_int("NGRAM_SIZE", 35),
@@ -373,13 +336,6 @@ def build_settings(script_dir: Path = Path(__file__).parent) -> Settings:
             "[ATENCIÓN: ¡ESTOY EN LOOP! Debo salir ya. Hago Grounding: audito mis premisas comprobadas, descarto hipótesis circulares y cambio la dirección de mi razonamiento hacia la conclusión final.]",
         ),
         ngram_grace_tokens=_env_int("NGRAM_GRACE_TOKENS", 256),
-        adaptive_temperature_enabled=_env_bool("FEATURE_ADAPTIVE_TEMPERATURE", False),
-        adaptive_temperature_layer=_env_int("ADAPTIVE_TEMP_LAYER", 20),
-        adaptive_temperature_prosa=_env_float("ADAPTIVE_TEMP_PROSA", 0.85),
-        adaptive_temperature_codigo_mate=_env_float("ADAPTIVE_TEMP_CODIGO_MATE", 0.10),
-        adaptive_temperature_default=_env_float("ADAPTIVE_TEMP_DEFAULT", 0.40),
-        adaptive_markers_prosa=_env_str("ADAPTIVE_MARKERS_PROSA", "19"),
-        adaptive_markers_codigo_mate=_env_str("ADAPTIVE_MARKERS_CODIGO_MATE", "72,133,23,148,42,130,161,198,226"),
         enable_mtp=_env_bool("ENABLE_MTP", False),
         mtp_weights_path=_env_str("MTP_WEIGHTS_PATH", "models/Qwen3.6-35B-A3B-MTP-MLX"),
         mtp_adaptive_temperature=_env_bool("MTP_ADAPTIVE_TEMPERATURE", True),
@@ -403,8 +359,6 @@ def build_settings(script_dir: Path = Path(__file__).parent) -> Settings:
         housekeeping_staging_ttl_seconds=_env_float("HOUSEKEEPING_STAGING_TTL_SECONDS", 300.0),
         housekeeping_staging_max_entries=_env_int("HOUSEKEEPING_STAGING_MAX_ENTRIES", 2),
         enable_ane=_env_bool("ENABLE_ANE", False),
-        ane_prefill_threshold=_env_int("ANE_PREFILL_THRESHOLD", 64),
-        ane_compiled_dir=_env_str("ANE_COMPILED_DIR", "models/ane_cache"),
         ane_prefill_buckets=[
             int(x.strip()) for x in _env_str("ANE_PREFILL_BUCKETS", "64,128,256").split(",") if x.strip()
         ],
