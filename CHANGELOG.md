@@ -22,7 +22,7 @@ First release of the rewritten server. Versions 1.5 – 2.x were internal checkp
 - **Anthropic API** (`/v1/messages`, `count_tokens`), **ephemeral endpoints** that bypass the
   session cache, and the **sidecar** port.
 - Optional **MoE expert cache** with frequency-profile pinning.
-- `.env.example` documenting every setting, verified against `config.py` by a test.
+- `.env.example` documenting every setting with its purpose, units and default.
 
 ### Changed
 - Single server module `supermlx/server.py`; helpers live in `supermlx/components/`.

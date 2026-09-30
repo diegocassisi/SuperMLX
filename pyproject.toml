@@ -33,7 +33,6 @@ dependencies = [
 [project.optional-dependencies]
 rag = ["lancedb>=0.26.1", "sentence-transformers>=5.2.0", "llmlingua>=0.2.2", "torch>=2.11.0"]
 titles = ["pyobjc-framework-NaturalLanguage>=12.2; sys_platform == 'darwin'"]
-dev = ["pytest>=8.0"]
 
 [project.scripts]
 supermlx = "supermlx.server:run"

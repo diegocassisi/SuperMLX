@@ -134,7 +134,7 @@ pip install -e '.[titles]'    # Apple NaturalLanguage session titles (macOS)
 
 Everything is configured through environment variables, normally in a `.env` file. Only `MODEL_PATH` is required.
 
-[`.env.example`](.env.example) documents **every** variable — purpose, units and default — grouped by section (model, network, sampling, thinking, cache, memory, MTP, loop protection, RAG, diagnostics). The defaults in that file are checked against `supermlx/config.py` by a test, so it cannot drift.
+[`.env.example`](.env.example) documents **every** variable — purpose, units and default — grouped by section (model, network, sampling, thinking, cache, memory, MTP, loop protection, RAG, diagnostics). It mirrors `supermlx/config.py`, the single source of truth for types and defaults.
 
 A few variables you will probably touch first:
 
@@ -169,20 +169,10 @@ supermlx/
   mtp/                 MTP speculative decoding (engine + model shim)
   sampling.py          dual-phase sampler, thinking schedule, task detector
   cache_engine.py, tool_prefix_cache.py, expert_cache.py, metal_memory_guard.py ...
-tests/                 pytest suites (most run without a GPU)
 benchmarks/            benchmark and stress scripts
 profiles/              MoE expert-frequency profiles
 docs/                  design notes
 ```
-
-## Tests
-
-```bash
-pip install -e '.[dev]'
-pytest tests/test_radix_cache.py tests/test_env_example.py     # fast, no model needed
-```
-
-Some suites (`*_real_model*`, `scale_radix_17k.py`) need a model and a running server; they are meant for manual validation.
 
 ## Design notes
 
