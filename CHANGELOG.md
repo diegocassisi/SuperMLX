@@ -6,9 +6,40 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
-## [1.4.2] — 2026-05-08
+## [3.0.0] — 2026-09-30
 
-_In progress._
+First release of the rewritten server. Versions 1.5 – 2.x were internal checkpoints
+(see the git tags); this entry summarizes everything since 1.4.x.
+
+### Added
+- **Radix prompt cache** (prefix tree of KV states) with eviction against a Metal memory
+  budget, and a **4-phase request pipeline** (preprocess → cache lookup → generate → postprocess).
+- **MTP speculative decoding** for models with a Multi-Token-Prediction head.
+- **Thinking control:** token budget enforced by logits forcing (KV-consistent), optional
+  temperature schedule, thermal sparks and epistemic/closure nudges.
+- **Task-aware temperature** via `[TASK: CODE|TECH|PROSE|CREATIVE]` tags.
+- **Metal memory guard** and adaptive prefill sized from the device.
+- **Anthropic API** (`/v1/messages`, `count_tokens`), **ephemeral endpoints** that bypass the
+  session cache, and the **sidecar** port.
+- Optional **MoE expert cache** with frequency-profile pinning.
+- `.env.example` documenting every setting, verified against `config.py` by a test.
+
+### Changed
+- Single server module `supermlx/server.py`; helpers live in `supermlx/components/`.
+- All configuration is read in `supermlx/config.py`; no module reads the environment directly
+  (except the Hugging Face `HF_*` variables).
+- Compaction requests share the global `DEFAULT_MIN_P`, `DEFAULT_TOP_P` and
+  `COMPACTION_TEMPERATURE` instead of keeping their own defaults.
+- Dependencies trimmed to what the code imports; `torch` and `pyobjc` moved to extras.
+
+### Removed
+- LiteLLM proxy (the server is reached directly on `MLX_PORT`), cascade routing,
+  the embedded-agent / COMPACT cache slot, the pipeline monitor dashboard.
+- Domain-adaptive temperature and the PRECISE/EXPLAIN/EXPLORE profiles (kept as archived ideas).
+
+### Known limitations
+- Vision-language models are not operational yet.
+- One request at a time (no continuous batching).
 
 ---
 

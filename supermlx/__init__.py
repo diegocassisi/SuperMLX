@@ -1,9 +1,9 @@
 """
 SuperMLX — Agentic-optimized MLX inference server for Apple Silicon.
 
-Maximizes small model performance on limited hardware for agentic workloads
-with large prompts. Features cache canonicalization, Kripper dual-slot KV cache,
-tool-call loop breaking and RAG enrichment.
+Keeps the KV cache alive across agent turns (radix prompt cache, tool-prefix cache,
+cache canonicalization), with MTP speculative decoding, thinking control,
+loop protection and Metal memory management.
 """
 
-__version__ = "1.4.2"
+__version__ = "3.0.0"

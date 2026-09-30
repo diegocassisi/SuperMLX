@@ -248,7 +248,7 @@ DOTENV_PATH = SCRIPT_DIR / ".env"
 if DOTENV_PATH.exists():
     load_dotenv(dotenv_path=DOTENV_PATH, override=True)
 
-__version__ = "2.1.0-dev"
+from . import __version__
 
 
 # ── Configuration (extracted to config.py) ────────────────────────────────────

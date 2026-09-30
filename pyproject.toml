@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "supermlx"
-version = "1.4.2"
+version = "3.0.0"
 description = "Agentic-optimized MLX inference server for Apple Silicon"
 readme = "README.md"
 license = {text = "MIT"}
