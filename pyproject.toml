@@ -26,19 +26,15 @@ dependencies = [
     "mlx==0.31.1",
     "mlx-lm==0.31.2",
     "python-dotenv>=1.0.1",
-    "safetensors>=0.7.0",
-    "torch>=2.11.0",
-    "transformers>=5.5.0",
-    "tokenizers>=0.22.2",
     "numpy>=2.2.6",
     "huggingface-hub>=1.9.0",
-    "litellm>=1.83.2",
 ]
 
 [project.optional-dependencies]
 vlm = ["mlx-vlm>=0.3.11"]
-monitor = ["streamlit>=1.45.0", "plotly>=6.1.0", "psutil>=7.0.0"]
-rag = ["lancedb>=0.26.1", "sentence-transformers>=5.2.0", "llmlingua>=0.2.2"]
+rag = ["lancedb>=0.26.1", "sentence-transformers>=5.2.0", "llmlingua>=0.2.2", "torch>=2.11.0"]
+titles = ["pyobjc-framework-NaturalLanguage>=12.2; sys_platform == 'darwin'"]
+dev = ["pytest>=8.0"]
 
 [project.scripts]
 supermlx = "supermlx.server:run"
