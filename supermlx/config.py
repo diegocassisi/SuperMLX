@@ -95,6 +95,16 @@ def _env_bool_any(names: List[str], default: bool) -> bool:
     return default
 
 
+def _env_opt_float(name: str) -> Optional[float]:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
 def _env_kv_bits(name: str, default: Optional[int]) -> Optional[int]:
     raw = os.getenv(name)
     if raw is None or raw.strip() == "":
@@ -193,6 +203,46 @@ class Settings:
     housekeeping_staging_max_entries: int  # Max concurrent sessions in housekeeping staging
     enable_ane: bool                       # Enable Apple Neural Engine (ANE) offload for prefill
     ane_prefill_buckets: List[int]         # Precompiled sequence length buckets for ANE
+    # ── Prefill / memory (server.py) ──
+    max_safe_prefill_tokens: int           # Hard prefill ceiling before OOM-protection kicks in
+    prefill_step_size: int                 # Prefill chunk size (tokens)
+    breathe_down_rest_threshold: int       # Tokens of idle prefill before the expert cache breathes down
+    gpu_yield_ms: float                    # Sleep between prefill chunks to yield the GPU (0=off)
+    radix_scratch_reserve_gb: float        # Scratch memory reserved when sizing the radix KV budget
+    memory_compact_threshold_gb: float     # Metal RAM (GB) above which compaction requests free memory
+    # ── Metal memory guard (metal_memory_guard.py) ──
+    metal_budget_gb: Optional[float]       # Override of the detected Metal working-set budget (None=auto)
+    metal_wired_reserve_fraction: float    # Fraction of working set reserved for KV growth + scratch
+    metal_cache_limit_fraction: float      # Max buffer cache as fraction of device total
+    metal_prefill_relief_threshold: float  # Trigger relief when projected usage > this fraction of budget
+    metal_cleanup_cache_threshold: float   # Only clear_cache if cache_memory > this fraction of device total
+    metal_prefill_relief_min_tokens: int   # Skip relief for prefills smaller than this
+    prefill_kv_bytes_per_token_fp16: int   # KV bytes/token estimate at fp16
+    metal_scratch_estimate_gb: float       # Estimated scratch memory during prefill
+    feature_memory_profiler: bool          # Periodic memory profiler (memory_profiler.py)
+    # ── Feature flags (server.py) ──
+    hermes_compact_swap: bool              # Swap Hermes compaction prompt for the structured COMPACT_PROMPT
+    log_prompts: bool                      # Dump prompts/messages to logs/requests/
+    log_tools: bool                        # Log tool schemas and tool results
+    feature_cache_diag: bool               # Cache diagnostic headers/logging
+    tool_audit_log: bool                   # Tool-call audit log
+    expert_routing_log: bool               # MoE expert routing log
+    tool_loop_breaker: bool                # Break repeated identical tool-call loops
+    tool_loop_max_retries: int             # Retries before the loop breaker acts
+    healing: bool                          # Tool-call healing (repair malformed calls)
+    preserve_thinking: bool                # Keep <think> blocks in the conversation history
+    housekeeping_cache_borrow: bool        # Housekeeping requests borrow the main KV cache
+    # ── RAG / compressor (rag_facade.py, rag_enricher.py) ──
+    feature_rag_enrichment: bool           # RAG enrichment (LanceDB + embeddings)
+    rag_workspace_root: str                # Workspace directory indexed by RAG
+    rag_force_reindex: bool                # Force a RAG reindex at startup
+    feature_compressor: bool               # Prompt compressor (LLMLingua-2)
+    compression_threshold: int             # Tokens above which compression applies
+    compression_guard: int                 # Recent messages never compressed
+    # ── Compaction flow (server_compact.py) ──
+    max_safe_compact_tokens: int           # Max tokens for the compact call itself
+    compact_preserve_tail: int             # Recent messages preserved verbatim
+    max_frozen_summary_chars: int          # Frozen-summary size before forcing consolidation
 
 
 def _normalize_model_family(value: Optional[str]) -> str:
@@ -358,6 +408,41 @@ def build_settings(script_dir: Path = Path(__file__).parent) -> Settings:
         ane_prefill_buckets=[
             int(x.strip()) for x in _env_str("ANE_PREFILL_BUCKETS", "64,128,256").split(",") if x.strip()
         ],
+        max_safe_prefill_tokens=_env_int("MAX_SAFE_PREFILL_TOKENS", 82192),
+        prefill_step_size=_env_int("PREFILL_STEP_SIZE", 256),
+        breathe_down_rest_threshold=_env_int("BREATHE_DOWN_REST_THRESHOLD", 15000),
+        gpu_yield_ms=_env_float("GPU_YIELD_MS", 0.0),
+        radix_scratch_reserve_gb=_env_float("RADIX_SCRATCH_RESERVE_GB", 1.5),
+        memory_compact_threshold_gb=_env_float("MEMORY_COMPACT_THRESHOLD_GB", 21.0),
+        metal_budget_gb=_env_opt_float("METAL_BUDGET_GB"),
+        metal_wired_reserve_fraction=_env_float("METAL_WIRED_RESERVE_FRACTION", 0.15),
+        metal_cache_limit_fraction=_env_float("METAL_CACHE_LIMIT_FRACTION", 0.25),
+        metal_prefill_relief_threshold=_env_float("METAL_PREFILL_RELIEF_THRESHOLD", 0.90),
+        metal_cleanup_cache_threshold=_env_float("METAL_CLEANUP_CACHE_THRESHOLD", 0.10),
+        metal_prefill_relief_min_tokens=_env_int("METAL_PREFILL_RELIEF_MIN_TOKENS", 1000),
+        prefill_kv_bytes_per_token_fp16=_env_int("PREFILL_KV_BYTES_PER_TOKEN_FP16", 65536),
+        metal_scratch_estimate_gb=_env_float("METAL_SCRATCH_ESTIMATE_GB", 1.5),
+        feature_memory_profiler=_env_bool("FEATURE_MEMORY_PROFILER", False),
+        hermes_compact_swap=_env_bool("HERMES_COMPACT_SWAP", False),
+        log_prompts=_env_bool("LOG_PROMPTS", True),
+        log_tools=_env_bool("LOG_TOOLS", True),
+        feature_cache_diag=_env_bool("FEATURE_CACHE_DIAG", True),
+        tool_audit_log=_env_bool("TOOL_AUDIT_LOG", False),
+        expert_routing_log=_env_bool("EXPERT_ROUTING_LOG", False),
+        tool_loop_breaker=_env_bool("TOOL_LOOP_BREAKER", True),
+        tool_loop_max_retries=_env_int("TOOL_LOOP_MAX_RETRIES", 3),
+        healing=_env_bool("HEALING", True),
+        preserve_thinking=_env_bool("PRESERVE_THINKING", True),
+        housekeeping_cache_borrow=_env_bool("HOUSEKEEPING_CACHE_BORROW", True),
+        feature_rag_enrichment=_env_bool("FEATURE_RAG_ENRICHMENT", False),
+        rag_workspace_root=_env_str("RAG_WORKSPACE_ROOT", ""),
+        rag_force_reindex=_env_bool("RAG_FORCE_REINDEX", False),
+        feature_compressor=_env_bool("FEATURE_COMPRESSOR", False),
+        compression_threshold=_env_int("COMPRESSION_THRESHOLD", 6000),
+        compression_guard=_env_int("COMPRESSION_GUARD", 6),
+        max_safe_compact_tokens=_env_int("MAX_SAFE_COMPACT_TOKENS", 35000),
+        compact_preserve_tail=_env_int("COMPACT_PRESERVE_TAIL", 4),
+        max_frozen_summary_chars=_env_int("MAX_FROZEN_SUMMARY_CHARS", 16000),
     )
 
 

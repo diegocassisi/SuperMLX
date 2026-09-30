@@ -16,55 +16,40 @@ import logging
 import re
 import time
 import json
-import os
 from typing import Any, Callable, Dict, List, Optional, Tuple
+
+from .config import SETTINGS
 
 logger = logging.getLogger(__name__)
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-def _env_int(key: str, default: int) -> int:
-    v = os.environ.get(key, "")
-    try:
-        return int(v)
-    except (ValueError, TypeError):
-        return default
-
-
-def _env_float(key: str, default: float) -> float:
-    v = os.environ.get(key, "")
-    try:
-        return float(v)
-    except (ValueError, TypeError):
-        return default
-
-
 def _compact_temperature() -> float:
-    return _env_float("COMPACTION_TEMPERATURE", 0.20)
+    return SETTINGS.compaction_temperature
 
 
 def _compact_min_p() -> float:
-    return _env_float("DEFAULT_MIN_P", 0.04)
+    return SETTINGS.default_min_p
 
 
 def _compact_top_p() -> float:
-    return _env_float("DEFAULT_TOP_P", 1.0)
+    return SETTINGS.default_top_p
 
 
 # Max tokens for the compact call itself (conversation + prompt).
 # Must be below OOM threshold. Default 35K leaves room for the ~2K prompt.
 def _max_safe_compact_tokens() -> int:
-    return _env_int("MAX_SAFE_COMPACT_TOKENS", 35000)
+    return SETTINGS.max_safe_compact_tokens
 
 
 # How many recent messages to preserve verbatim (not summarized).
 def _compact_tail_count() -> int:
-    return _env_int("COMPACT_PRESERVE_TAIL", 4)
+    return SETTINGS.compact_preserve_tail
 
 
 # Maximum characters for accumulated frozen summary before forcing consolidation (~4K tokens)
 def _max_frozen_summary_chars() -> int:
-    return _env_int("MAX_FROZEN_SUMMARY_CHARS", 16000)
+    return SETTINGS.max_frozen_summary_chars
 
 
 # Max output tokens for the summary generation.

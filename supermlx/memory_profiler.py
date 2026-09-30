@@ -20,12 +20,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from .config import SETTINGS
+
 logger = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
 _LOG_DIR: Optional[Path] = None
-_ENABLED: bool = os.environ.get("FEATURE_MEMORY_PROFILER", "false").lower() in ("true", "1", "yes")
+_ENABLED: bool = SETTINGS.feature_memory_profiler
 
 
 def init(log_root: Path) -> None:

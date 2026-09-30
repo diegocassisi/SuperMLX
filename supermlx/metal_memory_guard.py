@@ -20,9 +20,10 @@ SSoT: Este módulo es la única fuente de protección de memoria Metal.
 import ctypes
 import gc
 import logging
-import os
 import time
 from typing import Any, Dict, Optional
+
+from .config import SETTINGS
 
 logger = logging.getLogger(__name__)
 
@@ -52,33 +53,13 @@ _shader_warmup_done: bool = False
 
 # Fractions — derived from device characteristics, not hardcoded.
 # These are defaults that can be overridden via env vars.
-_WIRED_RESERVE_FRACTION = float(os.environ.get(
-    "METAL_WIRED_RESERVE_FRACTION", "0.15"
-))  # Reserve this fraction of max_working_set for KV growth + scratch (NOT wired)
-
-_CACHE_LIMIT_FRACTION = float(os.environ.get(
-    "METAL_CACHE_LIMIT_FRACTION", "0.25"
-))  # Max buffer cache as fraction of device_total
-
-_PREFILL_RELIEF_THRESHOLD = float(os.environ.get(
-    "METAL_PREFILL_RELIEF_THRESHOLD", "0.90"
-))  # Trigger relief when projected usage > this fraction of budget
-
-_CLEANUP_CACHE_THRESHOLD_FRACTION = float(os.environ.get(
-    "METAL_CLEANUP_CACHE_THRESHOLD", "0.10"
-))  # Only clear_cache if cache_memory > this fraction of device_total
-
-_PREFILL_RELIEF_MIN_TOKENS = int(os.environ.get(
-    "METAL_PREFILL_RELIEF_MIN_TOKENS", "1000"
-))  # Skip relief for prefills smaller than this
-
-_KV_BYTES_PER_TOKEN_FP16 = int(os.environ.get(
-    "PREFILL_KV_BYTES_PER_TOKEN_FP16", "65536"
-))  # ~64 KB/tok for Qwen3.6 class models at fp16
-
-_SCRATCH_ESTIMATE_GB = float(os.environ.get(
-    "METAL_SCRATCH_ESTIMATE_GB", "1.5"
-))  # Estimated scratch memory during prefill
+_WIRED_RESERVE_FRACTION = SETTINGS.metal_wired_reserve_fraction  # Reserve this fraction of max_working_set for KV growth + scratch (NOT wired)
+_CACHE_LIMIT_FRACTION = SETTINGS.metal_cache_limit_fraction  # Max buffer cache as fraction of device_total
+_PREFILL_RELIEF_THRESHOLD = SETTINGS.metal_prefill_relief_threshold  # Trigger relief when projected usage > this fraction of budget
+_CLEANUP_CACHE_THRESHOLD_FRACTION = SETTINGS.metal_cleanup_cache_threshold  # Only clear_cache if cache_memory > this fraction of device_total
+_PREFILL_RELIEF_MIN_TOKENS = SETTINGS.metal_prefill_relief_min_tokens  # Skip relief for prefills smaller than this
+_KV_BYTES_PER_TOKEN_FP16 = SETTINGS.prefill_kv_bytes_per_token_fp16  # ~64 KB/tok for Qwen3.6 class models at fp16
+_SCRATCH_ESTIMATE_GB = SETTINGS.metal_scratch_estimate_gb  # Estimated scratch memory during prefill
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -388,9 +369,8 @@ def get_metal_budget_gb() -> float:
     Budget = max_recommended_working_set (or device_total - OS_overhead).
     Can be overridden with METAL_BUDGET_GB env var.
     """
-    env_val = os.environ.get("METAL_BUDGET_GB")
-    if env_val:
-        return float(env_val)
+    if SETTINGS.metal_budget_gb:
+        return SETTINGS.metal_budget_gb
     return _max_working_set_bytes / 1e9 if _max_working_set_bytes > 0 else 20.0
 
 
@@ -446,9 +426,8 @@ def _apply_cache_limit(limit_bytes: int) -> None:
 
 def _get_budget_bytes() -> float:
     """Return effective budget in bytes for internal calculations."""
-    env_val = os.environ.get("METAL_BUDGET_GB")
-    if env_val:
-        return float(env_val) * 1e9
+    if SETTINGS.metal_budget_gb:
+        return SETTINGS.metal_budget_gb * 1e9
     return float(_max_working_set_bytes) if _max_working_set_bytes > 0 else 20e9
 
 

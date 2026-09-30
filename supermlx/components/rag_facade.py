@@ -14,8 +14,9 @@ SSoT: rag_enricher.py es la implementación, este módulo es el wiring para serv
 from __future__ import annotations
 
 import logging
-import os
 from typing import Any, Callable, Dict, List, Optional
+
+from ..config import SETTINGS
 
 logger = logging.getLogger(__name__)
 
@@ -26,23 +27,14 @@ _compressor_module: Any = None
 _compressor_available: bool = False
 _terminal_status_fn: Optional[Callable] = None
 
-# ── Config (read from env at import time) ────────────────────────────────────
-def _env_str(key: str, default: str) -> str:
-    return os.environ.get(key, default)
-
-def _env_int(key: str, default: int) -> int:
-    try:
-        return int(os.environ.get(key, str(default)))
-    except (ValueError, TypeError):
-        return default
-
-FEATURE_RAG_ENRICHMENT = _env_str("FEATURE_RAG_ENRICHMENT", "false").lower() in ("1", "true", "yes")
-FEATURE_RAG_WORKSPACE_ROOT = _env_str("RAG_WORKSPACE_ROOT", "")
+# ── Config (from SETTINGS) ───────────────────────────────────────────────────
+FEATURE_RAG_ENRICHMENT = SETTINGS.feature_rag_enrichment
+FEATURE_RAG_WORKSPACE_ROOT = SETTINGS.rag_workspace_root
 FEATURE_RAG_RELEVANCE_THRESHOLD = 1.6  # Qwen3-Embed asymmetric
 
-FEATURE_COMPRESSOR = _env_str("FEATURE_COMPRESSOR", "false").lower() in ("1", "true", "yes")
-FEATURE_COMPRESSION_THRESHOLD = _env_int("COMPRESSION_THRESHOLD", 6000)
-FEATURE_COMPRESSION_GUARD = _env_int("COMPRESSION_GUARD", 6)
+FEATURE_COMPRESSOR = SETTINGS.feature_compressor
+FEATURE_COMPRESSION_THRESHOLD = SETTINGS.compression_threshold
+FEATURE_COMPRESSION_GUARD = SETTINGS.compression_guard
 
 
 def init(*, terminal_status_fn: Optional[Callable] = None) -> Dict[str, Any]:

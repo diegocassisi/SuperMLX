@@ -140,7 +140,7 @@ import traceback
 logger = logging.getLogger("supermlx.server")
 from datetime import datetime
 # Overflow guard: reject requests that would exceed safe prefill limits (used by Compact Guard)
-_max_safe_prefill_tokens = int(os.environ.get("MAX_SAFE_PREFILL_TOKENS", "82192"))
+_max_safe_prefill_tokens = 0  # set from SETTINGS right after SETTINGS is built
 def _should_signal_overflow(rest_count: int) -> bool:
     return rest_count > _max_safe_prefill_tokens
 from collections import OrderedDict, deque
@@ -252,12 +252,10 @@ __version__ = "2.1.0-dev"
 
 
 # ── Configuration (extracted to config.py) ────────────────────────────────────
-from .config import (
-    build_settings,
-    _env_str, _env_int, _env_float, _env_bool,
-)
+from .config import build_settings
 
 SETTINGS = build_settings(script_dir=SCRIPT_DIR)
+_max_safe_prefill_tokens = SETTINGS.max_safe_prefill_tokens
 
 # ══════════════════════════════════════════════════════════════════════════════
 # FEATURE FLAGS — Hardcoded toggles para activar/desactivar componentes.
@@ -273,7 +271,7 @@ SETTINGS = build_settings(script_dir=SCRIPT_DIR)
 # Hermes compact prompt swap: when Hermes sends a compaction request,
 # replace its generic summarization prompt with Claude Code's structured
 # COMPACT_PROMPT (9 sections, analysis+summary tags). Default off.
-FEATURE_HERMES_COMPACT_SWAP   = _env_str("HERMES_COMPACT_SWAP", "false").lower() in ("1", "true", "yes")
+FEATURE_HERMES_COMPACT_SWAP   = SETTINGS.hermes_compact_swap
 
 # Last-seen Hermes system prompt + tools — injected into compact requests
 # so TPC prefix matches and the pre-computed KV cache is reused.
@@ -285,7 +283,7 @@ def _save_hermes_context() -> None:
     """Persist _last_hermes_context to disk alongside TPC files."""
     try:
         from pathlib import Path
-        _dir = Path(os.environ.get("CACHE_PERSIST_PATH", "logs")).parent if "CACHE_PERSIST_PATH" in os.environ else Path("logs")
+        _dir = Path(SETTINGS.cache_persist_path).parent if SETTINGS.cache_persist_path else Path("logs")
         # Use TPC's cache dir if available
         import supermlx.tool_prefix_cache as _tpc_mod
         if _tpc_mod._cache_dir:
@@ -314,7 +312,7 @@ def _load_hermes_context() -> None:
 #   chunk=512 → 0.66GB scratch, 516 tok/s
 #   chunk=256 → 0.32GB scratch, 520 tok/s  ← same speed, half scratch
 #   chunk=128 → 0.16GB scratch, 429 tok/s  ← 17% slower
-PREFILL_STEP_SIZE             = int(_env_str("PREFILL_STEP_SIZE", "256"))
+PREFILL_STEP_SIZE             = SETTINGS.prefill_step_size
 
 # RAG codebase enrichment: inyecta chunks relevantes del codebase en el context.
 # Requiere rag_enricher.py + lancedb + sentence-transformers.
@@ -330,8 +328,8 @@ FEATURE_DIAGNOSTIC_HEADERS = True
 FEATURE_FULL_LOGGING       = True
 
 # Sub-flags for logging (only active when FEATURE_FULL_LOGGING = True)
-FEATURE_LOG_PROMPTS        = _env_bool("LOG_PROMPTS", True)    # Dump de prompts/messages a disco (logs/requests/)
-FEATURE_LOG_TOOLS          = _env_bool("LOG_TOOLS", True)      # Detalle de tool schemas + tool_results en historial
+FEATURE_LOG_PROMPTS        = SETTINGS.log_prompts    # Dump de prompts/messages a disco (logs/requests/)
+FEATURE_LOG_TOOLS          = SETTINGS.log_tools      # Detalle de tool schemas + tool_results en historial
 FEATURE_LOG_COMPRESSION    = True   # Before/after compression + chunks + timing
 FEATURE_LOG_RAG            = True   # Chunks RAG inyectados, scores de relevancia
 FEATURE_LOG_CACHE          = True   # Hit/miss/shorter, stable prefix, evictions
@@ -342,18 +340,18 @@ FEATURE_LOG_RESP           = True   # Response normalization, tool extraction, t
 # FIX-31 Cache Diagnostics: opt-in before/after snapshots on every cache mutation.
 # Captures KV offset, key-tail hash, recurrent state fingerprint, and divergence detection.
 # Overhead: ~1ms per cache operation. Set FEATURE_CACHE_DIAG=false to disable.
-FEATURE_CACHE_DIAG         = _env_bool("FEATURE_CACHE_DIAG", True)
+FEATURE_CACHE_DIAG         = SETTINGS.feature_cache_diag
 
 # Tool call audit log: raw model XML → extracted args → delivered JSON.
 # Writes logs/requests/<req_id>/tool_audit.jsonl for debugging pipeline transforms.
 # Off by default — enable only when investigating tool call corruption.
-FEATURE_TOOL_AUDIT_LOG     = _env_bool("TOOL_AUDIT_LOG", False)
+FEATURE_TOOL_AUDIT_LOG     = SETTINGS.tool_audit_log
 
 # Expert Routing Logger: standalone diagnostic that records which experts are activated
 # per layer, per request. Purely observational — zero impact on model output or cache.
 # When disabled, the class is defined but attach() is never called: zero runtime overhead.
 # Output: logs/expert_routing.json. Env: EXPERT_ROUTING_LOG=true
-FEATURE_EXPERT_ROUTING_LOG = _env_bool("EXPERT_ROUTING_LOG", False)
+FEATURE_EXPERT_ROUTING_LOG = SETTINGS.expert_routing_log
 
 
 def _tool_audit_write(request_id: str, stage: str, data: dict) -> None:
@@ -394,26 +392,26 @@ _compress_with_cache = _cc.compress_with_cache
 # When the model retries the same failed tool N consecutive times, inject a
 # stop instruction into the last tool_result so the model gives up and responds
 # with text instead.  Env: TOOL_LOOP_BREAKER=true (default), TOOL_LOOP_MAX_RETRIES=3.
-FEATURE_TOOL_LOOP_BREAKER     = _env_bool("TOOL_LOOP_BREAKER", True)
-TOOL_LOOP_MAX_RETRIES         = _env_int("TOOL_LOOP_MAX_RETRIES", 3)
+FEATURE_TOOL_LOOP_BREAKER     = SETTINGS.tool_loop_breaker
+TOOL_LOOP_MAX_RETRIES         = SETTINGS.tool_loop_max_retries
 
 # Healing Store: restore <think> blocks stripped by clients back into assistant
 # messages so the KV cache matches the original generation.
 # With PRESERVE_THINKING=true, healing becomes essential: it restores thinking
 # that clients strip, and the template preserves it for the model to see.
-FEATURE_HEALING               = _env_bool("HEALING", True)
+FEATURE_HEALING               = SETTINGS.healing
 
 # Preserve Thinking: pass preserve_thinking=True to apply_chat_template so
 # the Qwen3.6 template keeps <think> blocks from previous assistant turns.
 # Qwen3.6 was designed to see its own reasoning chain (preserve_thinking);
 # without it, the template strips thinking and the model loses coherence.
-FEATURE_PRESERVE_THINKING     = _env_bool("PRESERVE_THINKING", True)
+FEATURE_PRESERVE_THINKING     = SETTINGS.preserve_thinking
 
 # Housekeeping Cache Borrow: when True, housekeeping requests USE the
 # conversation cache (good model quality) but RESTORE it afterwards
 # so the next normal request still gets a cache hit.
 # When False, housekeeping skips cache lookup entirely (TPC cold start).
-FEATURE_HOUSEKEEPING_CACHE_BORROW = _env_bool("HOUSEKEEPING_CACHE_BORROW", True)
+FEATURE_HOUSEKEEPING_CACHE_BORROW = SETTINGS.housekeeping_cache_borrow
 
 # warmup_manager: disk I/O primitives for KV cache persistence (used by TPC + FIX-31 recovery).
 # TPC (tool_prefix_cache.py) is the SSoT for prefix caching.
@@ -933,12 +931,12 @@ def _get_metal_budget_gb() -> float:
     return _guard.get_metal_budget_gb()
 
 # Threshold for Expert Breathing: rest tokens above this trigger breathe_down
-_BREATHE_DOWN_REST_THRESHOLD = int(os.environ.get("BREATHE_DOWN_REST_THRESHOLD", "15000"))
+_BREATHE_DOWN_REST_THRESHOLD = SETTINGS.breathe_down_rest_threshold
 
 # GPU yield: insert a tiny sleep between generated tokens so other Metal clients
 # (Chrome/Safari VideoToolbox) can squeeze command buffers into the GPU queue.
 # 0 = disabled (default), 1-2 ms is enough for smooth video playback alongside inference.
-_GPU_YIELD_SECONDS = float(os.environ.get("GPU_YIELD_MS", "0")) / 1000.0
+_GPU_YIELD_SECONDS = SETTINGS.gpu_yield_ms / 1000.0
 
 
 
@@ -1445,7 +1443,7 @@ else:
             _terminal_status("⚠️", f"MTP config not found at {_mtp_cfg_path} — running standard autoregressive")
 
     # ── Apple Neural Engine (ANE) Prefill Injection ────────────────────────
-    if getattr(SETTINGS, "enable_ane", False) or os.environ.get("ENABLE_ANE", "").strip().lower() in {"1", "true", "yes"}:
+    if SETTINGS.enable_ane:
         try:
             from lab.ane_code.ane_shim import inject_ane_support, validate_ane_support
             _ane_buckets = getattr(SETTINGS, "ane_prefill_buckets", [64, 128, 256])
@@ -1555,7 +1553,7 @@ try:
     from mlx.utils import tree_flatten as _tree_flatten
     _radix_weights_bytes = sum(v.nbytes for _, v in _tree_flatten(model.parameters()))
     _radix_metal_budget_bytes = int(_guard.get_metal_budget_gb() * 1e9)
-    _radix_scratch_bytes = int(float(os.environ.get("RADIX_SCRATCH_RESERVE_GB", "1.5")) * 1e9)
+    _radix_scratch_bytes = int(SETTINGS.radix_scratch_reserve_gb * 1e9)
     RADIX_PROMPT_CACHE.configure_memory_budget(
         metal_budget_bytes=_radix_metal_budget_bytes,
         weights_bytes=_radix_weights_bytes,
@@ -2509,7 +2507,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     _get_mem = getattr(mx, 'get_active_memory', None) or getattr(mx.metal, 'get_active_memory', None)
                     if _get_mem:
                         _active_gb = _get_mem() / 1e9
-                        _threshold_gb = float(os.environ.get("MEMORY_COMPACT_THRESHOLD_GB", "21.0"))
+                        _threshold_gb = SETTINGS.memory_compact_threshold_gb
                         # Use model_tokens (actual token count) not prompt_tokens
                         # (canonical cache key, can be inflated by scrub masking).
                         _real_token_count = len(model_tokens) if model_tokens else len(prompt_tokens)

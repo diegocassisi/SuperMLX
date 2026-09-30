@@ -23,6 +23,8 @@ import logging
 import pathlib
 from typing import List, Dict, Optional, Tuple
 
+from .config import SETTINGS
+
 logger = logging.getLogger("rag_enricher")
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -79,7 +81,7 @@ CODE_EXTENSIONS = {
 }
 
 # Re-index on every startup (drops and recreates the index). Env: RAG_FORCE_REINDEX=true
-FORCE_REINDEX = os.environ.get("RAG_FORCE_REINDEX", "false").lower() in ("1", "true", "yes")
+FORCE_REINDEX = SETTINGS.rag_force_reindex
 
 # Archivos/dirs a excluir del index
 EXCLUDE_PATTERNS = {
