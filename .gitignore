@@ -38,8 +38,16 @@ lab/
 
 # === PRIVADO (no publicar) ===
 abliterated/
-lastlog.md
 envs/
 venv/
 .venv-vllm-metal/
 requirements_full_backup.txt
+sidecar_stream_test.txt
+
+# === LOCAL-ONLY (logs, resultados, trazas, estado de corridas) ===
+_local/
+lastlog*.md
+L[0-9]-lastlog*.md
+*_trace.jsonl
+*_state.json
+benchmarks/results/

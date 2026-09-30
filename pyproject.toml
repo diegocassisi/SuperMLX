@@ -41,7 +41,7 @@ monitor = ["streamlit>=1.45.0", "plotly>=6.1.0", "psutil>=7.0.0"]
 rag = ["lancedb>=0.26.1", "sentence-transformers>=5.2.0", "llmlingua>=0.2.2"]
 
 [project.scripts]
-supermlx = "supermlx.server:run"
+supermlx = "supermlx.server3:run"
 
 [project.urls]
 Homepage = "https://github.com/diegocassisi/SuperMLX"
